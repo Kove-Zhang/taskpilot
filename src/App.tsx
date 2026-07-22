@@ -1,0 +1,507 @@
+import { useState, useRef } from 'react'
+import type { ClipboardEvent, ChangeEvent, DragEvent } from 'react'
+import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare } from 'lucide-react'
+import SettingsPanel from './SettingsPanel'
+import HistoryPanel from './HistoryPanel'
+import { extractTodosFromContent, generateWriting } from './lib/ai'
+import type { AIResult } from './lib/ai'
+import { syncToNotion } from './lib/notion'
+import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import { parseFile } from './lib/parser'
+import { logger } from './lib/logger'
+import { useEffect } from 'react'
+
+function App() {
+  const [input, setInput] = useState('')
+  const [images, setImages] = useState<string[]>([])
+  const [showSettings, setShowSettings] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState<AIResult | null>(null)
+  const [error, setError] = useState('')
+  const [syncing, setSyncing] = useState(false)
+  const [syncSuccess, setSyncSuccess] = useState(false)
+  const [isDragging, setIsDragging] = useState(false)
+  
+  const [writeIntent, setWriteIntent] = useState('')
+  const [writingResult, setWritingResult] = useState('')
+  const [writing, setWriting] = useState(false)
+  
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const isFileDialogOpen = useRef(false)
+  const isScreenshotting = useRef(false)
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    const setup = async () => {
+      unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        // If window loses focus and we are not opening a file dialog or taking a screenshot, hide it
+        if (!focused && !isFileDialogOpen.current && !isScreenshotting.current) {
+          getCurrentWindow().hide();
+        }
+      });
+    };
+    setup();
+    return () => {
+      if (unlisten) unlisten();
+    }
+  }, []);
+
+  const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData.items;
+    let pastedImages = 0;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        const file = items[i].getAsFile();
+        if (file) {
+          pastedImages++;
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            if (event.target?.result) {
+              setImages(prev => [...prev, event.target!.result as string]);
+            }
+          };
+          reader.readAsDataURL(file);
+        }
+      }
+    }
+    if (pastedImages > 0) {
+      logger.info(`Pasted ${pastedImages} images`);
+    }
+  }
+
+  const handleFiles = async (files: FileList | File[]) => {
+    setLoading(true);
+    setError('');
+    let appendedText = "";
+    try {
+      logger.info(`Processing ${files.length} dropped/selected files`);
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.type.startsWith('image/')) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            if (event.target?.result) {
+              setImages(prev => [...prev, event.target!.result as string]);
+            }
+          };
+          reader.readAsDataURL(file);
+        } else {
+          const text = await parseFile(file);
+          appendedText += `\n[文件 ${file.name}]:\n${text}\n`;
+        }
+      }
+      if (appendedText) {
+        setInput(prev => prev + appendedText);
+      }
+    } catch (err: any) {
+      setError(`解析文件出错: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleFiles(e.dataTransfer.files);
+    }
+  }
+
+  const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      handleFiles(e.target.files);
+    }
+  }
+
+  const triggerScreenshot = async () => {
+    try {
+      logger.info('Triggering screenshot selection');
+      const win = getCurrentWindow();
+      isScreenshotting.current = true;
+      await win.hide();
+      await invoke("trigger_screenshot");
+      // Wait a moment before restoring the window, or just let user press Alt+Space
+      setTimeout(() => {
+        win.show();
+        isScreenshotting.current = false;
+      }, 3000);
+    } catch (err: any) {
+      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+      setError(msg);
+      logger.error('Screenshot trigger failed', msg);
+      isScreenshotting.current = false;
+    }
+  }
+
+  const removeImage = (index: number) => {
+    setImages(prev => prev.filter((_, i) => i !== index))
+  }
+
+  const handleExtract = async () => {
+    if (!input && images.length === 0) return;
+    setLoading(true);
+    setError('');
+    setSyncSuccess(false);
+    logger.info('Starting AI extraction...', { inputLength: input.length, imagesCount: images.length });
+    try {
+      const res = await extractTodosFromContent(input, images);
+      res.id = Math.random().toString(36).substring(2, 11);
+      setResult(res);
+      logger.info('AI extraction success', { todosCount: res.todos.length });
+      try {
+        const historyJson = await invoke<string>("load_history");
+        const historyArr = JSON.parse(historyJson || "[]");
+        historyArr.unshift({ timestamp: new Date().toISOString(), result: res });
+        await invoke("save_history", { data: JSON.stringify(historyArr) });
+      } catch(e) {
+        logger.warn("Failed to save history", e);
+      }
+    } catch (err: any) {
+      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+      setError(msg);
+      logger.error('AI extraction error', msg);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleSyncNotion = async () => {
+    if (!result || result.todos.length === 0) return;
+    const selectedTodos = result.todos.filter(t => t.selected !== false);
+    if (selectedTodos.length === 0) return;
+    
+    setSyncing(true);
+    setError('');
+    logger.info('Syncing to Notion...', { count: selectedTodos.length });
+    try {
+      await syncToNotion(selectedTodos);
+      setSyncSuccess(true);
+      setResult(prev => prev ? { ...prev, syncedToNotion: true } : prev);
+      
+      const dataJson = await invoke<string>("load_history").catch(() => "[]");
+      let history = JSON.parse(dataJson || "[]");
+      history = history.map((h: any) => h.result?.id === result.id ? { ...h, result: { ...h.result, syncedToNotion: true } } : h);
+      await invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
+      
+      logger.info('Sync to Notion success');
+    } catch (err: any) {
+      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+      setError(msg);
+      logger.error('Notion sync error', msg);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  const updateTodo = (id: string, field: keyof TodoItem, value: any) => {
+    setResult(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        todos: prev.todos.map(t => t.id === id ? { ...t, [field]: value } : t)
+      }
+    })
+  }
+
+  const handleAddTodo = () => {
+    setResult(prev => {
+      if (!prev) return prev;
+      const today = new Date().toISOString().split('T')[0];
+      return {
+        ...prev,
+        todos: [...prev.todos, {
+          id: Math.random().toString(36).substr(2, 9),
+          title: '',
+          priority: '★',
+          planned_date: today,
+          selected: true
+        }]
+      }
+    })
+  }
+
+  const startNewSession = () => {
+    setInput('');
+    setImages([]);
+    setResult(null);
+    setError('');
+    setSyncSuccess(false);
+    setWriteIntent('');
+    setWritingResult('');
+  }
+
+  const handleRestoreHistory = (restoredResult: any) => {
+    setResult(restoredResult);
+    setSyncSuccess(restoredResult.syncedToNotion || false);
+    setInput('');
+    setImages([]);
+    setWriteIntent('');
+    setWritingResult('');
+  }
+
+  const handleGenerateWriting = async () => {
+    if (!result || result.todos.length === 0 || !writeIntent) return;
+    setWriting(true);
+    setError('');
+    logger.info('Starting AI writing...', { intent: writeIntent });
+    try {
+      const generated = await generateWriting(writeIntent, result.todos);
+      setWritingResult(generated);
+      logger.info('AI writing success');
+    } catch (err: any) {
+      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+      setError(msg);
+      logger.error('AI writing error', msg);
+    } finally {
+      setWriting(false);
+    }
+  }
+
+  const handleCopyWriting = async () => {
+    try {
+      await navigator.clipboard.writeText(writingResult);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  return (
+    <div 
+      className="w-full h-full overflow-y-auto block relative"
+      onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+      onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+      onDrop={handleDrop}
+    >
+      <div 
+        className="min-h-full p-4 flex flex-col items-center justify-center"
+        onClick={async () => await getCurrentWindow().hide()}
+      >
+        <div 
+          className={`glass-panel w-full max-w-2xl mx-auto p-6 flex flex-col gap-4 shadow-2xl transition-all duration-300 ${isDragging ? 'border-purple-500 bg-purple-500/10' : ''}`}
+          onClick={(e) => e.stopPropagation()}
+        >
+        
+        <div className="flex items-center justify-between border-b border-white/10 pb-4">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-purple-400" />
+            <h1 className="text-lg font-semibold text-white tracking-wide">Task Pilot</h1>
+          </div>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={startNewSession}
+              className="p-2 hover:bg-white/10 rounded-full transition-colors group"
+              title="新会话"
+            >
+              <PlusSquare className="w-5 h-5 text-slate-400 group-hover:text-green-400" />
+            </button>
+            <button 
+              onClick={() => setShowHistory(true)}
+              className="p-2 hover:bg-white/10 rounded-full transition-colors group"
+              title="历史记录"
+            >
+              <Clock className="w-5 h-5 text-slate-400 group-hover:text-blue-400" />
+            </button>
+            <button 
+              onClick={() => setShowSettings(true)}
+              className="p-2 hover:bg-white/10 rounded-full transition-colors group"
+              title="设置"
+            >
+              <Settings className="w-5 h-5 text-slate-400 group-hover:text-white" />
+            </button>
+          </div>
+        </div>
+
+        <div className="relative">
+          <textarea 
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onPaste={handlePaste}
+            placeholder={isDragging ? "松开鼠标以解析文件..." : "粘贴文字/图片，或拖拽文件 (Word/PDF/Excel) 到这里..."}
+            className={`w-full bg-slate-900/50 border border-white/10 rounded-lg p-4 min-h-[120px] text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none ${isDragging ? 'pointer-events-none' : ''}`}
+          />
+          {images.length > 0 && (
+            <div className="absolute bottom-4 left-4 flex gap-2">
+              {images.map((img, idx) => (
+                <div key={idx} className="relative w-12 h-12 rounded bg-slate-800 border border-white/10 group">
+                  <img src={img} className="w-full h-full object-cover rounded" />
+                  <button onClick={() => removeImage(idx)} className="absolute -top-1 -right-1 bg-red-500 rounded-full w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                    <X className="w-3 h-3 text-white" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {error && <div className="text-red-400 text-sm bg-red-500/10 p-2 rounded">{error}</div>}
+
+        <div className="flex items-center justify-between pt-2">
+          <div className="flex items-center gap-3">
+            <button 
+              onClick={triggerScreenshot}
+              className="flex items-center gap-2 px-3 py-1.5 text-sm bg-white/5 hover:bg-white/10 text-slate-300 rounded-md border border-white/5 transition-colors cursor-pointer"
+            >
+              <ImageIcon className="w-4 h-4" />
+              <span>截屏选区</span>
+            </button>
+            <input 
+              type="file" 
+              ref={fileInputRef} 
+              style={{ display: 'none' }} 
+              onChange={handleFileSelect} 
+              multiple 
+              accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,image/*" 
+            />
+            <button 
+              onClick={() => {
+                isFileDialogOpen.current = true;
+                fileInputRef.current?.click();
+                setTimeout(() => { isFileDialogOpen.current = false; }, 3000);
+              }}
+              className="flex items-center gap-2 px-3 py-1.5 text-sm bg-white/5 hover:bg-white/10 text-slate-300 rounded-md border border-white/5 transition-colors cursor-pointer"
+            >
+              <FileText className="w-4 h-4" />
+              <span>选择文件</span>
+            </button>
+          </div>
+
+          <button 
+            onClick={handleExtract}
+            className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md shadow-lg shadow-purple-500/20 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed" 
+            disabled={(!input && images.length === 0) || loading}
+          >
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+            <span>{loading ? '提取中...' : '提取待办'}</span>
+          </button>
+        </div>
+
+        {result && (
+          <div className="mt-4 border-t border-white/10 pt-4 animate-in fade-in slide-in-from-bottom-2">
+            <h3 className="text-sm font-medium text-purple-300 mb-2">摘要</h3>
+            <div className="text-sm text-slate-300 bg-white/5 p-3 rounded-md border border-white/10 mb-4">
+              {result.summary}
+            </div>
+            
+            <h3 className="text-sm font-medium text-orange-300 mb-2 flex items-center gap-2">
+              待办事项
+              {result.syncedToNotion && (
+                <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30">
+                  已同步至 Notion，禁止修改
+                </span>
+              )}
+            </h3>
+            <div className="space-y-2 mb-4">
+              {result.todos.map(todo => (
+                <div key={todo.id} className={`flex items-center gap-2 bg-slate-900/50 p-2 rounded-md border border-white/5 group transition-colors ${todo.selected === false ? 'opacity-50' : ''}`}>
+                  <input
+                    type="checkbox"
+                    checked={todo.selected !== false}
+                    onChange={(e) => updateTodo(todo.id, 'selected', e.target.checked)}
+                    disabled={result.syncedToNotion}
+                    className="w-4 h-4 rounded border-white/10 bg-slate-800 text-purple-500 focus:ring-purple-500/50 focus:ring-offset-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  />
+                  <select
+                    value={todo.priority}
+                    onChange={(e) => updateTodo(todo.id, 'priority', e.target.value)}
+                    disabled={result.syncedToNotion}
+                    className="text-xs font-mono text-purple-400 bg-purple-500/10 border-0 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-purple-500 outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <option value="★">★</option>
+                    <option value="★★">★★</option>
+                    <option value="★★★">★★★</option>
+                  </select>
+                  <input
+                    type="date"
+                    value={todo.planned_date || ''}
+                    onChange={(e) => updateTodo(todo.id, 'planned_date', e.target.value)}
+                    disabled={result.syncedToNotion}
+                    className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-slate-400 outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                  />
+                  <input 
+                    type="text" 
+                    value={todo.title}
+                    onChange={(e) => updateTodo(todo.id, 'title', e.target.value)}
+                    disabled={result.syncedToNotion}
+                    className={`flex-1 bg-transparent text-sm focus:outline-none focus:border-b focus:border-purple-500/50 px-1 ${todo.selected === false ? 'text-slate-500 line-through' : 'text-slate-200'} disabled:cursor-not-allowed`}
+                  />
+                </div>
+              ))}
+              {!result.syncedToNotion && (
+                <button 
+                  onClick={handleAddTodo}
+                  className="w-full py-2 flex items-center justify-center gap-1 text-xs text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-md border border-dashed border-white/10 transition-colors"
+                >
+                  ➕ 手动添加待办
+                </button>
+              )}
+            </div>
+            
+            {result.todos.length > 0 && (
+              <div className="flex justify-end">
+                 <button 
+                   onClick={handleSyncNotion}
+                   disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || result.syncedToNotion}
+                   className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${result.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
+                 >
+                   {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                   <span>{syncing ? '同步中...' : result.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
+                 </button>
+              </div>
+            )}
+
+            {result.todos.length > 0 && (
+              <div className="mt-6 border-t border-white/10 pt-4">
+                <h3 className="text-sm font-medium text-blue-300 mb-3 flex items-center gap-2">
+                  <Wand2 className="w-4 h-4" /> AI 辅助撰写
+                </h3>
+                <div className="flex gap-2 mb-4">
+                  <input
+                    type="text"
+                    value={writeIntent}
+                    onChange={(e) => setWriteIntent(e.target.value)}
+                    placeholder="输入撰写意图，例如：基于这些待办写一封周报"
+                    className="flex-1 bg-slate-900/50 border border-white/10 rounded-md p-2 text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  <button
+                    onClick={handleGenerateWriting}
+                    disabled={writing || !writeIntent}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-blue-600 hover:bg-blue-500 text-white rounded-md shadow-lg shadow-blue-500/20 transition-all active:scale-95 disabled:opacity-50"
+                  >
+                    {writing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                    <span>生成</span>
+                  </button>
+                </div>
+
+                {writingResult && (
+                  <div className="animate-in fade-in slide-in-from-top-2">
+                    <div className="bg-slate-900/80 border border-white/10 rounded-md p-3 max-h-60 overflow-y-auto text-sm text-slate-300 whitespace-pre-wrap custom-scrollbar mb-2">
+                      {writingResult}
+                    </div>
+                    <div className="flex justify-end">
+                      <button
+                        onClick={handleCopyWriting}
+                        className="text-xs text-blue-400 hover:text-blue-300 transition px-2 py-1 bg-blue-500/10 hover:bg-blue-500/20 rounded"
+                      >
+                        复制内容
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+      </div>
+      </div>
+
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} />}
+    </div>
+  )
+}
+
+export default App
