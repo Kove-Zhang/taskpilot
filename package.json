@@ -18,6 +18,7 @@
     "@tauri-apps/plugin-http": "^2.5.9",
     "@tauri-apps/plugin-sql": "^2.4.0",
     "@tauri-apps/plugin-window": "^2.0.0-alpha.1",
+    "hotkeys-js": "^4.0.4",
     "lucide-react": "^1.25.0",
     "mammoth": "^1.12.0",
     "pdfjs-dist": "^6.1.200",

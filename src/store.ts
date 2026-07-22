@@ -9,10 +9,12 @@ interface SettingsState {
   notionApiKey: string;
   notionDatabaseId: string;
   enableLogging: boolean;
+  globalShortcut: string;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
   setPersonalFocus: (focus: string) => void;
   setNotionSettings: (key: string, dbId: string) => void;
   setEnableLogging: (enable: boolean) => void;
+  setGlobalShortcut: (shortcut: string) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -25,10 +27,12 @@ export const useSettingsStore = create<SettingsState>()(
       notionApiKey: '',
       notionDatabaseId: '',
       enableLogging: false,
+      globalShortcut: 'Alt+Space',
       setApiSettings: (baseUrl, key, model) => set({ apiBaseUrl: baseUrl, apiKey: key, modelName: model }),
       setPersonalFocus: (focus) => set({ personalFocus: focus }),
       setNotionSettings: (key, dbId) => set({ notionApiKey: key, notionDatabaseId: dbId }),
       setEnableLogging: (enable) => set({ enableLogging: enable }),
+      setGlobalShortcut: (shortcut) => set({ globalShortcut: shortcut }),
     }),
     {
       name: 'task-pilot-settings',

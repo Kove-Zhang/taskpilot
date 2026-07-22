@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { generateWriting, extractTodosFromContent } from './ai'
+import { generateWriting } from './ai'
 import { useSettingsStore } from '../store'
 
 describe('AI Helper Methods', () => {

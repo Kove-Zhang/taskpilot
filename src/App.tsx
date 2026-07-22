@@ -4,13 +4,14 @@ import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Che
 import SettingsPanel from './SettingsPanel'
 import HistoryPanel from './HistoryPanel'
 import { extractTodosFromContent, generateWriting } from './lib/ai'
-import type { AIResult } from './lib/ai'
+import type { AIResult, TodoItem } from './lib/ai'
 import { syncToNotion } from './lib/notion'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { parseFile } from './lib/parser'
 import { logger } from './lib/logger'
 import { useEffect } from 'react'
+import { useSettingsStore } from './store'
 
 function App() {
   const [input, setInput] = useState('')
@@ -21,7 +22,7 @@ function App() {
   const [result, setResult] = useState<AIResult | null>(null)
   const [error, setError] = useState('')
   const [syncing, setSyncing] = useState(false)
-  const [syncSuccess, setSyncSuccess] = useState(false)
+  // const [syncSuccess, setSyncSuccess] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   
   const [writeIntent, setWriteIntent] = useState('')
@@ -35,6 +36,12 @@ function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     const setup = async () => {
+      // Sync shortcut on mount
+      const globalShortcut = useSettingsStore.getState().globalShortcut;
+      invoke('update_shortcut', { shortcut: globalShortcut }).catch(e => {
+          logger.error('Failed to sync initial global shortcut', e);
+      });
+
       unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         // If window loses focus and we are not opening a file dialog or taking a screenshot, hide it
         if (!focused && !isFileDialogOpen.current && !isScreenshotting.current) {
@@ -144,7 +151,7 @@ function App() {
     if (!input && images.length === 0) return;
     setLoading(true);
     setError('');
-    setSyncSuccess(false);
+
     logger.info('Starting AI extraction...', { inputLength: input.length, imagesCount: images.length });
     try {
       const res = await extractTodosFromContent(input, images);
@@ -178,7 +185,7 @@ function App() {
     logger.info('Syncing to Notion...', { count: selectedTodos.length });
     try {
       await syncToNotion(selectedTodos);
-      setSyncSuccess(true);
+
       setResult(prev => prev ? { ...prev, syncedToNotion: true } : prev);
       
       const dataJson = await invoke<string>("load_history").catch(() => "[]");
@@ -228,14 +235,14 @@ function App() {
     setImages([]);
     setResult(null);
     setError('');
-    setSyncSuccess(false);
+
     setWriteIntent('');
     setWritingResult('');
   }
 
   const handleRestoreHistory = (restoredResult: any) => {
     setResult(restoredResult);
-    setSyncSuccess(restoredResult.syncedToNotion || false);
+
     setInput('');
     setImages([]);
     setWriteIntent('');

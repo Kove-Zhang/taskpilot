@@ -3,6 +3,12 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use aes_gcm::{aead::{Aead, AeadCore, KeyInit, OsRng}, Aes256Gcm, Nonce};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::Emitter;
+
+struct AppState {
+    is_recording: AtomicBool,
+}
 
 fn get_storage_path(app_handle: &tauri::AppHandle) -> PathBuf {
     let mut path = app_handle.path().app_data_dir().unwrap();
@@ -154,23 +160,43 @@ fn open_log_file(app_handle: tauri::AppHandle) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn update_shortcut(app_handle: tauri::AppHandle, shortcut: String) -> Result<(), String> {
+    use std::str::FromStr;
+    app_handle.global_shortcut().unregister_all().map_err(|e| e.to_string())?;
+    let new_shortcut = Shortcut::from_str(&shortcut).map_err(|e| e.to_string())?;
+    app_handle.global_shortcut().register(new_shortcut).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_recording_mode(app_handle: tauri::AppHandle, is_recording: bool) {
+    let state = app_handle.state::<AppState>();
+    state.is_recording.store(is_recording, Ordering::SeqCst);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
-        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file])
+        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, update_shortcut, set_recording_mode])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, shortcut, event| {
+                .with_handler(|app, _shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        if shortcut.matches(Modifiers::ALT, Code::Space) {
-                            if let Some(window) = app.get_webview_window("main") {
-                                if window.is_visible().unwrap_or(false) {
-                                    window.hide().unwrap();
-                                } else {
-                                    window.show().unwrap();
-                                    window.set_focus().unwrap();
-                                }
+                        let state = app.state::<AppState>();
+                        if state.is_recording.load(Ordering::SeqCst) {
+                            let _ = app.emit("global-shortcut-triggered", ());
+                            return;
+                        }
+
+                        // Since we dynamically register the shortcut, any triggered shortcut for this app toggles the main window
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                window.hide().unwrap();
+                            } else {
+                                window.show().unwrap();
+                                window.set_focus().unwrap();
                             }
                         }
                     }
@@ -178,6 +204,10 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            app.manage(AppState {
+                is_recording: AtomicBool::new(false),
+            });
+
             let alt_space = Shortcut::new(Some(Modifiers::ALT), Code::Space);
             app.global_shortcut().register(alt_space)?;
 
