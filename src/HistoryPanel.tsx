@@ -16,6 +16,7 @@ interface HistoryPanelProps {
 export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [confirmingIdx, setConfirmingIdx] = useState<number | null>(null);
 
   useEffect(() => {
     loadHistory();
@@ -82,12 +83,7 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
             history.map((entry, idx) => (
               <div 
                 key={idx} 
-                onDoubleClick={() => {
-                  if (window.confirm("确定要用这条历史记录覆盖当前工作区吗？")) {
-                    onRestore(entry.result);
-                    onClose();
-                  }
-                }}
+                onDoubleClick={() => setConfirmingIdx(idx)}
                 className="bg-slate-900/50 p-4 rounded-lg border border-white/5 relative group cursor-pointer hover:border-purple-500/50 transition-colors"
                 title="双击恢复此记录"
               >
@@ -119,6 +115,43 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
             ))
           )}
         </div>
+
+        {/* Custom Confirm Modal */}
+        {confirmingIdx !== null && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 rounded-xl backdrop-blur-sm">
+            <div className="bg-slate-800 border border-slate-700 p-6 rounded-lg max-w-sm w-full shadow-2xl flex flex-col gap-4">
+              <h3 className="text-lg font-medium text-white">确认恢复历史记录</h3>
+              <p className="text-sm text-slate-300">
+                确定要用这条历史记录覆盖当前工作区吗？
+                {history[confirmingIdx]?.result?.syncedToNotion && (
+                  <span className="block mt-3 text-amber-400 p-2 bg-amber-500/10 rounded border border-amber-500/20">
+                    ⚠️ 注意：该记录已被推送至 Notion。<br/>禁止修改已同步的待办，以避免数据重复推送！
+                  </span>
+                )}
+              </p>
+              <div className="flex justify-end gap-3 mt-2">
+                <button 
+                  onClick={() => setConfirmingIdx(null)}
+                  className="px-4 py-2 text-sm rounded bg-slate-700 hover:bg-slate-600 text-white transition-colors"
+                >
+                  取消
+                </button>
+                <button 
+                  onClick={() => {
+                    if (confirmingIdx !== null) {
+                      onRestore(history[confirmingIdx].result);
+                      setConfirmingIdx(null);
+                      onClose();
+                    }
+                  }}
+                  className="px-4 py-2 text-sm rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+                >
+                  确定
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
