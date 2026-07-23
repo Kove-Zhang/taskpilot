@@ -5,6 +5,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
+use sha2::{Sha256, Digest};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 struct AppState {
     is_recording: AtomicBool,
@@ -175,11 +177,66 @@ fn set_recording_mode(app_handle: tauri::AppHandle, is_recording: bool) {
     state.is_recording.store(is_recording, Ordering::SeqCst);
 }
 
+fn get_machine_key() -> Result<[u8; 32], String> {
+    let uid = machine_uid::get().unwrap_or_else(|_| "fallback-uid-task-pilot".to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(uid.as_bytes());
+    let result = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    Ok(key)
+}
+
+#[tauri::command]
+fn encrypt_secret(value: String) -> Result<String, String> {
+    if value.is_empty() {
+        return Ok("".to_string());
+    }
+    let key = get_machine_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
+    
+    let ciphertext = cipher.encrypt(&nonce, value.as_bytes().as_ref()).map_err(|e| e.to_string())?;
+    let mut final_data = nonce.to_vec();
+    final_data.extend_from_slice(&ciphertext);
+    Ok(STANDARD.encode(final_data))
+}
+
+#[tauri::command]
+fn decrypt_secret(cipher_text: String) -> Result<String, String> {
+    if cipher_text.is_empty() {
+        return Ok("".to_string());
+    }
+    // If it's not base64 or valid, just return the original value (backward compatibility for unencrypted keys)
+    let encrypted_data = match STANDARD.decode(&cipher_text) {
+        Ok(data) => data,
+        Err(_) => return Ok(cipher_text),
+    };
+    
+    if encrypted_data.len() < 12 {
+        return Ok(cipher_text); // Probably plain text that happens to be valid base64
+    }
+    
+    let key = get_machine_key()?;
+    let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher = match Aes256Gcm::new_from_slice(&key) {
+        Ok(c) => c,
+        Err(_) => return Ok(cipher_text),
+    };
+    
+    match cipher.decrypt(nonce, ciphertext) {
+        Ok(plaintext) => Ok(String::from_utf8(plaintext).unwrap_or(cipher_text)),
+        Err(_) => Ok(cipher_text), // If decryption fails, it might be plaintext
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
-        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, update_shortcut, set_recording_mode])
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, update_shortcut, set_recording_mode, encrypt_secret, decrypt_secret])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

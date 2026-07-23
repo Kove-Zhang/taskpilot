@@ -1,9 +1,10 @@
 import * as mammoth from 'mammoth';
 import * as xlsx from 'xlsx';
 import * as pdfjsLib from 'pdfjs-dist';
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
-// Use a public CDN for the pdf.js worker to avoid Vite build configuration issues
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+// Use local worker provided by Vite
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
 export async function parseFile(file: File): Promise<string> {
   const extension = file.name.split('.').pop()?.toLowerCase();

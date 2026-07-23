@@ -536,14 +536,14 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                                 <input 
                                   type="checkbox" 
                                   checked={mapping.enabled}
-                                  disabled={prop.type === 'title'}
                                   onChange={e => {
+                                    if (prop.type === 'title') return;
                                     setFormFieldMappings({
                                       ...formFieldMappings,
                                       [prop.id]: { ...mapping, enabled: e.target.checked }
                                     });
                                   }}
-                                  className="w-3.5 h-3.5 rounded bg-slate-800 border-slate-600 text-orange-500 focus:ring-orange-500 focus:ring-offset-slate-900"
+                                  className={`w-3.5 h-3.5 rounded bg-slate-800 border-slate-600 text-orange-500 focus:ring-orange-500 focus:ring-offset-slate-900 ${prop.type === 'title' ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
                                 />
                                 <span className="text-xs text-slate-300 font-medium">{prop.name}</span>
                                 <span className="text-[10px] text-slate-500 bg-slate-800 px-1 rounded">{prop.type}</span>
@@ -592,19 +592,19 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                     {enabledSortedProps.length > 0 && (
                       <div className="mt-4 pt-3 border-t border-dashed border-white/10">
                         <h4 className="text-xs text-orange-400 mb-2 font-medium">UI 拼装预览</h4>
-                        <div className="flex items-center gap-2 bg-slate-900/80 p-2 rounded border border-white/5 overflow-x-auto custom-scrollbar opacity-80 pointer-events-none">
+                        <div className="flex items-center gap-2 bg-slate-900/80 p-2 rounded border border-white/5 overflow-x-auto custom-scrollbar opacity-80">
                           <input type="checkbox" className="w-4 h-4 rounded border-white/10 bg-slate-800 shrink-0" checked readOnly />
                           {enabledSortedProps.map(f => {
                             if (f.type === 'title' || f.type === 'rich_text') {
-                              return <input key={f.id} type="text" value={f.name} className="flex-1 min-w-[80px] bg-transparent text-sm border-b border-purple-500/50 px-1 text-slate-300" readOnly />;
+                              return <input key={f.id} type="text" value={f.name} className="flex-1 min-w-[120px] bg-transparent text-sm border-b border-purple-500/50 px-1 text-slate-300" readOnly />;
                             } else if (f.type === 'select') {
-                              return <div key={f.id} className="text-xs font-mono text-purple-400 bg-purple-500/10 px-1.5 py-1 rounded w-20 truncate text-center border-b border-purple-500/30">{f.name}</div>;
+                              return <div key={f.id} className="text-xs font-mono text-purple-400 bg-purple-500/10 px-1.5 py-1 rounded max-w-[80px] truncate text-center border-b border-purple-500/30 shrink-0 whitespace-nowrap">{f.name}</div>;
                             } else if (f.type === 'date') {
-                              return <div key={f.id} className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded">yyyy-mm-dd</div>;
+                              return <div key={f.id} className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded shrink-0 whitespace-nowrap">yyyy-mm-dd</div>;
                             } else if (f.type === 'checkbox') {
-                              return <div key={f.id} className="flex items-center gap-1 text-xs text-slate-400 shrink-0"><input type="checkbox" className="rounded bg-slate-800 border-slate-600" />{f.name}</div>;
+                              return <div key={f.id} className="flex items-center gap-1 text-xs text-slate-400 shrink-0 whitespace-nowrap"><input type="checkbox" className="rounded bg-slate-800 border-slate-600 shrink-0" />{f.name}</div>;
                             } else {
-                              return <div key={f.id} className="w-16 bg-transparent text-xs border-b border-white/10 text-slate-400 px-1 text-center">{f.name}</div>;
+                              return <div key={f.id} className="min-w-[60px] bg-transparent text-xs border-b border-white/10 text-slate-400 px-1 text-center shrink-0 whitespace-nowrap overflow-hidden text-ellipsis">{f.name}</div>;
                             }
                           })}
                         </div>
