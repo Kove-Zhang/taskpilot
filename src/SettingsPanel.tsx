@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard } from 'lucide-react'
+import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown } from 'lucide-react'
 import { useSettingsStore } from './store'
 import { logger } from './lib/logger'
 import { fetch } from '@tauri-apps/plugin-http'
@@ -11,7 +11,8 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut
+    notionProperties, fieldMappings,
+    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping
   } = useSettingsStore();
 
   const [formBaseUrl, setFormBaseUrl] = useState(apiBaseUrl);
@@ -22,6 +23,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [formNotionDb, setFormNotionDb] = useState(notionDatabaseId);
   const [formLogging, setFormLogging] = useState(enableLogging);
   const [formGlobalShortcut, setFormGlobalShortcut] = useState(globalShortcut);
+  const [formFieldMappings, setFormFieldMappings] = useState(fieldMappings);
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false);
   const [liveShortcut, setLiveShortcut] = useState('');
   const [activeTab, setActiveTab] = useState<'ai' | 'integration' | 'system'>('ai');
@@ -43,6 +45,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setNotionSettings(formNotionKey, formNotionDb);
     setEnableLogging(formLogging);
     setGlobalShortcut(formGlobalShortcut);
+    Object.entries(formFieldMappings).forEach(([k, v]) => setFieldMapping(k, v));
     
     // 同步到后端 Rust
     import('@tauri-apps/api/core').then(m => {
@@ -195,7 +198,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${formNotionKey}`,
-          'Notion-Version': '2025-09-03'
+          'Notion-Version': '2022-06-28'
         }
       });
 
@@ -204,9 +207,41 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         throw new Error(errData.message || `HTTP Error ${response.status}`);
       }
 
-      await response.json();
+      const data = await response.json();
+      
+      const props: any[] = [];
+      if (data.properties) {
+        for (const val of Object.values<any>(data.properties)) {
+          let options = undefined;
+          if (val.type === 'select' && val.select?.options) {
+            options = val.select.options.map((o: any) => o.name);
+          } else if (val.type === 'multi_select' && val.multi_select?.options) {
+            options = val.multi_select.options.map((o: any) => o.name);
+          }
+          props.push({
+            id: val.id,
+            name: val.name,
+            type: val.type,
+            options
+          });
+        }
+      }
+      // Sort to put title first
+      props.sort((a, b) => a.type === 'title' ? -1 : b.type === 'title' ? 1 : 0);
+      setNotionProperties(props);
+      
+      const newMappings = { ...formFieldMappings };
+      props.forEach((p, idx) => {
+        if (!newMappings[p.id]) {
+          newMappings[p.id] = { notionPropId: p.id, enabled: p.type === 'title', aiHint: '', order: idx };
+        } else if (newMappings[p.id].order === undefined) {
+          newMappings[p.id].order = idx;
+        }
+      });
+      setFormFieldMappings(newMappings);
+
       setNotionTestResult('success');
-      logger.info('Notion connection test successful');
+      logger.info('Notion connection test successful and schema loaded', { fieldsCount: props.length });
     } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
       setNotionTestResult('error');
@@ -422,12 +457,12 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                   className="text-xs flex items-center gap-1 bg-orange-500/20 text-orange-300 px-2 py-1 rounded hover:bg-orange-500/30 transition disabled:opacity-50"
                 >
                   {testingNotion ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
-                  测试连接
+                  同步结构并测试
                 </button>
               </div>
               {notionTestResult === 'success' && (
                 <div className="flex items-center gap-1 text-xs text-green-400 bg-green-500/10 p-2 rounded border border-green-500/20">
-                  <CheckCircle2 className="w-3.5 h-3.5" /> 数据库连接成功！
+                  <CheckCircle2 className="w-3.5 h-3.5" /> 数据库连接成功！已同步字段结构。
                 </div>
               )}
               {notionTestResult === 'error' && (
@@ -456,6 +491,128 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                   />
                 </div>
               </div>
+
+              {notionProperties && notionProperties.length > 0 && (() => {
+                const sortedProps = [...notionProperties].sort((a, b) => {
+                  const orderA = formFieldMappings[a.id]?.order ?? 999;
+                  const orderB = formFieldMappings[b.id]?.order ?? 999;
+                  return orderA - orderB;
+                });
+                
+                const moveField = (index: number, direction: 'up' | 'down') => {
+                  if (direction === 'up' && index > 0) {
+                    const newMappings = { ...formFieldMappings };
+                    const currId = sortedProps[index].id;
+                    const prevId = sortedProps[index - 1].id;
+                    const temp = newMappings[currId].order;
+                    newMappings[currId].order = newMappings[prevId].order;
+                    newMappings[prevId].order = temp;
+                    setFormFieldMappings(newMappings);
+                  } else if (direction === 'down' && index < sortedProps.length - 1) {
+                    const newMappings = { ...formFieldMappings };
+                    const currId = sortedProps[index].id;
+                    const nextId = sortedProps[index + 1].id;
+                    const temp = newMappings[currId].order;
+                    newMappings[currId].order = newMappings[nextId].order;
+                    newMappings[nextId].order = temp;
+                    setFormFieldMappings(newMappings);
+                  }
+                };
+
+                const enabledSortedProps = sortedProps.filter(p => formFieldMappings[p.id]?.enabled);
+
+                return (
+                  <div className="mt-4 border-t border-white/5 pt-4">
+                    <h4 className="text-xs font-medium text-slate-300 mb-2 flex justify-between items-center">
+                      <span>可同步的数据库字段 (Database Properties)</span>
+                    </h4>
+                    <div className="space-y-2 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
+                      {sortedProps.map((prop, idx) => {
+                        const mapping = formFieldMappings[prop.id] || { notionPropId: prop.id, enabled: false, aiHint: '', order: idx };
+                        return (
+                          <div key={prop.id} className="bg-slate-900/40 p-2 rounded border border-white/5 flex flex-col gap-2">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <input 
+                                  type="checkbox" 
+                                  checked={mapping.enabled}
+                                  disabled={prop.type === 'title'}
+                                  onChange={e => {
+                                    setFormFieldMappings({
+                                      ...formFieldMappings,
+                                      [prop.id]: { ...mapping, enabled: e.target.checked }
+                                    });
+                                  }}
+                                  className="w-3.5 h-3.5 rounded bg-slate-800 border-slate-600 text-orange-500 focus:ring-orange-500 focus:ring-offset-slate-900"
+                                />
+                                <span className="text-xs text-slate-300 font-medium">{prop.name}</span>
+                                <span className="text-[10px] text-slate-500 bg-slate-800 px-1 rounded">{prop.type}</span>
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <button onClick={() => moveField(idx, 'up')} disabled={idx === 0} className="p-1 hover:bg-white/10 rounded text-slate-500 hover:text-slate-300 disabled:opacity-30 disabled:hover:bg-transparent transition-colors">
+                                  <ArrowUp className="w-3.5 h-3.5" />
+                                </button>
+                                <button onClick={() => moveField(idx, 'down')} disabled={idx === sortedProps.length - 1} className="p-1 hover:bg-white/10 rounded text-slate-500 hover:text-slate-300 disabled:opacity-30 disabled:hover:bg-transparent transition-colors">
+                                  <ArrowDown className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                            
+                            {mapping.enabled && prop.type !== 'title' && (
+                              <input 
+                                type="text"
+                                value={mapping.aiHint}
+                                onChange={e => {
+                                  setFormFieldMappings({
+                                    ...formFieldMappings,
+                                    [prop.id]: { ...mapping, aiHint: e.target.value }
+                                  });
+                                }}
+                                placeholder="给 AI 的提取建议 (例如: 必须是某某人名，如果没有提及留空)"
+                                className="text-xs bg-slate-800/50 border border-white/5 rounded px-2 py-1 text-slate-300 outline-none focus:border-orange-500/50 w-full"
+                              />
+                            )}
+
+                            {mapping.enabled && prop.options && prop.options.length > 0 && (
+                              <div className="flex flex-wrap gap-1 mt-1">
+                                <span className="text-[10px] text-slate-500 mt-0.5">已同步选项:</span>
+                                {prop.options.map(opt => (
+                                  <span key={opt} className="text-[10px] bg-slate-800 border border-white/10 text-slate-300 px-1.5 py-0.5 rounded">
+                                    {opt}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                    
+                    {/* Preview Section */}
+                    {enabledSortedProps.length > 0 && (
+                      <div className="mt-4 pt-3 border-t border-dashed border-white/10">
+                        <h4 className="text-xs text-orange-400 mb-2 font-medium">UI 拼装预览</h4>
+                        <div className="flex items-center gap-2 bg-slate-900/80 p-2 rounded border border-white/5 overflow-x-auto custom-scrollbar opacity-80 pointer-events-none">
+                          <input type="checkbox" className="w-4 h-4 rounded border-white/10 bg-slate-800 shrink-0" checked readOnly />
+                          {enabledSortedProps.map(f => {
+                            if (f.type === 'title' || f.type === 'rich_text') {
+                              return <input key={f.id} type="text" value={f.name} className="flex-1 min-w-[80px] bg-transparent text-sm border-b border-purple-500/50 px-1 text-slate-300" readOnly />;
+                            } else if (f.type === 'select') {
+                              return <div key={f.id} className="text-xs font-mono text-purple-400 bg-purple-500/10 px-1.5 py-1 rounded w-20 truncate text-center border-b border-purple-500/30">{f.name}</div>;
+                            } else if (f.type === 'date') {
+                              return <div key={f.id} className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded">yyyy-mm-dd</div>;
+                            } else if (f.type === 'checkbox') {
+                              return <div key={f.id} className="flex items-center gap-1 text-xs text-slate-400 shrink-0"><input type="checkbox" className="rounded bg-slate-800 border-slate-600" />{f.name}</div>;
+                            } else {
+                              return <div key={f.id} className="w-16 bg-transparent text-xs border-b border-white/10 text-slate-400 px-1 text-center">{f.name}</div>;
+                            }
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
 

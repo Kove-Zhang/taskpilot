@@ -11,20 +11,49 @@ export interface AIResult {
 
 export interface TodoItem {
   id: string;
-  title: string;
-  priority: string;
-  planned_date?: string;
   selected?: boolean;
+  [key: string]: any;
 }
 
 export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
-  const { apiBaseUrl, apiKey, modelName, personalFocus } = useSettingsStore.getState();
+  const { apiBaseUrl, apiKey, modelName, personalFocus, notionProperties, fieldMappings } = useSettingsStore.getState();
 
   if (!apiKey) {
     throw new Error("请先在设置中配置 API Key");
   }
 
+  const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
+  
+  let jsonSchemaDesc = `{\n      "id": "唯一随机ID",\n`;
+  let hintDesc = "";
+
+  if (activeFields.length === 0) {
+    jsonSchemaDesc += `      "title": "待办事项标题",\n      "priority": "★ 或者 ★★ 或者 ★★★",\n      "planned_date": "YYYY-MM-DD格式的日期，如无明确日期则留空"\n`;
+  } else {
+    for (const field of activeFields) {
+      const mapping = fieldMappings[field.id];
+      let typeDesc = "字符串";
+      if (field.type === 'date') typeDesc = "YYYY-MM-DD格式的日期，如无明确日期则留空";
+      if (field.type === 'checkbox') typeDesc = "布尔值(true/false)";
+      if (field.type === 'number') typeDesc = "数字";
+      if (field.type === 'select' || field.type === 'multi_select') {
+        typeDesc = `只能是以下枚举值之一: [${field.options?.join(', ') || ''}]`;
+      }
+      
+      jsonSchemaDesc += `      "${field.name}": "${typeDesc}",\n`;
+      if (mapping?.aiHint) {
+        hintDesc += `- "${field.name}": ${mapping.aiHint}\n`;
+      }
+    }
+  }
+  jsonSchemaDesc += `    }`;
+
+  const now = new Date();
+  const timeStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${['日', '一', '二', '三', '四', '五', '六'][now.getDay()]} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
   const systemPrompt = `你是一个智能助理，任务是从用户输入的内容中提取核心总结和待办事项。
+当前系统真实时间是：${timeStr} (请以此为基准推算“明天”、“下周”等相对时间名词的精确日期，必须转换为 YYYY-MM-DD 格式，绝不可臆想错乱的时间)。
+
 用户的个人关注重点是：${personalFocus}
 请结合用户的关注重点进行分析。
 
@@ -32,15 +61,11 @@ export async function extractTodosFromContent(textContent: string, base64Images:
 {
   "summary": "对内容的简短总结（100字以内）",
   "todos": [
-    {
-      "id": "唯一随机ID",
-      "title": "待办事项标题",
-      "priority": "★" 或者 "★★" 或者 "★★★",
-      "planned_date": "YYYY-MM-DD格式的日期，如无明确日期则留空"
-    }
+    ${jsonSchemaDesc}
   ]
 }
-如果没有待办事项，todos 数组留空。`;
+如果没有待办事项，todos 数组留空。
+${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
 
   const contentArray: any[] = [];
   if (textContent) {

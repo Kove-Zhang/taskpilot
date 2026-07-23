@@ -17,7 +17,8 @@
         {"url": "https://*:*/**"},
         {"url": "http://*:*/**"},
         {"url": "https://ai.chinatowercom.cn:30080/**"},
-        {"url": "https://api.openai.com/**"}
+        {"url": "https://api.openai.com/**"},
+        {"url": "https://api.notion.com/**"}
       ]
     }
   ]

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { X, Clock, Trash2 } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import type { AIResult } from './lib/ai'
+import { useSettingsStore } from './store'
 
 interface HistoryEntry {
   timestamp: string;
@@ -14,6 +15,7 @@ interface HistoryPanelProps {
 }
 
 export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) {
+  const { notionProperties, fieldMappings } = useSettingsStore();
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [confirmingIdx, setConfirmingIdx] = useState<number | null>(null);
@@ -102,13 +104,18 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                 <div className="text-xs text-slate-500 mb-2 pr-8">{new Date(entry.timestamp).toLocaleString()}</div>
                 <div className="text-sm text-slate-300 mb-3 line-clamp-2">{entry.result.summary}</div>
                 <div className="space-y-1.5">
-                  {entry.result.todos.map((t, i) => (
-                    <div key={i} className="text-xs text-slate-400 flex items-center gap-2">
-                      <span className="text-purple-400">[{t.priority}]</span>
-                      {(t as any).type && <span className="text-blue-300">[{(t as any).type}]</span>}
-                      <span>{t.title}</span>
-                    </div>
-                  ))}
+                  {entry.result.todos.map((t: any, i) => {
+                    const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
+                    const titleProp = activeFields.find(p => p.type === 'title')?.name || 'title';
+                    const priorityProp = activeFields.find(p => p.name.includes('优先') || p.name === 'priority' || p.type === 'select')?.name || 'priority';
+                    
+                    return (
+                      <div key={i} className="text-xs text-slate-400 flex items-center gap-2">
+                        {t[priorityProp] && <span className="text-purple-400">[{t[priorityProp]}]</span>}
+                        <span>{t[titleProp] || t.title || t.Name || '未命名待办'}</span>
+                      </div>
+                    )
+                  })}
                   {entry.result.todos.length === 0 && <div className="text-xs text-slate-500">无待办事项</div>}
                 </div>
               </div>

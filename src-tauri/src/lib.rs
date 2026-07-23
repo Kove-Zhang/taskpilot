@@ -209,7 +209,7 @@ pub fn run() {
             });
 
             let alt_space = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-            app.global_shortcut().register(alt_space)?;
+            let _ = app.global_shortcut().register(alt_space);
 
             let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&quit_i])?;

@@ -4,7 +4,7 @@ import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Che
 import SettingsPanel from './SettingsPanel'
 import HistoryPanel from './HistoryPanel'
 import { extractTodosFromContent, generateWriting } from './lib/ai'
-import type { AIResult, TodoItem } from './lib/ai'
+import type { AIResult } from './lib/ai'
 import { syncToNotion } from './lib/notion'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -22,9 +22,20 @@ function App() {
   const [result, setResult] = useState<AIResult | null>(null)
   const [error, setError] = useState('')
   const [syncing, setSyncing] = useState(false)
-  // const [syncSuccess, setSyncSuccess] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   
+  const { notionProperties, fieldMappings } = useSettingsStore()
+  const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled).sort((a, b) => {
+    const orderA = fieldMappings[a.id]?.order ?? 999;
+    const orderB = fieldMappings[b.id]?.order ?? 999;
+    return orderA - orderB;
+  }) || []
+  const displayFields = activeFields.length > 0 ? activeFields : [
+    { id: 't1', name: 'title', type: 'title' },
+    { id: 't2', name: 'priority', type: 'select', options: ['★', '★★', '★★★'] },
+    { id: 't3', name: 'planned_date', type: 'date' }
+  ];
+
   const [writeIntent, setWriteIntent] = useState('')
   const [writingResult, setWritingResult] = useState('')
   const [writing, setWriting] = useState(false)
@@ -203,7 +214,7 @@ function App() {
     }
   }
 
-  const updateTodo = (id: string, field: keyof TodoItem, value: any) => {
+  const updateTodo = (id: string, field: string, value: any) => {
     setResult(prev => {
       if (!prev) return prev;
       return {
@@ -217,15 +228,19 @@ function App() {
     setResult(prev => {
       if (!prev) return prev;
       const today = new Date().toISOString().split('T')[0];
+      const newTodo: any = {
+        id: Math.random().toString(36).substr(2, 9),
+        selected: true
+      };
+      displayFields.forEach(f => {
+        if (f.type === 'date') newTodo[f.name] = today;
+        else if (f.type === 'select' && f.options && f.options.length > 0) newTodo[f.name] = f.options[0];
+        else if (f.type === 'checkbox') newTodo[f.name] = false;
+        else newTodo[f.name] = '';
+      });
       return {
         ...prev,
-        todos: [...prev.todos, {
-          id: Math.random().toString(36).substr(2, 9),
-          title: '',
-          priority: '★',
-          planned_date: today,
-          selected: true
-        }]
+        todos: [...prev.todos, newTodo]
       }
     })
   }
@@ -408,32 +423,75 @@ function App() {
                     checked={todo.selected !== false}
                     onChange={(e) => updateTodo(todo.id, 'selected', e.target.checked)}
                     disabled={result.syncedToNotion}
-                    className="w-4 h-4 rounded border-white/10 bg-slate-800 text-purple-500 focus:ring-purple-500/50 focus:ring-offset-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="w-4 h-4 rounded border-white/10 bg-slate-800 text-purple-500 focus:ring-purple-500/50 focus:ring-offset-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
                   />
-                  <select
-                    value={todo.priority}
-                    onChange={(e) => updateTodo(todo.id, 'priority', e.target.value)}
-                    disabled={result.syncedToNotion}
-                    className="text-xs font-mono text-purple-400 bg-purple-500/10 border-0 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-purple-500 outline-none disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <option value="★">★</option>
-                    <option value="★★">★★</option>
-                    <option value="★★★">★★★</option>
-                  </select>
-                  <input
-                    type="date"
-                    value={todo.planned_date || ''}
-                    onChange={(e) => updateTodo(todo.id, 'planned_date', e.target.value)}
-                    disabled={result.syncedToNotion}
-                    className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-slate-400 outline-none disabled:opacity-50 disabled:cursor-not-allowed"
-                  />
-                  <input 
-                    type="text" 
-                    value={todo.title}
-                    onChange={(e) => updateTodo(todo.id, 'title', e.target.value)}
-                    disabled={result.syncedToNotion}
-                    className={`flex-1 bg-transparent text-sm focus:outline-none focus:border-b focus:border-purple-500/50 px-1 ${todo.selected === false ? 'text-slate-500 line-through' : 'text-slate-200'} disabled:cursor-not-allowed`}
-                  />
+                  
+                  {displayFields.map(field => {
+                    if (field.type === 'title' || field.type === 'rich_text') {
+                      return (
+                        <input 
+                          key={field.id}
+                          type="text" 
+                          value={todo[field.name] || ''}
+                          onChange={(e) => updateTodo(todo.id, field.name, e.target.value)}
+                          disabled={result.syncedToNotion}
+                          placeholder={field.name}
+                          className={`flex-1 min-w-[80px] bg-transparent text-sm focus:outline-none focus:border-b focus:border-purple-500/50 px-1 ${todo.selected === false ? 'text-slate-500 line-through' : 'text-slate-200'} disabled:cursor-not-allowed`}
+                        />
+                      );
+                    } else if (field.type === 'select') {
+                      return (
+                        <select
+                          key={field.id}
+                          value={todo[field.name] || ''}
+                          onChange={(e) => updateTodo(todo.id, field.name, e.target.value)}
+                          disabled={result.syncedToNotion}
+                          className="text-xs font-mono text-purple-400 bg-purple-500/10 border-0 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-purple-500 outline-none disabled:opacity-50 disabled:cursor-not-allowed max-w-[100px] truncate"
+                        >
+                          <option value="">{field.name}</option>
+                          {field.options?.map(opt => (
+                            <option key={opt} value={opt}>{opt}</option>
+                          ))}
+                        </select>
+                      );
+                    } else if (field.type === 'date') {
+                      return (
+                        <input
+                          key={field.id}
+                          type="date"
+                          value={todo[field.name] || ''}
+                          onChange={(e) => updateTodo(todo.id, field.name, e.target.value)}
+                          disabled={result.syncedToNotion}
+                          className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-slate-400 outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                        />
+                      );
+                    } else if (field.type === 'checkbox') {
+                      return (
+                        <label key={field.id} className="flex items-center gap-1 text-xs text-slate-400 cursor-pointer shrink-0">
+                          <input 
+                            type="checkbox" 
+                            checked={todo[field.name] === true} 
+                            onChange={e => updateTodo(todo.id, field.name, e.target.checked)} 
+                            disabled={result.syncedToNotion} 
+                            className="rounded bg-slate-800 border-slate-600 focus:ring-offset-slate-900" 
+                          />
+                          {field.name}
+                        </label>
+                      );
+                    } else {
+                      return (
+                        <input 
+                          key={field.id} 
+                          type="text" 
+                          value={todo[field.name] || ''} 
+                          onChange={e => updateTodo(todo.id, field.name, e.target.value)} 
+                          disabled={result.syncedToNotion} 
+                          placeholder={field.name} 
+                          className="w-16 bg-transparent text-xs border-b border-white/10 focus:border-purple-500/50 outline-none text-slate-300 px-1" 
+                        />
+                      );
+                    }
+                  })}
                 </div>
               ))}
               {!result.syncedToNotion && (
