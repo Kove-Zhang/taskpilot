@@ -1,18 +1,38 @@
 import { useEffect, useState } from 'react'
-import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown } from 'lucide-react'
+import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown, Mail } from 'lucide-react'
 import { useSettingsStore } from './store'
 import { logger } from './lib/logger'
 import { fetch } from '@tauri-apps/plugin-http'
+import { invoke } from '@tauri-apps/api/core'
+
+
+function decodeIMAPFolder(name: string): string {
+  return name.replace(/&([^-]*)-/g, function(match, base64) {
+    if (base64 === '') return '&';
+    const b64 = base64.replace(/,/g, '/');
+    try {
+      const bin = atob(b64);
+      let res = '';
+      for (let i = 0; i < bin.length; i += 2) {
+        res += String.fromCharCode((bin.charCodeAt(i) << 8) | (bin.charCodeAt(i + 1) || 0));
+      }
+      return res;
+    } catch (e) {
+      return match;
+    }
+  });
+}
 
 interface SettingsPanelProps {
+
   onClose: () => void;
 }
 
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    notionProperties, fieldMappings, tokenLimit, enableReasoning,
-    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning
+    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig,
+    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig
   } = useSettingsStore();
 
   const [formBaseUrl, setFormBaseUrl] = useState(apiBaseUrl);
@@ -25,10 +45,38 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [formGlobalShortcut, setFormGlobalShortcut] = useState(globalShortcut);
   const [formTokenLimit, setFormTokenLimit] = useState(tokenLimit);
   const [formEnableReasoning, setFormEnableReasoning] = useState(enableReasoning);
+  const [formEmailConfig, setFormEmailConfig] = useState(emailConfig);
+  const [availableFolders, setAvailableFolders] = useState<string[]>([]);
+  const [loadingFolders, setLoadingFolders] = useState(false);
+  const [folderError, setFolderError] = useState('');
+
+  const handleFetchFolders = async () => {
+    if (!formEmailConfig.host || !formEmailConfig.user || !formEmailConfig.pass) {
+      setFolderError('请先填写 IMAP 服务器和账号密码');
+      return;
+    }
+    setLoadingFolders(true);
+    setFolderError('');
+    try {
+      const folders = await invoke<string[]>('get_email_folders', {
+        host: formEmailConfig.host,
+        port: formEmailConfig.port,
+        user: formEmailConfig.user,
+        pass: formEmailConfig.pass,
+        ssl: formEmailConfig.ssl
+      });
+      setAvailableFolders(folders);
+    } catch (e: any) {
+      setFolderError('获取文件夹失败: ' + String(e));
+    } finally {
+      setLoadingFolders(false);
+    }
+  };
+
   const [formFieldMappings, setFormFieldMappings] = useState(fieldMappings);
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false);
   const [liveShortcut, setLiveShortcut] = useState('');
-  const [activeTab, setActiveTab] = useState<'ai' | 'integration' | 'system'>('ai');
+  const [activeTab, setActiveTab] = useState<'ai' | 'integration' | 'email' | 'system'>('ai');
 
   const [testingConnection, setTestingConnection] = useState(false);
   const [testResult, setTestResult] = useState<'none' | 'success' | 'error'>('none');
@@ -49,6 +97,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setGlobalShortcut(formGlobalShortcut);
     setTokenLimit(formTokenLimit);
     setEnableReasoning(formEnableReasoning);
+    setEmailConfig(formEmailConfig);
     Object.entries(formFieldMappings).forEach(([k, v]) => setFieldMapping(k, v));
     
     // 同步到后端 Rust
@@ -360,6 +409,13 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             {activeTab === 'ai' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-purple-500 rounded-t-full shadow-[0_0_8px_rgba(168,85,247,0.5)]"></div>}
           </button>
           <button
+            onClick={() => setActiveTab('email')}
+            className={`pb-3 text-sm font-medium transition-colors relative ${activeTab === 'email' ? 'text-pink-400' : 'text-slate-400 hover:text-slate-300'}`}
+          >
+            <div className="flex items-center gap-2"><Mail className="w-4 h-4" /> 邮件监听</div>
+            {activeTab === 'email' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-pink-500 rounded-t-full shadow-[0_0_8px_rgba(244,114,182,0.5)]"></div>}
+          </button>
+          <button
             onClick={() => setActiveTab('integration')}
             className={`pb-3 text-sm font-medium transition-colors relative ${activeTab === 'integration' ? 'text-orange-400' : 'text-slate-400 hover:text-slate-300'}`}
           >
@@ -493,6 +549,205 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                 className="w-full bg-slate-900/50 border border-white/10 rounded p-2 text-sm text-slate-200 min-h-[120px] resize-none focus:ring-1 focus:ring-blue-500 outline-none"
                 placeholder="例如：我是一名前端开发，请侧重提取关于 UI、交互、接口联调的待办..."
               />
+            </div>
+          </div>
+
+          {/* --- TAB: Email --- */}
+          <div className={`space-y-6 animate-in fade-in slide-in-from-right-4 duration-300 ${activeTab !== 'email' ? 'hidden' : ''}`}>
+            <div className="space-y-3">
+              <h3 className="text-sm font-medium text-pink-300 flex items-center gap-2">
+                <Mail className="w-4 h-4" /> 邮件监听配置
+              </h3>
+              
+              <div className="bg-slate-900/50 p-4 rounded-lg border border-white/5 space-y-4">
+                <label className="flex items-center gap-3 cursor-pointer group">
+                  <input 
+                    type="checkbox" 
+                    checked={formEmailConfig.enabled}
+                    onChange={(e) => setFormEmailConfig({...formEmailConfig, enabled: e.target.checked})}
+                    className="w-4 h-4 rounded border-white/10 bg-slate-800 text-pink-500 focus:ring-pink-500/50"
+                  />
+                  <span className="text-sm text-slate-200 group-hover:text-white transition-colors">启用定时监听邮件</span>
+                </label>
+                
+                {formEmailConfig.enabled && (
+                  <div className="space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs text-slate-400 mb-1 block">IMAP 服务器</label>
+                        <input 
+                          type="text" 
+                          value={formEmailConfig.host}
+                          onChange={(e) => setFormEmailConfig({...formEmailConfig, host: e.target.value})}
+                          placeholder="imap.example.com"
+                          className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                        />
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-xs text-slate-400 mb-1 block">端口</label>
+                          <input 
+                            type="number" 
+                            value={formEmailConfig.port}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, port: Number(e.target.value)})}
+                            className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                          />
+                        </div>
+                        <div className="flex items-end pb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input 
+                              type="checkbox" 
+                              checked={formEmailConfig.ssl}
+                              onChange={(e) => setFormEmailConfig({...formEmailConfig, ssl: e.target.checked})}
+                              className="rounded border-white/10 bg-slate-800 text-pink-500 focus:ring-pink-500/50"
+                            />
+                            <span className="text-xs text-slate-300">SSL/TLS</span>
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs text-slate-400 mb-1 block">邮箱账号</label>
+                        <input 
+                          type="text" 
+                          value={formEmailConfig.user}
+                          onChange={(e) => setFormEmailConfig({...formEmailConfig, user: e.target.value})}
+                          placeholder="user@example.com"
+                          className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-400 mb-1 block">授权码/密码</label>
+                        <input 
+                          type="password" 
+                          value={formEmailConfig.pass}
+                          onChange={(e) => setFormEmailConfig({...formEmailConfig, pass: e.target.value})}
+                          placeholder="••••••••"
+                          className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                        />
+                      </div>
+                    </div>
+                    
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs text-slate-400 block">监听文件夹 (默认 INBOX)</label>
+                        <button
+                          onClick={handleFetchFolders}
+                          disabled={loadingFolders}
+                          className="text-xs text-pink-400 hover:text-pink-300 transition-colors disabled:opacity-50 flex items-center gap-1"
+                        >
+                          {loadingFolders ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+                          自动同步
+                        </button>
+                      </div>
+                      
+                      {folderError && <div className="text-xs text-red-400">{folderError}</div>}
+                      
+                      {availableFolders.length > 0 ? (
+                        <div className="bg-black/30 border border-white/10 rounded p-3 max-h-32 overflow-y-auto custom-scrollbar flex flex-wrap gap-2">
+                          {availableFolders.map(folder => {
+                            const isSelected = formEmailConfig.targetFolder.split(',').includes(folder);
+                            return (
+                              <label key={folder} className="flex items-center gap-1.5 cursor-pointer bg-slate-800/50 hover:bg-slate-700/50 px-2 py-1 rounded border border-white/5 transition-colors">
+                                <input 
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={(e) => {
+                                    const current = formEmailConfig.targetFolder.split(',').filter(Boolean);
+                                    let next;
+                                    if (e.target.checked) {
+                                      next = [...current, folder];
+                                    } else {
+                                      next = current.filter(f => f !== folder);
+                                    }
+                                    setFormEmailConfig({...formEmailConfig, targetFolder: next.join(',')});
+                                  }}
+                                  className="w-3 h-3 rounded border-white/10 bg-slate-800 text-pink-500 focus:ring-pink-500/50"
+                                />
+                                <span className="text-xs text-slate-300">{decodeIMAPFolder(folder)}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <input 
+                          type="text" 
+                          value={formEmailConfig.targetFolder}
+                          onChange={(e) => setFormEmailConfig({...formEmailConfig, targetFolder: e.target.value})}
+                          placeholder="如 INBOX, 或者点击右上角自动同步"
+                          className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                        />
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label className="text-xs text-slate-400 block mb-1">定时执行周期</label>
+                        <div className="flex gap-2 flex-wrap">
+                          {['日', '一', '二', '三', '四', '五', '六'].map((day, idx) => (
+                            <label key={idx} className="flex items-center gap-1 cursor-pointer">
+                              <input 
+                                type="checkbox"
+                                checked={formEmailConfig.scheduleDays.includes(idx)}
+                                onChange={(e) => {
+                                  const newDays = e.target.checked 
+                                    ? [...formEmailConfig.scheduleDays, idx].sort()
+                                    : formEmailConfig.scheduleDays.filter(d => d !== idx);
+                                  setFormEmailConfig({...formEmailConfig, scheduleDays: newDays});
+                                }}
+                                className="w-3 h-3 rounded border-white/10 bg-slate-800 text-pink-500 focus:ring-pink-500/50"
+                              />
+                              <span className="text-[11px] text-slate-300">周{day}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-400 mb-1 block">执行时间/间隔</label>
+                        <select 
+                          value={formEmailConfig.scheduleTime}
+                          onChange={(e) => setFormEmailConfig({...formEmailConfig, scheduleTime: e.target.value})}
+                          className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                        >
+                          <option value="every_1h">每 1 小时执行一次</option>
+                          <option value="every_3h">每 3 小时执行一次</option>
+                          <option value="09:00">每天 09:00 定时执行</option>
+                          <option value="10:00">每天 10:00 定时执行</option>
+                          <option value="12:00">每天 12:00 定时执行</option>
+                          <option value="18:00">每天 18:00 定时执行</option>
+                        </select>
+                      </div>
+                    </div>
+                    
+                    <div className="flex items-center gap-4 border-t border-white/5 pt-3">
+                       <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                          <input 
+                            type="checkbox" 
+                            checked={formEmailConfig.markAsRead}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, markAsRead: e.target.checked})}
+                            className="rounded border-white/10 bg-slate-800 text-pink-500 focus:ring-pink-500/50"
+                          />
+                          处理成功后标记为已读
+                       </label>
+                       
+                       <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                          <input 
+                            type="checkbox" 
+                            checked={formEmailConfig.autoSyncToNotion}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, autoSyncToNotion: e.target.checked})}
+                            className="rounded border-white/10 bg-slate-800 text-pink-500 focus:ring-pink-500/50"
+                          />
+                          自动同步待办至 Notion
+                       </label>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                ⚠️ 由于安全策略限制，QQ 邮箱、163 邮箱等大多需要使用独立的“授权码”而非登录密码。请前往对应的 Web 邮箱设置中生成。
+              </p>
             </div>
           </div>
 

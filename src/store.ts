@@ -27,6 +27,9 @@ const secureStorage: StateStorage = {
         if (parsed.state?.notionApiKey) {
           parsed.state.notionApiKey = await invoke('decrypt_secret', { cipherText: parsed.state.notionApiKey });
         }
+        if (parsed.state?.emailConfig?.pass) {
+          parsed.state.emailConfig.pass = await invoke('decrypt_secret', { cipherText: parsed.state.emailConfig.pass });
+        }
         return JSON.stringify(parsed);
       } catch (e) {
         console.warn("Parse or decrypt error:", e);
@@ -45,6 +48,9 @@ const secureStorage: StateStorage = {
       }
       if (parsed.state?.notionApiKey) {
         parsed.state.notionApiKey = await invoke('encrypt_secret', { value: parsed.state.notionApiKey });
+      }
+      if (parsed.state?.emailConfig?.pass) {
+        parsed.state.emailConfig.pass = await invoke('encrypt_secret', { value: parsed.state.emailConfig.pass });
       }
       await tauriStore.set(name, JSON.stringify(parsed));
       await tauriStore.save();
@@ -78,6 +84,21 @@ export interface FieldMapping {
   order: number;
 }
 
+export interface EmailConfig {
+  host: string;
+  port: number;
+  ssl: boolean;
+  user: string;
+  pass: string;
+  targetFolder: string;
+  scheduleDays: number[]; // 0 = Sunday, 1 = Monday, ... 6 = Saturday
+  scheduleTime: string; // e.g. "09:00" or interval like "every_1h", "every_3h"
+  markAsRead: boolean;
+  retryCount: number;
+  enabled: boolean;
+  autoSyncToNotion: boolean;
+}
+
 interface SettingsState {
   apiBaseUrl: string;
   apiKey: string;
@@ -91,6 +112,7 @@ interface SettingsState {
   fieldMappings: Record<string, FieldMapping>;
   tokenLimit: number;
   enableReasoning: boolean;
+  emailConfig: EmailConfig;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
   setPersonalFocus: (focus: string) => void;
   setNotionSettings: (key: string, dbId: string) => void;
@@ -100,6 +122,7 @@ interface SettingsState {
   setFieldMapping: (notionPropId: string, mapping: FieldMapping) => void;
   setTokenLimit: (limit: number) => void;
   setEnableReasoning: (enable: boolean) => void;
+  setEmailConfig: (config: Partial<EmailConfig>) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -117,6 +140,20 @@ export const useSettingsStore = create<SettingsState>()(
       fieldMappings: {},
       tokenLimit: 8000,
       enableReasoning: false,
+      emailConfig: {
+        host: '',
+        port: 993,
+        ssl: true,
+        user: '',
+        pass: '',
+        targetFolder: 'INBOX',
+        scheduleDays: [1, 2, 3, 4, 5],
+        scheduleTime: 'every_1h',
+        markAsRead: false,
+        retryCount: 1,
+        enabled: false,
+        autoSyncToNotion: false
+      },
       setApiSettings: (apiBaseUrl, apiKey, modelName) => set({ apiBaseUrl, apiKey, modelName }),
       setPersonalFocus: (personalFocus) => set({ personalFocus }),
       setNotionSettings: (notionApiKey, notionDatabaseId) => set({ notionApiKey, notionDatabaseId }),
@@ -130,7 +167,10 @@ export const useSettingsStore = create<SettingsState>()(
         }
       })),
       setTokenLimit: (tokenLimit) => set({ tokenLimit }),
-      setEnableReasoning: (enableReasoning) => set({ enableReasoning })
+      setEnableReasoning: (enableReasoning) => set({ enableReasoning }),
+      setEmailConfig: (config: Partial<EmailConfig>) => set((state) => ({ 
+        emailConfig: { ...state.emailConfig, ...config } 
+      })),
     }),
     {
       name: 'task-pilot-settings',

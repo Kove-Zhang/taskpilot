@@ -8,6 +8,9 @@ use tauri::Emitter;
 use sha2::{Sha256, Digest};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+mod imap_cmds;
+use imap_cmds::{get_email_folders, fetch_emails, mark_email_read};
+
 struct AppState {
     is_recording: AtomicBool,
 }
@@ -236,7 +239,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, update_shortcut, set_recording_mode, encrypt_secret, decrypt_secret])
+        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, update_shortcut, set_recording_mode, encrypt_secret, decrypt_secret, get_email_folders, fetch_emails, mark_email_read])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

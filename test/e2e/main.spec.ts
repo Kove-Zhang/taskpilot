@@ -20,8 +20,31 @@ describe('Task Pilot E2E', () => {
         const apiKeyInput = await $('input[placeholder*="API Key"]')
         await apiKeyInput.setValue('f27bd2b1-ebf6-4452-8510-96172e0fea87')
 
-        const modelInput = await $('input[placeholder*="模型名称"]')
-        await modelInput.setValue('qwen3.7-plus')
+        const modelInput = await $('input[placeholder*="gpt-4o"]')
+        if (await modelInput.isExisting()) {
+            await modelInput.setValue('qwen3.7-plus')
+        }
+        
+        // 3.5 Test Email Integration Tab
+        const emailTabBtn = await $('button=✉️ 邮件监听')
+        if (await emailTabBtn.isExisting()) {
+            await emailTabBtn.click()
+            
+            const enableEmailCheckbox = await $('label=启用定时监听邮件')
+            if (await enableEmailCheckbox.isExisting()) {
+                await enableEmailCheckbox.click() // Check it to reveal inputs
+            }
+
+            const imapHostInput = await $('input[placeholder="imap.example.com"]')
+            if (await imapHostInput.isExisting()) {
+                await imapHostInput.setValue('imap.qq.com')
+            }
+
+            const imapUserInput = await $('input[placeholder="user@example.com"]')
+            if (await imapUserInput.isExisting()) {
+                await imapUserInput.setValue('test@qq.com')
+            }
+        }
         
         // 4. Save and Close Settings
         // Click outside or explicit save button depending on UI

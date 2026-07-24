@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import type { ClipboardEvent, ChangeEvent, DragEvent } from 'react'
-import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare } from 'lucide-react'
+import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail } from 'lucide-react'
 import SettingsPanel from './SettingsPanel'
 import HistoryPanel from './HistoryPanel'
+import EmailTasksPanel from './EmailTasksPanel'
+import { startEmailScheduler, stopEmailScheduler } from './lib/emailScheduler'
 import { extractTodosFromContent, generateWriting } from './lib/ai'
 import type { AIResult } from './lib/ai'
 import { syncToNotion } from './lib/notion'
@@ -55,6 +57,7 @@ export default function App() {
   const [images, setImages] = useState<string[]>([])
   const [showSettings, setShowSettings] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
+  const [showEmailHistory, setShowEmailHistory] = useState(false)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<AIResult | null>(null)
   const [error, setError] = useState<string | null>(null);
@@ -84,7 +87,8 @@ export default function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    const setup = async () => {
+    startEmailScheduler();
+      const setup = async () => {
       // Sync shortcut on mount
       const globalShortcut = useSettingsStore.getState().globalShortcut;
       invoke('update_shortcut', { shortcut: globalShortcut }).catch(e => {
@@ -101,6 +105,7 @@ export default function App() {
     setup();
     return () => {
       if (unlisten) unlisten();
+        stopEmailScheduler();
     }
   }, []);
 
@@ -395,6 +400,13 @@ export default function App() {
               <Clock className="w-5 h-5 text-slate-400 group-hover:text-blue-400" />
             </button>
             <button 
+              onClick={() => setShowEmailHistory(true)}
+              className="p-2 hover:bg-white/10 rounded-full transition-colors group"
+              title="邮件监听历史"
+            >
+              <Mail className="w-5 h-5 text-slate-400 group-hover:text-pink-400" />
+            </button>
+            <button 
               onClick={() => setShowSettings(true)}
               className="p-2 hover:bg-white/10 rounded-full transition-colors group"
               title="设置"
@@ -650,6 +662,7 @@ export default function App() {
 
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} />}
+      {showEmailHistory && <EmailTasksPanel onClose={() => setShowEmailHistory(false)} />}
     </div>
   )
 }

@@ -40,7 +40,7 @@ describe('AI Helper Methods', () => {
     const callArgs = mockFetch.mock.calls[0]
     expect(callArgs[0]).toBe('https://api.openai.com/v1/chat/completions')
     expect(JSON.parse(callArgs[1].body)).toHaveProperty('model', 'gpt-4o')
-    expect(JSON.parse(callArgs[1].body).messages[1].content).toContain('Draft an email')
-    expect(JSON.parse(callArgs[1].body).messages[1].content).toContain('Buy milk')
+    expect(JSON.parse(callArgs[1].body).messages[1].content[0].text).toContain('Draft an email')
+    expect(JSON.parse(callArgs[1].body).messages[1].content[0].text).toContain('Buy milk')
   })
 })
