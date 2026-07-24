@@ -16,7 +16,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const { notionProperties, fieldMappings } = useSettingsStore();
   const [history, setHistory] = useState<EmailHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const { running, progressMsg } = useScannerStore();
+  const { running, progressMsg, historyVersion } = useScannerStore();
   const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
   const [editingEntryIndex, setEditingEntryIndex] = useState<number | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -93,7 +93,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
 
   useEffect(() => {
     loadHistory();
-  }, []);
+  }, [historyVersion]);
 
   const loadHistory = async () => {
     setLoading(true);
@@ -153,7 +153,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const handleForceRun = async () => {
     if (running) return;
     try {
-      await forceRunEmailScanner();
+      await forceRunEmailScanner(true);
       await loadHistory();
     } catch (e) {
       console.error(e);

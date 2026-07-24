@@ -97,6 +97,8 @@ export interface EmailConfig {
   retryCount: number;
   enabled: boolean;
   autoSyncToNotion: boolean;
+  autoReadDays: number;
+  manualReadDays: number;
 }
 
 interface SettingsState {
@@ -152,7 +154,9 @@ export const useSettingsStore = create<SettingsState>()(
         markAsRead: false,
         retryCount: 1,
         enabled: false,
-        autoSyncToNotion: false
+        autoSyncToNotion: false,
+        autoReadDays: 3,
+        manualReadDays: 7
       },
       setApiSettings: (apiBaseUrl, apiKey, modelName) => set({ apiBaseUrl, apiKey, modelName }),
       setPersonalFocus: (personalFocus) => set({ personalFocus }),
@@ -182,13 +186,17 @@ export const useSettingsStore = create<SettingsState>()(
 export interface ScannerState {
   running: boolean;
   progressMsg: string;
+  historyVersion: number;
   setRunning: (running: boolean) => void;
   setProgressMsg: (progressMsg: string) => void;
+  incrementHistoryVersion: () => void;
 }
 
 export const useScannerStore = create<ScannerState>((set) => ({
   running: false,
   progressMsg: '',
+  historyVersion: 0,
   setRunning: (running) => set({ running }),
-  setProgressMsg: (progressMsg) => set({ progressMsg })
+  setProgressMsg: (progressMsg) => set({ progressMsg }),
+  incrementHistoryVersion: () => set((state) => ({ historyVersion: state.historyVersion + 1 }))
 }))

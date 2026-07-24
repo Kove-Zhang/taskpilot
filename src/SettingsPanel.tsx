@@ -6,23 +6,7 @@ import { fetch } from '@tauri-apps/plugin-http'
 import { invoke } from '@tauri-apps/api/core'
 
 
-function decodeIMAPFolder(name: string): string {
-  return name.replace(/&([^-]*)-/g, function(match, base64) {
-    if (base64 === '') return '&';
-    const b64 = base64.replace(/,/g, '/');
-    try {
-      const bin = atob(b64);
-      let res = '';
-      for (let i = 0; i < bin.length; i += 2) {
-        res += String.fromCharCode((bin.charCodeAt(i) << 8) | (bin.charCodeAt(i + 1) || 0));
-      }
-      return res;
-    } catch (e) {
-      return match;
-    }
-  });
-}
-
+import { decodeIMAPFolder } from './lib/parser'
 interface SettingsPanelProps {
 
   onClose: () => void;
@@ -748,6 +732,30 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                             className="rounded border-white/10 bg-slate-800 text-pink-500 focus:ring-pink-500/50"
                           />
                           自动同步待办至 Notion
+                       </label>
+                    </div>
+
+                    <div className="flex gap-4 border-t border-white/5 pt-3">
+                       <label className="flex flex-col gap-1 text-xs text-slate-300 w-1/2">
+                          <span>自动抓取回溯天数 (Auto)</span>
+                          <input 
+                            type="number" 
+                            min="1" max="365"
+                            value={formEmailConfig.autoReadDays || 3}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, autoReadDays: parseInt(e.target.value) || 3})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none w-full"
+                          />
+                       </label>
+                       
+                       <label className="flex flex-col gap-1 text-xs text-slate-300 w-1/2">
+                          <span>手动抓取回溯天数 (Manual)</span>
+                          <input 
+                            type="number" 
+                            min="1" max="365"
+                            value={formEmailConfig.manualReadDays || 7}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, manualReadDays: parseInt(e.target.value) || 7})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none w-full"
+                          />
                        </label>
                     </div>
                   </div>

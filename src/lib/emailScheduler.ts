@@ -1,5 +1,6 @@
 import { useSettingsStore, useScannerStore } from '../store';
 import { invoke } from '@tauri-apps/api/core';
+import { decodeIMAPFolder } from './parser';
 import { extractTodosFromContent, type AIResult } from './ai';
 import { syncToNotion } from './notion';
 import { logger } from './logger';
@@ -150,7 +151,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
     };
 }
 
-export async function forceRunEmailScanner() {
+export async function forceRunEmailScanner(isManual: boolean = false) {
     const scannerStore = useScannerStore.getState();
     if (scannerStore.running) {
         logger.warn("Email scanner is already running, skipping.");
@@ -177,7 +178,8 @@ export async function forceRunEmailScanner() {
         for (const folder of folders) {
             logger.info(`Fetching emails from folder: ${folder}`);
             try {
-                scannerStore.setProgressMsg(`拉取目录 ${folder}...`);
+                scannerStore.setProgressMsg(`拉取目录 ${decodeIMAPFolder(folder)}...`);
+                const sinceDays = isManual ? (emailConfig.manualReadDays || 7) : (emailConfig.autoReadDays || 3);
                 const emails = await invoke('fetch_emails', {
                     host: emailConfig.host,
                     port: emailConfig.port,
@@ -185,7 +187,8 @@ export async function forceRunEmailScanner() {
                     pass: emailConfig.pass,
                     ssl: emailConfig.ssl,
                     folder: folder,
-                    unreadOnly: true
+                    unreadOnly: true,
+                    sinceDays: sinceDays
                 }) as any[];
 
                 logger.info(`Fetched ${emails.length} unread emails from ${folder}.`);
@@ -198,28 +201,28 @@ export async function forceRunEmailScanner() {
                     if (!processedUids.includes(`${folder}_${email.uid}`)) {
                         // If it wasn't added inside processSingleEmail, it means it skipped or failed
                     }
-                    results.push(result);
+                    
+                    // Immediately save to history for real-time feedback
+                    if (result.aiResult || result.status === 'failed') {
+                        let existing: EmailHistoryItem[] = await historyStore.get('history') || [];
+                        existing.unshift(result);
+                        if (existing.length > 500) existing = existing.slice(0, 500);
+                        await historyStore.set('history', existing);
+                        await historyStore.save();
+                        scannerStore.incrementHistoryVersion();
+                    }
+
+                    // Save processed UIDs to prevent duplicates in future runs incrementally
+                    if (processedUids.length > 5000) {
+                        processedUids = processedUids.slice(processedUids.length - 5000);
+                    }
+                    await historyStore.set('processed_uids', processedUids);
                 }
             } catch (err) {
                 logger.error(`Failed to fetch emails from folder ${folder}`, err);
             }
         }
 
-        // Save processed UIDs to prevent duplicates in future runs
-        if (processedUids.length > 5000) {
-            processedUids = processedUids.slice(processedUids.length - 5000);
-        }
-        await historyStore.set('processed_uids', processedUids);
-
-        // Save results to history
-        // Filter out skipped items to prevent flooding history panel
-        const newResults = results.filter(r => r.aiResult || r.status === 'failed');
-        if (newResults.length > 0) {
-            let existing: EmailHistoryItem[] = await historyStore.get('history') || [];
-            existing = [...newResults, ...existing].slice(0, 500); // Keep last 500
-            await historyStore.set('history', existing);
-        }
-        
         await historyStore.save();
 
         logger.info("Email scanner batch completed.");
@@ -240,7 +243,7 @@ export function startEmailScheduler() {
     // Check every 10 seconds to prevent skipping due to interval drift
     timerInterval = setInterval(() => {
         if (shouldRunNow()) {
-            forceRunEmailScanner().then(() => {
+            forceRunEmailScanner(false).then(() => {
                 // Do nothing
             });
         }

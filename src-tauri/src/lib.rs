@@ -166,6 +166,16 @@ fn open_log_file(app_handle: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn clear_log(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let mut log_path = app_handle.path().app_data_dir().unwrap();
+    log_path.push("task-pilot.log");
+    if log_path.exists() {
+        fs::write(&log_path, "").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn update_shortcut(app_handle: tauri::AppHandle, shortcut: String) -> Result<(), String> {
     use std::str::FromStr;
     app_handle.global_shortcut().unregister_all().map_err(|e| e.to_string())?;
@@ -239,7 +249,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, update_shortcut, set_recording_mode, encrypt_secret, decrypt_secret, get_email_folders, fetch_emails, mark_email_read])
+        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, clear_log, update_shortcut, set_recording_mode, encrypt_secret, decrypt_secret, get_email_folders, fetch_emails, mark_email_read])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

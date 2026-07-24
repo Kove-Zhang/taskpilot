@@ -86,6 +86,7 @@ pub async fn fetch_emails(
     ssl: bool,
     folder: String,
     unread_only: bool,
+    since_days: Option<u32>,
 ) -> Result<Vec<Email>, String> {
     if !ssl {
         return Err("Only SSL is supported".to_string());
@@ -100,8 +101,18 @@ pub async fn fetch_emails(
         
     session.select(&folder).map_err(|e| format!("Select Error: {}", e))?;
     
-    let query = if unread_only { "UNSEEN" } else { "ALL" };
-    let uids = session.uid_search(query).map_err(|e| format!("Search Error: {}", e))?;
+    let query = if let Some(days) = since_days {
+        let since_date = (chrono::Local::now() - chrono::Duration::days(days as i64)).format("%d-%b-%Y").to_string();
+        if unread_only {
+            format!("UNSEEN SINCE {}", since_date)
+        } else {
+            format!("SINCE {}", since_date)
+        }
+    } else {
+        if unread_only { "UNSEEN".to_string() } else { "ALL".to_string() }
+    };
+    
+    let uids = session.uid_search(&query).map_err(|e| format!("Search Error: {}", e))?;
     
     let mut emails = Vec::new();
     
