@@ -409,18 +409,18 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             {activeTab === 'ai' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-purple-500 rounded-t-full shadow-[0_0_8px_rgba(168,85,247,0.5)]"></div>}
           </button>
           <button
-            onClick={() => setActiveTab('email')}
-            className={`pb-3 text-sm font-medium transition-colors relative ${activeTab === 'email' ? 'text-pink-400' : 'text-slate-400 hover:text-slate-300'}`}
-          >
-            <div className="flex items-center gap-2"><Mail className="w-4 h-4" /> 邮件监听</div>
-            {activeTab === 'email' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-pink-500 rounded-t-full shadow-[0_0_8px_rgba(244,114,182,0.5)]"></div>}
-          </button>
-          <button
             onClick={() => setActiveTab('integration')}
             className={`pb-3 text-sm font-medium transition-colors relative ${activeTab === 'integration' ? 'text-orange-400' : 'text-slate-400 hover:text-slate-300'}`}
           >
             <div className="flex items-center gap-2"><Database className="w-4 h-4" /> 集成与推送</div>
             {activeTab === 'integration' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500 rounded-t-full shadow-[0_0_8px_rgba(249,115,22,0.5)]"></div>}
+          </button>
+          <button
+            onClick={() => setActiveTab('email')}
+            className={`pb-3 text-sm font-medium transition-colors relative ${activeTab === 'email' ? 'text-pink-400' : 'text-slate-400 hover:text-slate-300'}`}
+          >
+            <div className="flex items-center gap-2"><Mail className="w-4 h-4" /> 邮件监听</div>
+            {activeTab === 'email' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-pink-500 rounded-t-full shadow-[0_0_8px_rgba(244,114,182,0.5)]"></div>}
           </button>
           <button
             onClick={() => setActiveTab('system')}
@@ -672,13 +672,21 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                           })}
                         </div>
                       ) : (
-                        <input 
-                          type="text" 
-                          value={formEmailConfig.targetFolder}
-                          onChange={(e) => setFormEmailConfig({...formEmailConfig, targetFolder: e.target.value})}
-                          placeholder="如 INBOX, 或者点击右上角自动同步"
-                          className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
-                        />
+                        <div className="space-y-1">
+                          <input 
+                            type="text" 
+                            readOnly
+                            value={formEmailConfig.targetFolder.split(',').map(f => decodeIMAPFolder(f)).join(',')}
+                            className="w-full bg-black/30 border border-white/10 rounded p-2 text-sm text-slate-200 focus:outline-none cursor-default"
+                          />
+                          <input 
+                            type="text" 
+                            value={formEmailConfig.targetFolder}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, targetFolder: e.target.value})}
+                            placeholder="如 INBOX, 或者点击右上角自动同步"
+                            className="w-full bg-transparent border-none p-0 text-[10px] text-slate-500 focus:ring-0 outline-none font-mono"
+                          />
+                        </div>
                       )}
                     </div>
 
