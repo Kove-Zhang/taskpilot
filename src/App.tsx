@@ -236,7 +236,7 @@ export default function App() {
 
   const handleSyncNotion = async () => {
     if (!result || result.todos.length === 0) return;
-    const selectedTodos = result.todos.filter(t => t.selected !== false);
+    const selectedTodos = result.todos.filter(t => t.selected !== false && !t.synced);
     if (selectedTodos.length === 0) return;
     
     setSyncing(true);
@@ -269,12 +269,24 @@ export default function App() {
         };
       });
       
-      // Update history if all succeeded
+      // Update history to persist individual sync statuses even on partial failure
+      const dataJson = await invoke<string>("load_history").catch(() => "[]");
+      let history = JSON.parse(dataJson || "[]");
+      history = history.map((h: any) => h.result?.id === result.id ? { 
+        ...h, 
+        result: { 
+          ...h.result, 
+          syncedToNotion: failed.length === 0,
+          todos: h.result.todos.map((t: any) => {
+            if (succeeded.find(s => s.id === t.id)) {
+              return { ...t, synced: true };
+            }
+            return t;
+          })
+        } 
+      } : h);
+      await invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
       if (failed.length === 0) {
-        const dataJson = await invoke<string>("load_history").catch(() => "[]");
-        let history = JSON.parse(dataJson || "[]");
-        history = history.map((h: any) => h.result?.id === result.id ? { ...h, result: { ...h.result, syncedToNotion: true } } : h);
-        await invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
         logger.info('Sync to Notion complete (all success)');
       }
 

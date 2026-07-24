@@ -41,7 +41,9 @@ export async function syncToNotion(todos: TodoItem[]): Promise<SyncResult[]> {
              pageBody.properties[key] = { select: { name: String(value) } };
           } else if (key === 'planned_date' || key === '计划完成时间') {
              const dateStr = String(value).replace(/\//g, '-').substring(0, 10);
-             pageBody.properties[key] = { date: { start: dateStr } };
+             if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+               pageBody.properties[key] = { date: { start: dateStr } };
+             }
           }
           continue;
         }
@@ -73,7 +75,9 @@ export async function syncToNotion(todos: TodoItem[]): Promise<SyncResult[]> {
           case 'date':
             // Normalize date to ISO format YYYY-MM-DD
             let dateStr = String(value).replace(/\//g, '-').substring(0, 10);
-            pageBody.properties[key] = { date: { start: dateStr } };
+            if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+              pageBody.properties[key] = { date: { start: dateStr } };
+            }
             break;
           case 'checkbox':
             pageBody.properties[key] = { checkbox: value === true || String(value).toLowerCase() === 'true' };

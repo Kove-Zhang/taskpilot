@@ -81,25 +81,37 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
     const maxAttempts = emailConfig.retryCount + 1;
     let lastError = '';
 
+    let aiResult: AIResult | undefined = undefined;
+    let synced = false;
+
     while (attempt < maxAttempts) {
         attempt++;
         try {
             logger.info(`Processing email UID ${email.uid} (Attempt ${attempt})`);
             
             // 1. AI Extraction (truncation happens inside extractTodosFromContent)
-            const prompt = `邮件主题: ${email.subject}\n发件人: ${email.sender}\n日期: ${email.date}\n\n内容:\n${email.body_text}`;
-            const aiResult = await extractTodosFromContent(prompt, []);
+            if (!aiResult) {
+                const prompt = `邮件主题: ${email.subject}\n发件人: ${email.sender}\n日期: ${email.date}\n\n内容:\n${email.body_text}`;
+                aiResult = await extractTodosFromContent(prompt, []);
+            }
 
             // 2. Notion Sync (Only if autoSyncToNotion is true)
             const notionDbId = useSettingsStore.getState().notionDatabaseId;
-            let synced = false;
-            if (emailConfig.autoSyncToNotion && aiResult.todos && aiResult.todos.length > 0 && notionDbId) {
+            if (emailConfig.autoSyncToNotion && aiResult.todos && aiResult.todos.length > 0 && notionDbId && !synced) {
                 // Pre-process for sync if necessary
-                const todosToSync = aiResult.todos.map(t => ({ ...t, selected: true }));
-                const syncRes = await syncToNotion(todosToSync);
-                const failed = syncRes.filter(r => !r.success);
-                if (failed.length > 0) {
-                    throw new Error(`Notion sync failed for ${failed.length} items`);
+                const todosToSync = aiResult.todos.filter(t => !t.synced).map(t => ({ ...t, selected: true }));
+                if (todosToSync.length > 0) {
+                    const syncRes = await syncToNotion(todosToSync);
+                    
+                    syncRes.filter(r => r.success).forEach(r => {
+                        const target = aiResult!.todos.find(t => t.id === r.id);
+                        if (target) target.synced = true;
+                    });
+                    
+                    const failed = syncRes.filter(r => !r.success);
+                    if (failed.length > 0) {
+                        throw new Error(`Notion sync failed for ${failed.length} items`);
+                    }
                 }
                 synced = true;
             }
@@ -151,6 +163,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
         emailDate: email.date,
         status: 'failed',
         error: lastError,
+        aiResult,
         folder
     };
 }
