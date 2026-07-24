@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2 } from 'lucide-react'
+import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2, Trash2 } from 'lucide-react'
 import { LazyStore } from '@tauri-apps/plugin-store'
 import type { EmailHistoryItem } from './lib/emailScheduler'
 import { forceRunEmailScanner } from './lib/emailScheduler'
@@ -101,6 +101,39 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
       console.error("加载邮箱历史记录失败", e);
     } finally {
       setLoading(false);
+    }
+  }
+
+  const clearAllHistory = async () => {
+    if (window.confirm('确定要清空所有邮箱监听历史记录并重置底层的防重复指纹吗？清空后，之前的未读邮件将被重新抓取。')) {
+      try {
+        await historyStore.set('history', []);
+        await historyStore.set('processed_uids', []);
+        await historyStore.save();
+        setHistory([]);
+      } catch (e) {
+        console.error("清空历史记录失败", e);
+      }
+    }
+  }
+
+  const removeHistoryItem = async (indexToRemove: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!window.confirm('确定要删除这条记录吗？删除后该邮件将在下次扫描时重新被抓取。')) return;
+
+    const entryToRemove = history[indexToRemove];
+    const newHistory = history.filter((_, idx) => idx !== indexToRemove);
+    
+    try {
+      let processedUids: string[] = await historyStore.get('processed_uids') || [];
+      processedUids = processedUids.filter(uidStr => !uidStr.endsWith(`_${entryToRemove.emailUid}`));
+      await historyStore.set('processed_uids', processedUids);
+      
+      await historyStore.set('history', newHistory);
+      await historyStore.save();
+      setHistory(newHistory);
+    } catch (err) {
+      console.error("删除记录失败", err);
     }
   }
 
@@ -265,6 +298,9 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
             邮箱监听历史
           </h2>
           <div className="flex items-center gap-3">
+            <button onClick={clearAllHistory} className="text-xs flex items-center gap-1 text-slate-400 hover:text-red-400 transition-colors">
+              <Trash2 className="w-3.5 h-3.5" /> 清空
+            </button>
             <button 
               onClick={handleForceRun} 
               disabled={running}
@@ -316,6 +352,9 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                     <span className="text-xs text-slate-500 font-mono bg-black/30 px-1.5 rounded">
                       UID: {entry.emailUid}
                     </span>
+                    <button onClick={(e) => removeHistoryItem(idx, e)} className="p-1 opacity-0 group-hover:opacity-100 hover:bg-white/10 rounded-md transition-all text-slate-400 hover:text-red-400">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
                 
