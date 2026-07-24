@@ -30,8 +30,9 @@ function shouldRunNow(): boolean {
 
     const now = new Date();
     
-    // Prevent running multiple times in the same minute
-    if (now.getTime() - lastRunTimestamp < 60000) {
+    // Prevent running multiple times in the same minute, but also handle interval drift robustly
+    const lastRunMinute = new Date(lastRunTimestamp).getMinutes();
+    if (lastRunTimestamp > 0 && now.getMinutes() === lastRunMinute && (now.getTime() - lastRunTimestamp < 5 * 60000)) {
         return false;
     }
     
@@ -48,6 +49,7 @@ function shouldRunNow(): boolean {
         return now.getHours() % 3 === 0 && now.getMinutes() === 0;
     } else {
         // Specific time like "09:00"
+        if (!scheduleTime || !scheduleTime.includes(':')) return false;
         const [hourStr, minStr] = scheduleTime.split(':');
         const hour = parseInt(hourStr, 10);
         const min = parseInt(minStr, 10);
@@ -198,14 +200,14 @@ let timerInterval: any = null;
 export function startEmailScheduler() {
     if (timerInterval) return;
 
-    // Check every minute
+    // Check every 10 seconds to prevent skipping due to interval drift
     timerInterval = setInterval(() => {
         if (shouldRunNow()) {
             forceRunEmailScanner().then(() => {
                 // Do nothing
             });
         }
-    }, 60 * 1000);
+    }, 10 * 1000);
 }
 
 export function stopEmailScheduler() {
