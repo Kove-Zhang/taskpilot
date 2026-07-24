@@ -7,11 +7,13 @@ import { useSettingsStore } from './store'
 interface HistoryEntry {
   timestamp: string;
   result: AIResult;
+  input?: string;
+  images?: string[];
 }
 
 interface HistoryPanelProps {
   onClose: () => void;
-  onRestore: (result: AIResult) => void;
+  onRestore: (result: AIResult, input?: string, images?: string[]) => void;
 }
 
 export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) {
@@ -136,24 +138,23 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                   </span>
                 )}
               </p>
-              <div className="flex justify-end gap-3 mt-2">
+              <div className="flex justify-end gap-2 mt-4">
                 <button 
                   onClick={() => setConfirmingIdx(null)}
-                  className="px-4 py-2 text-sm rounded bg-slate-700 hover:bg-slate-600 text-white transition-colors"
+                  className="px-3 py-1.5 text-xs text-slate-400 hover:text-white transition-colors"
                 >
                   取消
                 </button>
                 <button 
                   onClick={() => {
-                    if (confirmingIdx !== null) {
-                      onRestore(history[confirmingIdx].result);
-                      setConfirmingIdx(null);
-                      onClose();
-                    }
+                    const entry = history[confirmingIdx];
+                    onRestore(entry.result, entry.input, entry.images);
+                    setConfirmingIdx(null);
+                    onClose();
                   }}
-                  className="px-4 py-2 text-sm rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+                  className="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-500 text-white rounded transition-colors"
                 >
-                  确定
+                  确认恢复
                 </button>
               </div>
             </div>

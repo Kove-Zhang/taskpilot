@@ -89,6 +89,7 @@ interface SettingsState {
   globalShortcut: string;
   notionProperties: NotionProperty[];
   fieldMappings: Record<string, FieldMapping>;
+  tokenLimit: number;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
   setPersonalFocus: (focus: string) => void;
   setNotionSettings: (key: string, dbId: string) => void;
@@ -96,6 +97,7 @@ interface SettingsState {
   setGlobalShortcut: (shortcut: string) => void;
   setNotionProperties: (props: NotionProperty[]) => void;
   setFieldMapping: (notionPropId: string, mapping: FieldMapping) => void;
+  setTokenLimit: (limit: number) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -111,15 +113,20 @@ export const useSettingsStore = create<SettingsState>()(
       globalShortcut: 'Alt+Space',
       notionProperties: [],
       fieldMappings: {},
-      setApiSettings: (baseUrl, key, model) => set({ apiBaseUrl: baseUrl, apiKey: key, modelName: model }),
-      setPersonalFocus: (focus) => set({ personalFocus: focus }),
-      setNotionSettings: (key, dbId) => set({ notionApiKey: key, notionDatabaseId: dbId }),
-      setEnableLogging: (enable) => set({ enableLogging: enable }),
-      setGlobalShortcut: (shortcut) => set({ globalShortcut: shortcut }),
+      tokenLimit: 8000,
+      setApiSettings: (apiBaseUrl, apiKey, modelName) => set({ apiBaseUrl, apiKey, modelName }),
+      setPersonalFocus: (personalFocus) => set({ personalFocus }),
+      setNotionSettings: (notionApiKey, notionDatabaseId) => set({ notionApiKey, notionDatabaseId }),
+      setEnableLogging: (enableLogging) => set({ enableLogging }),
+      setGlobalShortcut: (globalShortcut) => set({ globalShortcut }),
       setNotionProperties: (props) => set({ notionProperties: props }),
       setFieldMapping: (id, mapping) => set((state) => ({
-        fieldMappings: { ...state.fieldMappings, [id]: mapping }
+        fieldMappings: {
+          ...state.fieldMappings,
+          [id]: mapping
+        }
       })),
+      setTokenLimit: (tokenLimit) => set({ tokenLimit })
     }),
     {
       name: 'task-pilot-settings',

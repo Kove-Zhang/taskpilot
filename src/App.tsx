@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import type { ClipboardEvent, ChangeEvent, DragEvent } from 'react'
 import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare } from 'lucide-react'
 import SettingsPanel from './SettingsPanel'
@@ -10,10 +10,47 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { parseFile } from './lib/parser'
 import { logger } from './lib/logger'
-import { useEffect } from 'react'
 import { useSettingsStore } from './store'
+const compressImage = async (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        const max = 1920;
+        if (width > max || height > max) {
+          if (width > height) {
+            height = Math.round((height * max) / width);
+            width = max;
+          } else {
+            width = Math.round((width * max) / height);
+            height = max;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.8));
+        } else {
+          resolve(event.target?.result as string);
+        }
+      };
+      img.onerror = () => reject(new Error('图片加载失败'));
+      img.src = event.target?.result as string;
+    };
+    reader.onerror = () => reject(new Error('文件读取失败'));
+    reader.readAsDataURL(file);
+  });
+};
 
-function App() {
+export default function App() {
   const [input, setInput] = useState('')
   const [images, setImages] = useState<string[]>([])
   const [showSettings, setShowSettings] = useState(false)
@@ -74,13 +111,11 @@ function App() {
         const file = items[i].getAsFile();
         if (file) {
           pastedImages++;
-          const reader = new FileReader();
-          reader.onload = (event) => {
-            if (event.target?.result) {
-              setImages(prev => [...prev, event.target!.result as string]);
-            }
-          };
-          reader.readAsDataURL(file);
+          compressImage(file).then(base64 => {
+            setImages(prev => [...prev, base64]);
+          }).catch(err => {
+            logger.error('Image compression failed', err);
+          });
         }
       }
     }
@@ -98,13 +133,12 @@ function App() {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         if (file.type.startsWith('image/')) {
-          const reader = new FileReader();
-          reader.onload = (event) => {
-            if (event.target?.result) {
-              setImages(prev => [...prev, event.target!.result as string]);
-            }
-          };
-          reader.readAsDataURL(file);
+          try {
+            const base64 = await compressImage(file);
+            setImages(prev => [...prev, base64]);
+          } catch (err) {
+            logger.error('File image compression failed', err);
+          }
         } else {
           const text = await parseFile(file);
           appendedText += `\n[文件 ${file.name}]:\n${text}\n`;
@@ -171,8 +205,16 @@ function App() {
       logger.info('AI extraction success', { todosCount: res.todos.length });
       try {
         const historyJson = await invoke<string>("load_history");
-        const historyArr = JSON.parse(historyJson || "[]");
-        historyArr.unshift({ timestamp: new Date().toISOString(), result: res });
+        let historyArr = JSON.parse(historyJson || "[]");
+        historyArr.unshift({ 
+          timestamp: new Date().toISOString(), 
+          result: res,
+          input: input,
+          images: images
+        });
+        if (historyArr.length > 50) {
+          historyArr = historyArr.slice(0, 50);
+        }
         await invoke("save_history", { data: JSON.stringify(historyArr) });
       } catch(e) {
         logger.warn("Failed to save history", e);
@@ -195,16 +237,41 @@ function App() {
     setError('');
     logger.info('Syncing to Notion...', { count: selectedTodos.length });
     try {
-      await syncToNotion(selectedTodos);
+      const syncResults = await syncToNotion(selectedTodos);
+      
+      const failed = syncResults.filter(r => !r.success);
+      const succeeded = syncResults.filter(r => r.success);
 
-      setResult(prev => prev ? { ...prev, syncedToNotion: true } : prev);
+      if (failed.length > 0) {
+        // Collect errors
+        const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\n');
+        setError(`部分同步失败 (${failed.length}/${selectedTodos.length}):\n${errorMsgs}`);
+        logger.warn('Partial Notion sync failure', { failedCount: failed.length, errors: failed.map(f => f.error) });
+      }
+
+      setResult(prev => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          syncedToNotion: failed.length === 0, // only true if all succeeded
+          todos: prev.todos.map(t => {
+            if (succeeded.find(s => s.id === t.id)) {
+              return { ...t, synced: true }; // Custom flag for UI if we want
+            }
+            return t;
+          })
+        };
+      });
       
-      const dataJson = await invoke<string>("load_history").catch(() => "[]");
-      let history = JSON.parse(dataJson || "[]");
-      history = history.map((h: any) => h.result?.id === result.id ? { ...h, result: { ...h.result, syncedToNotion: true } } : h);
-      await invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
-      
-      logger.info('Sync to Notion success');
+      // Update history if all succeeded
+      if (failed.length === 0) {
+        const dataJson = await invoke<string>("load_history").catch(() => "[]");
+        let history = JSON.parse(dataJson || "[]");
+        history = history.map((h: any) => h.result?.id === result.id ? { ...h, result: { ...h.result, syncedToNotion: true } } : h);
+        await invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
+        logger.info('Sync to Notion complete (all success)');
+      }
+
     } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
       setError(msg);
@@ -255,11 +322,11 @@ function App() {
     setWritingResult('');
   }
 
-  const handleRestoreHistory = (restoredResult: any) => {
+  const handleRestoreHistory = (restoredResult: any, restoredInput?: string, restoredImages?: string[]) => {
     setResult(restoredResult);
 
-    setInput('');
-    setImages([]);
+    setInput(restoredInput || '');
+    setImages(restoredImages || []);
     setWriteIntent('');
     setWritingResult('');
   }
@@ -270,7 +337,7 @@ function App() {
     setError('');
     logger.info('Starting AI writing...', { intent: writeIntent });
     try {
-      const generated = await generateWriting(writeIntent, result.todos);
+      const generated = await generateWriting(writeIntent, result.todos, input, images);
       setWritingResult(generated);
       logger.info('AI writing success');
     } catch (err: any) {
@@ -568,5 +635,3 @@ function App() {
     </div>
   )
 }
-
-export default App

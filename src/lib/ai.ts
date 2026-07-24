@@ -15,8 +15,24 @@ export interface TodoItem {
   [key: string]: any;
 }
 
+/**
+ * 清洗并压缩长文本，节约 Token
+ * @param text 原始文本
+ * @param maxLength 安全截断阈值
+ */
+function compressTextForAI(text: string, maxLength: number = 6000): string {
+  if (!text) return "";
+  // 替换多个连续空行/换行为单换行，替换连续空格为单空格，去除首尾空白
+  let optimized = text.replace(/\n\s*\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
+  // 超过阈值则截断
+  if (optimized.length > maxLength) {
+    optimized = optimized.substring(0, maxLength) + '\n...(文本已截断以保护 Token 限制)';
+  }
+  return optimized;
+}
+
 export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
-  const { apiBaseUrl, apiKey, modelName, personalFocus, notionProperties, fieldMappings } = useSettingsStore.getState();
+  const { apiBaseUrl, apiKey, modelName, personalFocus, notionProperties, fieldMappings, tokenLimit } = useSettingsStore.getState();
 
   if (!apiKey) {
     throw new Error("请先在设置中配置 API Key");
@@ -69,7 +85,8 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
 
   const contentArray: any[] = [];
   if (textContent) {
-    contentArray.push({ type: "text", text: textContent });
+    const compressed = compressTextForAI(textContent, tokenLimit || 8000);
+    contentArray.push({ type: "text", text: compressed });
   }
   
   for (const img of base64Images) {
@@ -111,21 +128,25 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
   
   try {
     const parsed = JSON.parse(rawContent) as AIResult;
-    if (parsed.todos) {
-      const today = new Date().toISOString().split('T')[0];
-      parsed.todos = parsed.todos.map(t => ({ 
-        ...t, 
-        selected: true,
-        planned_date: t.planned_date || today
-      }));
+    if (!parsed.todos || !Array.isArray(parsed.todos)) {
+      parsed.todos = [];
     }
+    parsed.todos = parsed.todos.map(t => ({ 
+      ...t, 
+      selected: true
+    }));
     return parsed;
   } catch (e) {
     throw new Error("模型返回的数据无法解析为 JSON: " + rawContent);
   }
 }
 
-export async function generateWriting(intent: string, contextTodos: TodoItem[]): Promise<string> {
+export async function generateWriting(
+  intent: string, 
+  contextTodos: TodoItem[],
+  originalText?: string,
+  originalImages?: string[]
+): Promise<string> {
   const { apiBaseUrl, apiKey, modelName } = useSettingsStore.getState();
 
   if (!apiKey) {
@@ -135,18 +156,39 @@ export async function generateWriting(intent: string, contextTodos: TodoItem[]):
   const systemPrompt = `你是一个高级AI撰写助手。你的任务是根据用户提供的【待办事项上下文】和【撰写意图】，生成结构清晰、语气恰当的长文本（如邮件、报告等）。
 请直接输出生成的文本内容，不要输出任何多余的解释说明。`;
 
-  const contextStr = contextTodos.map(t => `- [${t.priority}] ${t.title}`).join('\n');
-  const userContent = `【待办事项上下文】：\n${contextStr}\n\n【撰写意图】：\n${intent}\n\n请根据以上信息开始撰写：`;
+  // 动态提取并紧凑压缩
+  const compressedTodos = contextTodos.map((t, i) => {
+    const props = Object.entries(t)
+        .filter(([k, v]) => k !== 'id' && k !== 'selected' && !!v)
+        .map(([k, v]) => `${k}:${v}`)
+        .join('; ');
+    return `[待办${i+1}] ${props}`;
+  }).join('\n');
+
+  const contentArray: any[] = [];
+  if (originalText) {
+    const optimizedText = compressTextForAI(originalText, 3000);
+    contentArray.push({ type: "text", text: "【参考材料】\n" + optimizedText });
+  }
+  
+  for (const img of (originalImages || [])) {
+    contentArray.push({ type: "image_url", image_url: { url: img } });
+  }
+  
+  contentArray.push({ 
+    type: "text", 
+    text: `\n【已有待办】\n${compressedTodos}\n\n【用户意图】\n${intent}\n\n请根据以上信息开始撰写：` 
+  });
 
   const payload = {
     model: modelName || "gpt-4o",
     messages: [
       { role: "system", content: systemPrompt },
-      { role: "user", content: userContent }
+      { role: "user", content: contentArray }
     ]
   };
 
-  logger.info('Sending writing prompt to AI', { systemPrompt, userContent });
+  logger.info('Sending writing prompt to AI', { systemPrompt, inputCount: contentArray.length });
 
   const normalizedUrl = apiBaseUrl.endsWith('/') ? apiBaseUrl.slice(0, -1) : apiBaseUrl;
   const response = await fetch(`${normalizedUrl}/chat/completions`, {

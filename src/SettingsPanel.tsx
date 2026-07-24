@@ -11,8 +11,8 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    notionProperties, fieldMappings,
-    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping
+    notionProperties, fieldMappings, tokenLimit,
+    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit
   } = useSettingsStore();
 
   const [formBaseUrl, setFormBaseUrl] = useState(apiBaseUrl);
@@ -23,6 +23,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [formNotionDb, setFormNotionDb] = useState(notionDatabaseId);
   const [formLogging, setFormLogging] = useState(enableLogging);
   const [formGlobalShortcut, setFormGlobalShortcut] = useState(globalShortcut);
+  const [formTokenLimit, setFormTokenLimit] = useState(tokenLimit);
   const [formFieldMappings, setFormFieldMappings] = useState(fieldMappings);
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false);
   const [liveShortcut, setLiveShortcut] = useState('');
@@ -45,6 +46,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setNotionSettings(formNotionKey, formNotionDb);
     setEnableLogging(formLogging);
     setGlobalShortcut(formGlobalShortcut);
+    setTokenLimit(formTokenLimit);
     Object.entries(formFieldMappings).forEach(([k, v]) => setFieldMapping(k, v));
     
     // 同步到后端 Rust
@@ -146,17 +148,26 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     
     try {
       logger.info('Testing API connection...', { baseUrl: formBaseUrl, model: formModelName });
+      
+      const isOSeries = /^o\d+/.test(formModelName);
+      const payload: any = {
+        model: formModelName,
+        messages: [{ role: 'user', content: 'Say "OK" if you receive this.' }]
+      };
+      
+      if (isOSeries) {
+        payload.max_completion_tokens = 5;
+      } else {
+        payload.max_tokens = 5;
+      }
+
       const response = await fetch(`${formBaseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${formApiKey}`
         },
-        body: JSON.stringify({
-          model: formModelName,
-          messages: [{ role: 'user', content: 'Say "OK" if you receive this.' }],
-          max_tokens: 5
-        })
+        body: JSON.stringify(payload)
       });
 
       if (!response.ok) {
@@ -396,6 +407,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                     className="w-full bg-slate-900/50 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500 outline-none"
                     placeholder="gpt-4o"
                   />
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    💡 若需使用截图提取功能，请确保填写的模型支持视觉识别（如 gpt-4o）。
+                  </p>
                 </div>
               </div>
             </div>
@@ -491,6 +505,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                   />
                 </div>
               </div>
+              <p className="text-[11px] text-orange-400/80 mt-1">
+                ⚠️ 必做：请务必在 Notion 数据库页面右上角的「...」-&gt;「Connections」中，将此 Integration 邀请进来允许访问，否则将报 404/Not Found 错误！
+              </p>
 
               {notionProperties && notionProperties.length > 0 && (() => {
                 const sortedProps = [...notionProperties].sort((a, b) => {
@@ -693,6 +710,35 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             
             <div className="h-px bg-white/5 w-full"></div>
 
+            {/* Advanced Settings */}
+            <div className="space-y-3">
+              <h3 className="text-sm font-medium text-slate-400 flex items-center gap-2">
+                <Settings className="w-4 h-4" /> 高级设置
+              </h3>
+              
+              <div className="grid gap-3">
+                <div>
+                  <label className="text-xs text-slate-400 mb-1 block">长文本解析 Token 保护截断上限 (字符数)</label>
+                  <input 
+                    type="number" value={formTokenLimit} onChange={e => setFormTokenLimit(Number(e.target.value))}
+                    className="w-full bg-slate-900/50 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-teal-500 outline-none"
+                    placeholder="8000"
+                  />
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    默认 8000。如果输入文本过长，会被自动截断，防止超长 PDF 解析造成天价账单或引发报错。
+                  </p>
+                </div>
+              </div>
+              
+              <div className="bg-white/5 p-3 rounded border border-white/10 mt-2">
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  💡 <strong className="text-slate-300">关于时间推算</strong>：系统在提取待办时，已在底层向大模型注入了您系统当前的真实时间。因此您可以随意在文本中使用“明天”、“下周五”、“月底”等相对时间描述，系统均能精准解析为标准日期格式。
+                </p>
+              </div>
+            </div>
+
+            <div className="h-px bg-white/5 w-full"></div>
+
             {/* Dev Settings */}
             <div className="space-y-3">
               <h3 className="text-sm font-medium text-slate-400 flex items-center gap-2">
@@ -721,10 +767,14 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </div>
 
         {/* Footer */}
-        <div className="pt-2 border-t border-white/10 flex justify-end">
+        <div className="pt-4 mt-2 border-t border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <p className="text-[10px] text-slate-500/80 leading-relaxed max-w-md">
+            🔒 <strong className="font-medium text-slate-400">隐私与数据声明</strong><br/>
+            所有文件（PDF/Word/Excel 等）的解析读取 100% 在本地沙箱执行。提取和润色过程会调用您配置的 API Base URL 发送请求，请勿向不受信任的服务端发送机密信息。
+          </p>
           <button 
             onClick={handleSave}
-            className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md shadow-lg shadow-purple-500/20 transition-all active:scale-95"
+            className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md shadow-lg shadow-purple-500/20 transition-all active:scale-95 shrink-0 whitespace-nowrap self-end sm:self-auto"
           >
             <Save className="w-4 h-4" />
             <span>保存设置</span>
