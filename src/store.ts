@@ -178,3 +178,17 @@ export const useSettingsStore = create<SettingsState>()(
     }
   )
 )
+
+export interface ScannerState {
+  running: boolean;
+  progressMsg: string;
+  setRunning: (running: boolean) => void;
+  setProgressMsg: (progressMsg: string) => void;
+}
+
+export const useScannerStore = create<ScannerState>((set) => ({
+  running: false,
+  progressMsg: '',
+  setRunning: (running) => set({ running }),
+  setProgressMsg: (progressMsg) => set({ progressMsg })
+}))

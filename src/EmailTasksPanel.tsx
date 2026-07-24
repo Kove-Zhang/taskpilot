@@ -3,7 +3,7 @@ import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, Arro
 import { LazyStore } from '@tauri-apps/plugin-store'
 import type { EmailHistoryItem } from './lib/emailScheduler'
 import { forceRunEmailScanner } from './lib/emailScheduler'
-import { useSettingsStore } from './store'
+import { useSettingsStore, useScannerStore } from './store'
 import { syncToNotion } from './lib/notion'
 
 interface EmailTasksPanelProps {
@@ -16,12 +16,15 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const { notionProperties, fieldMappings } = useSettingsStore();
   const [history, setHistory] = useState<EmailHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [running, setRunning] = useState(false);
-  const [progressMsg, setProgressMsg] = useState('');
+  const { running, progressMsg } = useScannerStore();
   const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
   const [editingEntryIndex, setEditingEntryIndex] = useState<number | null>(null);
   const [syncing, setSyncing] = useState(false);
-
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    message: string;
+    onConfirm: () => void;
+  }>({ isOpen: false, message: '', onConfirm: () => {} });
   const updateTodo = async (todoId: string, field: string, value: any) => {
     if (editingEntryIndex === null) return;
     const newHistory = [...history];
@@ -105,50 +108,55 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   }
 
   const clearAllHistory = async () => {
-    if (window.confirm('确定要清空所有邮箱监听历史记录并重置底层的防重复指纹吗？清空后，之前的未读邮件将被重新抓取。')) {
-      try {
-        await historyStore.set('history', []);
-        await historyStore.set('processed_uids', []);
-        await historyStore.save();
-        setHistory([]);
-      } catch (e) {
-        console.error("清空历史记录失败", e);
+    setConfirmDialog({
+      isOpen: true,
+      message: '确定要清空所有邮箱监听历史记录并重置底层的防重复指纹吗？清空后，之前的未读邮件将被重新抓取。',
+      onConfirm: async () => {
+        try {
+          await historyStore.set('history', []);
+          await historyStore.set('processed_uids', []);
+          await historyStore.save();
+          setHistory([]);
+        } catch (e) {
+          console.error("清空历史记录失败", e);
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
       }
-    }
+    });
   }
 
   const removeHistoryItem = async (indexToRemove: number, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!window.confirm('确定要删除这条记录吗？删除后该邮件将在下次扫描时重新被抓取。')) return;
-
-    const entryToRemove = history[indexToRemove];
-    const newHistory = history.filter((_, idx) => idx !== indexToRemove);
-    
-    try {
-      let processedUids: string[] = await historyStore.get('processed_uids') || [];
-      processedUids = processedUids.filter(uidStr => !uidStr.endsWith(`_${entryToRemove.emailUid}`));
-      await historyStore.set('processed_uids', processedUids);
-      
-      await historyStore.set('history', newHistory);
-      await historyStore.save();
-      setHistory(newHistory);
-    } catch (err) {
-      console.error("删除记录失败", err);
-    }
+    setConfirmDialog({
+      isOpen: true,
+      message: '确定要删除这条记录吗？删除后该邮件将在下次扫描时重新被抓取。',
+      onConfirm: async () => {
+        const entryToRemove = history[indexToRemove];
+        const newHistory = history.filter((_, idx) => idx !== indexToRemove);
+        
+        try {
+          let processedUids: string[] = await historyStore.get('processed_uids') || [];
+          processedUids = processedUids.filter(uidStr => !uidStr.endsWith(`_${entryToRemove.emailUid}`));
+          await historyStore.set('processed_uids', processedUids);
+          
+          await historyStore.set('history', newHistory);
+          await historyStore.save();
+          setHistory(newHistory);
+        } catch (err) {
+          console.error("删除记录失败", err);
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+    });
   }
 
   const handleForceRun = async () => {
     if (running) return;
-    setRunning(true);
-    setProgressMsg('提取中...');
     try {
-      await forceRunEmailScanner((msg) => setProgressMsg(msg));
+      await forceRunEmailScanner();
       await loadHistory();
     } catch (e) {
       console.error(e);
-    } finally {
-      setRunning(false);
-      setProgressMsg('');
     }
   }
 
@@ -425,6 +433,29 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
           )}
         </div>
       </div>
+
+      {confirmDialog.isOpen && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}>
+          <div className="bg-slate-900 border border-white/10 rounded-xl p-6 max-w-sm w-full shadow-2xl flex flex-col gap-4 animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold text-white">确认操作</h3>
+            <p className="text-sm text-slate-300 leading-relaxed">{confirmDialog.message}</p>
+            <div className="flex justify-end gap-3 mt-2">
+              <button
+                onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
+                className="px-4 py-2 text-sm text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 rounded-md transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={confirmDialog.onConfirm}
+                className="px-4 py-2 text-sm text-white bg-pink-600 hover:bg-pink-500 rounded-md shadow-lg shadow-pink-500/20 transition-all active:scale-95"
+              >
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

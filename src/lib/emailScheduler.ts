@@ -1,4 +1,4 @@
-import { useSettingsStore } from '../store';
+import { useSettingsStore, useScannerStore } from '../store';
 import { invoke } from '@tauri-apps/api/core';
 import { extractTodosFromContent, type AIResult } from './ai';
 import { syncToNotion } from './notion';
@@ -21,7 +21,6 @@ export interface EmailHistoryItem {
 const historyStore = new LazyStore('email_history.enc');
 
 // In-memory flag to prevent overlapping runs
-let isRunning = false;
 let lastRunTimestamp = 0;
 
 function shouldRunNow(): boolean {
@@ -151,8 +150,9 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
     };
 }
 
-export async function forceRunEmailScanner(onProgress?: (msg: string) => void) {
-    if (isRunning) {
+export async function forceRunEmailScanner() {
+    const scannerStore = useScannerStore.getState();
+    if (scannerStore.running) {
         logger.warn("Email scanner is already running, skipping.");
         return;
     }
@@ -163,21 +163,21 @@ export async function forceRunEmailScanner(onProgress?: (msg: string) => void) {
         return;
     }
 
-    isRunning = true;
+    scannerStore.setRunning(true);
     lastRunTimestamp = Date.now();
     logger.info("Starting email scanner batch...");
     const batchId = `batch_${Date.now()}`;
     const results: EmailHistoryItem[] = [];
 
     try {
-        if (onProgress) onProgress('连接服务器...');
+        scannerStore.setProgressMsg('连接服务器...');
         let processedUids: string[] = await historyStore.get('processed_uids') || [];
         const folders = emailConfig.targetFolder ? emailConfig.targetFolder.split(',').map(f => f.trim()).filter(Boolean) : ['INBOX'];
         
         for (const folder of folders) {
             logger.info(`Fetching emails from folder: ${folder}`);
             try {
-                if (onProgress) onProgress(`拉取目录 ${folder}...`);
+                scannerStore.setProgressMsg(`拉取目录 ${folder}...`);
                 const emails = await invoke('fetch_emails', {
                     host: emailConfig.host,
                     port: emailConfig.port,
@@ -193,7 +193,7 @@ export async function forceRunEmailScanner(onProgress?: (msg: string) => void) {
                 let processedCount = 0;
                 for (const email of emails) {
                     processedCount++;
-                    if (onProgress) onProgress(`处理中 (${processedCount}/${emails.length})...`);
+                    scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length})...`);
                     const result = await processSingleEmail(email, batchId, folder, processedUids);
                     if (!processedUids.includes(`${folder}_${email.uid}`)) {
                         // If it wasn't added inside processSingleEmail, it means it skipped or failed
@@ -226,7 +226,9 @@ export async function forceRunEmailScanner(onProgress?: (msg: string) => void) {
     } catch (e) {
         logger.error("Failed to run email scanner", e);
     } finally {
-        isRunning = false;
+        const store = useScannerStore.getState();
+        store.setRunning(false);
+        store.setProgressMsg('');
     }
 }
 
