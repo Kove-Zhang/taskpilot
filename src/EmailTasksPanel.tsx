@@ -17,6 +17,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const [history, setHistory] = useState<EmailHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [progressMsg, setProgressMsg] = useState('');
   const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
   const [editingEntryIndex, setEditingEntryIndex] = useState<number | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -104,14 +105,17 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   }
 
   const handleForceRun = async () => {
+    if (running) return;
     setRunning(true);
+    setProgressMsg('提取中...');
     try {
-      await forceRunEmailScanner();
+      await forceRunEmailScanner((msg) => setProgressMsg(msg));
       await loadHistory();
     } catch (e) {
       console.error(e);
     } finally {
       setRunning(false);
+      setProgressMsg('');
     }
   }
 
@@ -266,7 +270,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
               disabled={running}
               className="text-xs flex items-center gap-1 bg-pink-500/20 hover:bg-pink-500/30 text-pink-300 px-3 py-1.5 rounded transition-colors disabled:opacity-50"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${running ? 'animate-spin' : ''}`} /> {running ? '执行中...' : '立即执行扫描'}
+              <RefreshCw className={`w-3.5 h-3.5 ${running ? 'animate-spin' : ''}`} /> {running ? (progressMsg || '执行中...') : '立即执行扫描'}
             </button>
             <button onClick={onClose} className="p-1 hover:bg-white/10 rounded-md transition-colors text-slate-400 hover:text-white">
               <X className="w-5 h-5" />

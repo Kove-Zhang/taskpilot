@@ -151,7 +151,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
     };
 }
 
-export async function forceRunEmailScanner() {
+export async function forceRunEmailScanner(onProgress?: (msg: string) => void) {
     if (isRunning) {
         logger.warn("Email scanner is already running, skipping.");
         return;
@@ -170,12 +170,14 @@ export async function forceRunEmailScanner() {
     const results: EmailHistoryItem[] = [];
 
     try {
+        if (onProgress) onProgress('连接服务器...');
         let processedUids: string[] = await historyStore.get('processed_uids') || [];
         const folders = emailConfig.targetFolder ? emailConfig.targetFolder.split(',').map(f => f.trim()).filter(Boolean) : ['INBOX'];
         
         for (const folder of folders) {
             logger.info(`Fetching emails from folder: ${folder}`);
             try {
+                if (onProgress) onProgress(`拉取目录 ${folder}...`);
                 const emails = await invoke('fetch_emails', {
                     host: emailConfig.host,
                     port: emailConfig.port,
@@ -188,7 +190,10 @@ export async function forceRunEmailScanner() {
 
                 logger.info(`Fetched ${emails.length} unread emails from ${folder}.`);
 
+                let processedCount = 0;
                 for (const email of emails) {
+                    processedCount++;
+                    if (onProgress) onProgress(`处理中 (${processedCount}/${emails.length})...`);
                     const result = await processSingleEmail(email, batchId, folder, processedUids);
                     if (!processedUids.includes(`${folder}_${email.uid}`)) {
                         // If it wasn't added inside processSingleEmail, it means it skipped or failed
