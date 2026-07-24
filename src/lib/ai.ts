@@ -32,7 +32,7 @@ function compressTextForAI(text: string, maxLength: number = 6000): string {
 }
 
 export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
-  const { apiBaseUrl, apiKey, modelName, personalFocus, notionProperties, fieldMappings, tokenLimit } = useSettingsStore.getState();
+  const { apiBaseUrl, apiKey, modelName, personalFocus, notionProperties, fieldMappings, tokenLimit, enableReasoning } = useSettingsStore.getState();
 
   if (!apiKey) {
     throw new Error("请先在设置中配置 API Key");
@@ -96,7 +96,14 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
     });
   }
 
-  const payload = {
+  if (!enableReasoning) {
+    contentArray.push({ 
+      type: "text", 
+      text: "\n\n(指令：请直接输出最终结果，跳过所有思维链、推导过程和思考步骤。)\n/no_think" 
+    });
+  }
+
+  const payload: any = {
     model: modelName || "gpt-4o",
     response_format: { type: "json_object" },
     messages: [
@@ -105,7 +112,42 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
     ]
   };
 
-  logger.info('Sending extraction prompt to AI', { systemPrompt, inputCount: contentArray.length });
+  const isOSeries = /^o\d+/.test((modelName || "").toLowerCase());
+  const isClaude = (modelName || "").toLowerCase().includes('claude');
+  const isDeepSeek = (modelName || "").toLowerCase().includes('deepseek') || (modelName || "").toLowerCase().includes('reasoner') || (modelName || "").toLowerCase().includes('thinking');
+
+  if (!enableReasoning) {
+    if (isOSeries) {
+      payload.reasoning_effort = "low";
+    } else if (isClaude) {
+      payload.thinking = { type: "disabled" };
+    } else if (isDeepSeek) {
+      payload.reasoning_effort = "low";
+    }
+  } else {
+    if (isOSeries) {
+      payload.reasoning_effort = "high";
+    } else if (isClaude) {
+      payload.thinking = { type: "enabled", budget_tokens: 4096 };
+    }
+  }
+
+  const logPayload = { ...payload };
+  logPayload.messages = payload.messages.map((m: any) => {
+    if (m.role === 'user' && Array.isArray(m.content)) {
+      return {
+        role: m.role,
+        content: m.content.map((c: any) => ({
+          type: c.type,
+          text: c.type === 'text' ? `[Text length: ${c.text?.length}]` : undefined,
+          image_url: c.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined
+        }))
+      };
+    }
+    return m;
+  });
+
+  logger.info('Sending extraction prompt to AI', { payload: logPayload });
 
   const normalizedUrl = apiBaseUrl.endsWith('/') ? apiBaseUrl.slice(0, -1) : apiBaseUrl;
   const response = await fetch(`${normalizedUrl}/chat/completions`, {
@@ -147,7 +189,7 @@ export async function generateWriting(
   originalText?: string,
   originalImages?: string[]
 ): Promise<string> {
-  const { apiBaseUrl, apiKey, modelName } = useSettingsStore.getState();
+  const { apiBaseUrl, apiKey, modelName, enableReasoning } = useSettingsStore.getState();
 
   if (!apiKey) {
     throw new Error("请先在设置中配置 API Key");
@@ -180,7 +222,14 @@ export async function generateWriting(
     text: `\n【已有待办】\n${compressedTodos}\n\n【用户意图】\n${intent}\n\n请根据以上信息开始撰写：` 
   });
 
-  const payload = {
+  if (!enableReasoning) {
+    contentArray.push({ 
+      type: "text", 
+      text: "\n\n(指令：请直接输出最终结果，跳过所有思维链、推导过程和思考步骤。)\n/no_think" 
+    });
+  }
+
+  const payload: any = {
     model: modelName || "gpt-4o",
     messages: [
       { role: "system", content: systemPrompt },
@@ -188,7 +237,42 @@ export async function generateWriting(
     ]
   };
 
-  logger.info('Sending writing prompt to AI', { systemPrompt, inputCount: contentArray.length });
+  const isOSeries = /^o\d+/.test((modelName || "").toLowerCase());
+  const isClaude = (modelName || "").toLowerCase().includes('claude');
+  const isDeepSeek = (modelName || "").toLowerCase().includes('deepseek') || (modelName || "").toLowerCase().includes('reasoner') || (modelName || "").toLowerCase().includes('thinking');
+
+  if (!enableReasoning) {
+    if (isOSeries) {
+      payload.reasoning_effort = "low";
+    } else if (isClaude) {
+      payload.thinking = { type: "disabled" };
+    } else if (isDeepSeek) {
+      payload.reasoning_effort = "low";
+    }
+  } else {
+    if (isOSeries) {
+      payload.reasoning_effort = "high";
+    } else if (isClaude) {
+      payload.thinking = { type: "enabled", budget_tokens: 4096 };
+    }
+  }
+
+  const logPayload = { ...payload };
+  logPayload.messages = payload.messages.map((m: any) => {
+    if (m.role === 'user' && Array.isArray(m.content)) {
+      return {
+        role: m.role,
+        content: m.content.map((c: any) => ({
+          type: c.type,
+          text: c.type === 'text' ? `[Text length: ${c.text?.length}]` : undefined,
+          image_url: c.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined
+        }))
+      };
+    }
+    return m;
+  });
+
+  logger.info('Sending writing prompt to AI', { payload: logPayload });
 
   const normalizedUrl = apiBaseUrl.endsWith('/') ? apiBaseUrl.slice(0, -1) : apiBaseUrl;
   const response = await fetch(`${normalizedUrl}/chat/completions`, {

@@ -90,6 +90,7 @@ interface SettingsState {
   notionProperties: NotionProperty[];
   fieldMappings: Record<string, FieldMapping>;
   tokenLimit: number;
+  enableReasoning: boolean;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
   setPersonalFocus: (focus: string) => void;
   setNotionSettings: (key: string, dbId: string) => void;
@@ -98,6 +99,7 @@ interface SettingsState {
   setNotionProperties: (props: NotionProperty[]) => void;
   setFieldMapping: (notionPropId: string, mapping: FieldMapping) => void;
   setTokenLimit: (limit: number) => void;
+  setEnableReasoning: (enable: boolean) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -114,6 +116,7 @@ export const useSettingsStore = create<SettingsState>()(
       notionProperties: [],
       fieldMappings: {},
       tokenLimit: 8000,
+      enableReasoning: false,
       setApiSettings: (apiBaseUrl, apiKey, modelName) => set({ apiBaseUrl, apiKey, modelName }),
       setPersonalFocus: (personalFocus) => set({ personalFocus }),
       setNotionSettings: (notionApiKey, notionDatabaseId) => set({ notionApiKey, notionDatabaseId }),
@@ -126,7 +129,8 @@ export const useSettingsStore = create<SettingsState>()(
           [id]: mapping
         }
       })),
-      setTokenLimit: (tokenLimit) => set({ tokenLimit })
+      setTokenLimit: (tokenLimit) => set({ tokenLimit }),
+      setEnableReasoning: (enableReasoning) => set({ enableReasoning })
     }),
     {
       name: 'task-pilot-settings',

@@ -5,7 +5,23 @@ export async function logMessage(level: 'INFO' | 'WARN' | 'ERROR', msg: string, 
   const enableLogging = useSettingsStore.getState().enableLogging;
   if (!enableLogging) return;
 
-  const serializedData = data ? (typeof data === 'string' ? data : JSON.stringify(data, null, 2)) : '';
+  let serializedData = '';
+  if (data) {
+    if (typeof data === 'string') {
+      serializedData = data;
+    } else if (data instanceof Error) {
+      serializedData = JSON.stringify({ message: data.message, stack: data.stack, name: data.name }, null, 2);
+    } else {
+      // Handle objects that might contain Errors or just regular objects
+      serializedData = JSON.stringify(data, (_key, value) => {
+        if (value instanceof Error) {
+          return { message: value.message, stack: value.stack, name: value.name };
+        }
+        return value;
+      }, 2);
+    }
+  }
+
   const now = new Date();
   const timestamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
   const message = `[${timestamp}] [${level}] ${msg} ${serializedData ? '\\n' + serializedData : ''}`;

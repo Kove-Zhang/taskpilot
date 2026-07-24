@@ -11,8 +11,8 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    notionProperties, fieldMappings, tokenLimit,
-    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit
+    notionProperties, fieldMappings, tokenLimit, enableReasoning,
+    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning
   } = useSettingsStore();
 
   const [formBaseUrl, setFormBaseUrl] = useState(apiBaseUrl);
@@ -24,6 +24,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [formLogging, setFormLogging] = useState(enableLogging);
   const [formGlobalShortcut, setFormGlobalShortcut] = useState(globalShortcut);
   const [formTokenLimit, setFormTokenLimit] = useState(tokenLimit);
+  const [formEnableReasoning, setFormEnableReasoning] = useState(enableReasoning);
   const [formFieldMappings, setFormFieldMappings] = useState(fieldMappings);
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false);
   const [liveShortcut, setLiveShortcut] = useState('');
@@ -47,6 +48,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setEnableLogging(formLogging);
     setGlobalShortcut(formGlobalShortcut);
     setTokenLimit(formTokenLimit);
+    setEnableReasoning(formEnableReasoning);
     Object.entries(formFieldMappings).forEach(([k, v]) => setFieldMapping(k, v));
     
     // 同步到后端 Rust
@@ -147,9 +149,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setTestErrorMsg('');
     
     try {
-      logger.info('Testing API connection...', { baseUrl: formBaseUrl, model: formModelName });
-      
-      const isOSeries = /^o\d+/.test(formModelName);
+      const isOSeries = /^o\d+/.test(formModelName.toLowerCase());
+      const isClaude = formModelName.toLowerCase().includes('claude');
+      const isDeepSeek = formModelName.toLowerCase().includes('deepseek') || formModelName.toLowerCase().includes('reasoner') || formModelName.toLowerCase().includes('thinking');
+
       const payload: any = {
         model: formModelName,
         messages: [{ role: 'user', content: 'Say "OK" if you receive this.' }]
@@ -160,6 +163,25 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       } else {
         payload.max_tokens = 5;
       }
+
+      if (!formEnableReasoning) {
+        if (isOSeries) {
+          payload.reasoning_effort = "low";
+        } else if (isClaude) {
+          payload.thinking = { type: "disabled" };
+        } else if (isDeepSeek) {
+          // Attempt proxy-compatible instructions, safely ignore if not supported by all proxies.
+          payload.reasoning_effort = "low";
+        }
+      } else {
+        if (isOSeries) {
+          payload.reasoning_effort = "high";
+        } else if (isClaude) {
+          payload.thinking = { type: "enabled", budget_tokens: 1024 };
+        }
+      }
+
+      logger.info('Testing API connection...', { baseUrl: formBaseUrl, payload });
 
       const response = await fetch(`${formBaseUrl}/chat/completions`, {
         method: 'POST',
@@ -411,6 +433,22 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                     💡 若需使用截图提取功能，请确保填写的模型支持视觉识别（如 gpt-4o）。
                   </p>
                 </div>
+                
+                <div className="flex items-center gap-2 mt-1">
+                  <input
+                    type="checkbox"
+                    id="enableReasoning"
+                    checked={formEnableReasoning}
+                    onChange={(e) => setFormEnableReasoning(e.target.checked)}
+                    className="w-3.5 h-3.5 rounded border-white/20 bg-black/20 text-purple-500 focus:ring-purple-500/50"
+                  />
+                  <label htmlFor="enableReasoning" className="text-xs text-slate-300 select-none cursor-pointer">
+                    允许大模型进入深度思考模式
+                  </label>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  针对支持推理的模型（如 o1, o3-mini, claude-3.7 等），开启后推理能力更强但响应较慢。默认关闭（将向模型发送压制思考的 API 参数及禁用提示词）
+                </p>
               </div>
             </div>
 
