@@ -101,25 +101,39 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     const entry = history[editingEntryIndex];
     if (!entry.aiResult || !entry.aiResult.todos) return;
     
-    const selectedTodos = entry.aiResult.todos.filter(t => t.selected !== false);
+    const selectedTodos = entry.aiResult.todos.filter(t => t.selected !== false && !t.synced);
     if (selectedTodos.length === 0) return;
     
     setSyncing(true);
     try {
       const syncRes = await syncToNotion(selectedTodos);
+      const succeeded = syncRes.filter(r => r.success);
       const failed = syncRes.filter(r => !r.success);
-      if (failed.length > 0) {
-        throw new Error(`Failed to sync ${failed.length} items`);
-      }
       
       const newHistory = [...history];
-      newHistory[editingEntryIndex] = {
-        ...newHistory[editingEntryIndex],
-        syncedToNotion: true
-      };
+      const targetEntry = { ...newHistory[editingEntryIndex] };
+      if (targetEntry.aiResult) {
+        targetEntry.aiResult = {
+          ...targetEntry.aiResult,
+          todos: targetEntry.aiResult.todos.map(t => {
+            if (succeeded.find(s => s.id === t.id)) {
+              return { ...t, synced: true };
+            }
+            return t;
+          })
+        };
+      }
+      targetEntry.syncedToNotion = failed.length === 0;
+      newHistory[editingEntryIndex] = targetEntry;
+      
       setHistory(newHistory);
       await historyStore.set('history', newHistory);
       await historyStore.save();
+      
+      if (failed.length > 0) {
+        const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\\n');
+        throw new Error(`部分同步失败 (${failed.length}/${selectedTodos.length}):\\n${errorMsgs}`);
+      }
     } catch (e: any) {
       console.error(e);
       alert('同步失败: ' + (e.message || String(e)));
