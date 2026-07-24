@@ -57,7 +57,8 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<AIResult | null>(null)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<string | null>(null);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   
@@ -414,8 +415,8 @@ export default function App() {
           {images.length > 0 && (
             <div className="absolute bottom-4 left-4 flex gap-2">
               {images.map((img, idx) => (
-                <div key={idx} className="relative w-12 h-12 rounded bg-slate-800 border border-white/10 group">
-                  <img src={img} className="w-full h-full object-cover rounded" />
+                <div key={idx} className="relative w-12 h-12 rounded bg-slate-800 border border-white/10 group cursor-pointer" onClick={() => setPreviewImage(img)} title="点击查看大图">
+                  <img src={img} className="w-full h-full object-cover rounded hover:opacity-80 transition-opacity" />
                   <button onClick={() => removeImage(idx)} className="absolute -top-1 -right-1 bg-red-500 rounded-full w-4 h-4 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                     <X className="w-3 h-3 text-white" />
                   </button>
@@ -629,6 +630,23 @@ export default function App() {
 
       </div>
       </div>
+
+      {previewImage && (
+        <div 
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 p-4"
+          onClick={() => setPreviewImage(null)}
+        >
+          <img 
+            src={previewImage} 
+            className="max-w-full max-h-full object-contain rounded-lg shadow-2xl cursor-zoom-out" 
+            alt="Preview"
+            onClick={(e) => {
+              e.stopPropagation();
+              setPreviewImage(null);
+            }}
+          />
+        </div>
+      )}
 
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} />}
