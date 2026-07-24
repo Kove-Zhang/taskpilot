@@ -338,7 +338,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
 
   return (
     <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="glass-panel w-full max-w-2xl p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[80vh]">
+      <div className="glass-panel w-[95%] max-w-[760px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh]">
         
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
@@ -372,7 +372,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
           ) : (
             <>
               {/* Sidebar */}
-              <div className="w-48 flex-shrink-0 border-r border-white/5 overflow-y-auto custom-scrollbar bg-black/20">
+              <div className="w-56 flex-shrink-0 border-r border-white/5 overflow-y-auto custom-scrollbar bg-black/20">
                 {folders.map(folder => (
                   <div key={folder} className="mb-2">
                     <div className="px-4 py-2 text-xs font-medium text-slate-500 bg-slate-900/50 sticky top-0 backdrop-blur z-10 border-b border-white/5">
