@@ -1063,12 +1063,31 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                   />
                   <span className="text-sm text-slate-300 group-hover:text-white transition-colors">开启本地详细日志记录</span>
                 </label>
-                <button 
-                  onClick={() => import('@tauri-apps/api/core').then(m => m.invoke('open_log_file')).catch(e => console.error(e))}
-                  className="text-xs text-blue-400 hover:text-blue-300 transition bg-blue-500/10 hover:bg-blue-500/20 px-2 py-1 rounded"
-                >
-                  打开日志文件
-                </button>
+                <div className="flex gap-2">
+                  <button 
+                    onClick={() => import('@tauri-apps/api/core').then(m => m.invoke('open_log_file')).catch(e => console.error(e))}
+                    className="text-xs text-blue-400 hover:text-blue-300 transition bg-blue-500/10 hover:bg-blue-500/20 px-2 py-1 rounded"
+                  >
+                    打开日志文件
+                  </button>
+                  <button 
+                    onClick={async (e) => {
+                      const btn = e.currentTarget;
+                      const originalText = btn.innerText;
+                      try {
+                        const m = await import('@tauri-apps/api/core');
+                        await m.invoke('clear_log');
+                        btn.innerText = '已清空！';
+                      } catch (err) {
+                        btn.innerText = '清空失败';
+                      }
+                      setTimeout(() => { btn.innerText = originalText; }, 2000);
+                    }}
+                    className="text-xs text-red-400 hover:text-red-300 transition bg-red-500/10 hover:bg-red-500/20 px-2 py-1 rounded min-w-[64px]"
+                  >
+                    清空日志
+                  </button>
+                </div>
               </div>
             </div>
           </div>
