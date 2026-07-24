@@ -17,6 +17,7 @@ export interface EmailHistoryItem {
     aiResult?: AIResult;
     emailDate?: string;
     syncedToNotion?: boolean;
+    folder?: string;
 }
 
 const historyStore = new LazyStore('email_history.enc');
@@ -71,7 +72,8 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
             sender: email.sender,
             emailDate: email.date,
             status: 'success', // Consider it success so it's not retried as error
-            syncedToNotion: false // or undefined, as it was skipped
+            syncedToNotion: false, // or undefined, as it was skipped
+            folder
         };
     }
 
@@ -125,7 +127,8 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                 emailDate: email.date,
                 status: 'success',
                 aiResult,
-                syncedToNotion: synced
+                syncedToNotion: synced,
+                folder
             };
 
         } catch (e: any) {
@@ -147,7 +150,8 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
         sender: email.sender,
         emailDate: email.date,
         status: 'failed',
-        error: lastError
+        error: lastError,
+        folder
     };
 }
 

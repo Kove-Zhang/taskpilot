@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { X, Clock, Trash2 } from 'lucide-react'
+import { X, Clock, Trash2, ChevronDown, ChevronUp } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import type { AIResult } from './lib/ai'
 import { useSettingsStore } from './store'
@@ -21,6 +21,11 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [confirmingIdx, setConfirmingIdx] = useState<number | null>(null);
+  const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
+
+  const toggleExpand = (key: string) => {
+    setExpandedTodos(prev => ({ ...prev, [key]: !prev[key] }));
+  };
 
   useEffect(() => {
     loadHistory();
@@ -84,44 +89,98 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
           ) : history.length === 0 ? (
             <div className="text-center text-slate-500 py-10">暂无历史记录</div>
           ) : (
-            history.map((entry, idx) => (
-              <div 
-                key={idx} 
-                onDoubleClick={() => setConfirmingIdx(idx)}
-                className="bg-slate-900/50 p-4 rounded-lg border border-white/5 relative group cursor-pointer hover:border-purple-500/50 transition-colors"
-                title="双击恢复此记录"
-              >
-                {entry.result.syncedToNotion && (
-                  <div className="absolute top-4 right-12 text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30">
-                    已推送
+            (() => {
+              const indexedHistory = history.map((item, originalIndex) => ({ ...item, originalIndex }));
+              const sorted = [...indexedHistory].sort((a, b) => {
+                const timeA = new Date(a.timestamp).getTime();
+                const timeB = new Date(b.timestamp).getTime();
+                return timeB - timeA;
+              });
+
+              const grouped: Record<string, typeof sorted> = {};
+              sorted.forEach(item => {
+                const dateObj = new Date(item.timestamp);
+                const dateStr = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}-${String(dateObj.getDate()).padStart(2, '0')}`;
+                
+                if (!grouped[dateStr]) grouped[dateStr] = [];
+                grouped[dateStr].push(item);
+              });
+
+              return Object.keys(grouped).sort((a, b) => b.localeCompare(a)).map(dateStr => (
+                <div key={dateStr} className="mb-4 last:mb-0">
+                  <div className="text-xs font-semibold text-slate-400 mb-3 sticky top-0 bg-slate-950/80 backdrop-blur py-1 z-10">
+                    {dateStr}
                   </div>
-                )}
-                <button 
-                  onClick={() => deleteHistoryItem(idx)}
-                  className="absolute top-4 right-4 p-1 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded opacity-0 group-hover:opacity-100 transition-all"
-                  title="删除此记录"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
-                <div className="text-xs text-slate-500 mb-2 pr-8">{new Date(entry.timestamp).toLocaleString()}</div>
-                <div className="text-sm text-slate-300 mb-3 line-clamp-2">{entry.result.summary}</div>
-                <div className="space-y-1.5">
-                  {entry.result.todos.map((t: any, i) => {
-                    const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
-                    const titleProp = activeFields.find(p => p.type === 'title')?.name || 'title';
-                    const priorityProp = activeFields.find(p => p.name.includes('优先') || p.name === 'priority' || p.type === 'select')?.name || 'priority';
-                    
-                    return (
-                      <div key={i} className="text-xs text-slate-400 flex items-center gap-2">
-                        {t[priorityProp] && <span className="text-purple-400">[{t[priorityProp]}]</span>}
-                        <span>{t[titleProp] || t.title || t.Name || '未命名待办'}</span>
-                      </div>
-                    )
-                  })}
-                  {entry.result.todos.length === 0 && <div className="text-xs text-slate-500">无待办事项</div>}
+                  <div className="space-y-4">
+                    {grouped[dateStr].map((entry) => {
+                      const idx = entry.originalIndex;
+                      const todosCount = entry.result.todos?.length || 0;
+                      const isListExpanded = !!expandedTodos[`list_${idx}`];
+                      const displayTodos = isListExpanded ? (entry.result.todos || []) : (entry.result.todos || []).slice(0, 3);
+
+                      return (
+                        <div 
+                          key={idx} 
+                          onDoubleClick={() => setConfirmingIdx(idx)}
+                          className="bg-slate-900/50 p-4 rounded-lg border border-white/5 relative group cursor-pointer hover:border-purple-500/50 transition-colors"
+                          title="双击恢复此记录"
+                        >
+                          {entry.result.syncedToNotion && (
+                            <div className="absolute top-4 right-12 text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30">
+                              已推送
+                            </div>
+                          )}
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              deleteHistoryItem(idx);
+                            }}
+                            className="absolute top-4 right-4 p-1 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded opacity-0 group-hover:opacity-100 transition-all"
+                            title="删除此记录"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                          <div className="text-xs text-slate-500 mb-2 pr-8">{new Date(entry.timestamp).toLocaleString()}</div>
+                          <div className="text-sm text-slate-300 mb-3 line-clamp-2">{entry.result.summary}</div>
+                          <div className="space-y-1.5">
+                            {displayTodos.map((t: any, i) => {
+                              const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
+                              const titleProp = activeFields.find(p => p.type === 'title')?.name || 'title';
+                              const priorityProp = activeFields.find(p => p.name.includes('优先') || p.name === 'priority' || p.type === 'select')?.name || 'priority';
+                              
+                              return (
+                                <div key={i} className="text-xs text-slate-400 flex items-center gap-2">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-blue-500/50 shrink-0" />
+                                  {t[priorityProp] && <span className="text-purple-400 shrink-0">[{t[priorityProp]}]</span>}
+                                  <span className="truncate">{t[titleProp] || t.title || t.Name || '未命名待办'}</span>
+                                </div>
+                              )
+                            })}
+                            {todosCount === 0 && <div className="text-xs text-slate-500">无待办事项</div>}
+                            
+                            {todosCount > 3 && (
+                              <button 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleExpand(`list_${idx}`);
+                                }}
+                                className="w-full py-1.5 mt-2 text-xs text-slate-400 hover:text-slate-300 hover:bg-white/5 rounded border border-dashed border-white/10 transition-colors flex justify-center items-center gap-1"
+                              >
+                                {isListExpanded ? (
+                                  <><ChevronUp className="w-3 h-3" /> 收起多余待办</>
+                                ) : (
+                                  <><ChevronDown className="w-3 h-3" /> 展开剩余 {todosCount - 3} 项待办...</>
+                                )}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
                 </div>
-              </div>
-            ))
+              ));
+            })()
           )}
         </div>
 
