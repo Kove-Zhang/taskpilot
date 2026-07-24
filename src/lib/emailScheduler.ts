@@ -185,7 +185,6 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
     lastRunTimestamp = Date.now();
     logger.info("Starting email scanner batch...");
     const batchId = `batch_${Date.now()}`;
-    const results: EmailHistoryItem[] = [];
 
     try {
         scannerStore.setProgressMsg('连接服务器...');
