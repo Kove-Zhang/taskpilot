@@ -57,8 +57,24 @@ function shouldRunNow(): boolean {
     }
 }
 
-async function processSingleEmail(email: any, batchId: string): Promise<EmailHistoryItem> {
+async function processSingleEmail(email: any, batchId: string, folder: string, processedUids: string[]): Promise<EmailHistoryItem> {
     const { emailConfig } = useSettingsStore.getState();
+    const fingerprint = `${folder}_${email.uid}`;
+    
+    if (processedUids.includes(fingerprint)) {
+        logger.info(`Email UID ${email.uid} in ${folder} already processed, skipping.`);
+        return {
+            batchId,
+            timestamp: Date.now(),
+            emailUid: email.uid,
+            subject: email.subject,
+            sender: email.sender,
+            emailDate: email.date,
+            status: 'success', // Consider it success so it's not retried as error
+            syncedToNotion: false // or undefined, as it was skipped
+        };
+    }
+
     let attempt = 0;
     const maxAttempts = emailConfig.retryCount + 1;
     let lastError = '';
@@ -99,6 +115,7 @@ async function processSingleEmail(email: any, batchId: string): Promise<EmailHis
                 });
             }
 
+            processedUids.push(fingerprint);
             return {
                 batchId,
                 timestamp: Date.now(),
@@ -153,6 +170,7 @@ export async function forceRunEmailScanner() {
     const results: EmailHistoryItem[] = [];
 
     try {
+        let processedUids: string[] = await historyStore.get('processed_uids') || [];
         const folders = emailConfig.targetFolder ? emailConfig.targetFolder.split(',').map(f => f.trim()).filter(Boolean) : ['INBOX'];
         
         for (const folder of folders) {
@@ -171,7 +189,10 @@ export async function forceRunEmailScanner() {
                 logger.info(`Fetched ${emails.length} unread emails from ${folder}.`);
 
                 for (const email of emails) {
-                    const result = await processSingleEmail(email, batchId);
+                    const result = await processSingleEmail(email, batchId, folder, processedUids);
+                    if (!processedUids.includes(`${folder}_${email.uid}`)) {
+                        // If it wasn't added inside processSingleEmail, it means it skipped or failed
+                    }
                     results.push(result);
                 }
             } catch (err) {
@@ -179,13 +200,22 @@ export async function forceRunEmailScanner() {
             }
         }
 
-        // Save results to history
-        if (results.length > 0) {
-            let existing: EmailHistoryItem[] = await historyStore.get('history') || [];
-            existing = [...results, ...existing].slice(0, 500); // Keep last 500
-            await historyStore.set('history', existing);
-            await historyStore.save();
+        // Save processed UIDs to prevent duplicates in future runs
+        if (processedUids.length > 5000) {
+            processedUids = processedUids.slice(processedUids.length - 5000);
         }
+        await historyStore.set('processed_uids', processedUids);
+
+        // Save results to history
+        // Filter out skipped items to prevent flooding history panel
+        const newResults = results.filter(r => r.aiResult || r.status === 'failed');
+        if (newResults.length > 0) {
+            let existing: EmailHistoryItem[] = await historyStore.get('history') || [];
+            existing = [...newResults, ...existing].slice(0, 500); // Keep last 500
+            await historyStore.set('history', existing);
+        }
+        
+        await historyStore.save();
 
         logger.info("Email scanner batch completed.");
     } catch (e) {
