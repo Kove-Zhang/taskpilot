@@ -214,9 +214,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         }
       }
 
-      logger.info('Testing API connection...', { baseUrl: formBaseUrl, payload });
+      const normalizedUrl = formBaseUrl.trim().endsWith('/') ? formBaseUrl.trim().slice(0, -1) : formBaseUrl.trim();
+      logger.info('Testing API connection...', { baseUrl: normalizedUrl, payload });
 
-      const response = await fetch(`${formBaseUrl}/chat/completions`, {
+      const response = await fetch(`${normalizedUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -330,22 +331,53 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
     setOptimizingPrompt(true);
     try {
-      const response = await fetch(`${formBaseUrl}/chat/completions`, {
+      const normalizedUrl = formBaseUrl.trim().endsWith('/') ? formBaseUrl.trim().slice(0, -1) : formBaseUrl.trim();
+      const isOSeries = /^o\d+/.test(formModelName.toLowerCase());
+      const isClaude = formModelName.toLowerCase().includes('claude');
+      const isDeepSeek = formModelName.toLowerCase().includes('deepseek') || formModelName.toLowerCase().includes('reasoner') || formModelName.toLowerCase().includes('thinking');
+
+      const messages: any[] = [{
+        role: 'system',
+        content: '你是一个资深的 Prompt Engineer。请将用户输入的一段简单的任务关注点描述，润色为一段结构清晰、语气专业且指令明确的「系统提示词（System Prompt）」，用于指导另一个大模型精准提取相关待办事项。\n\n【项目背景要求】\n你的润色结果将被注入到本系统的主 Prompt 中。主 Prompt 已经强制要求模型以 JSON 格式输出待办事项，且只包含 `title`(标题), `priority`(优先级), `planned_date`(计划日期) 字段。因此，你的润色内容应专注于**提取规则、业务逻辑、内容过滤标准、优先级评判倾向**等，**绝对不要**包含关于输出格式（如 JSON、Markdown、字段定义）的指令。\n\n【关键约束】\n1. 表达必须清晰、明确、严谨。\n2. 绝对不可额外捏造或增添用户未说明的背景、领域知识或未提及的业务要求。\n3. 仅做形式上的专业化改写，直接输出润色后的提示词，绝不要包含任何开场白或解释。'
+      }];
+
+      if (!formEnableReasoning) {
+        messages.push({
+          role: 'user',
+          content: `${formFocus}\n\n(指令：请直接输出最终结果，跳过所有思维链、推导过程和思考步骤。)\n/no_think`
+        });
+      } else {
+        messages.push({ role: 'user', content: formFocus });
+      }
+
+      const payload: any = {
+        model: formModelName,
+        messages
+      };
+
+      if (!formEnableReasoning) {
+        if (isOSeries) {
+          payload.reasoning_effort = "low";
+        } else if (isClaude) {
+          payload.thinking = { type: "disabled" };
+        } else if (isDeepSeek) {
+          payload.reasoning_effort = "low";
+        }
+      } else {
+        if (isOSeries) {
+          payload.reasoning_effort = "high";
+        } else if (isClaude) {
+          payload.thinking = { type: "enabled", budget_tokens: 2048 };
+        }
+      }
+
+      const response = await fetch(`${normalizedUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${formApiKey}`
         },
-        body: JSON.stringify({
-          model: formModelName,
-          messages: [{
-            role: 'system',
-            content: '你是一个资深的 Prompt Engineer。请将用户输入的一段简单的任务关注点描述，润色为一段结构清晰、语气专业且指令明确的「系统提示词（System Prompt）」，用于指导另一个大模型精准提取相关待办事项。\n\n【项目背景要求】\n你的润色结果将被注入到本系统的主 Prompt 中。主 Prompt 已经强制要求模型以 JSON 格式输出待办事项，且只包含 `title`(标题), `priority`(优先级), `planned_date`(计划日期) 字段。因此，你的润色内容应专注于**提取规则、业务逻辑、内容过滤标准、优先级评判倾向**等，**绝对不要**包含关于输出格式（如 JSON、Markdown、字段定义）的指令。\n\n【关键约束】\n1. 表达必须清晰、明确、严谨。\n2. 绝对不可额外捏造或增添用户未说明的背景、领域知识或未提及的业务要求。\n3. 仅做形式上的专业化改写，直接输出润色后的提示词，绝不要包含任何开场白或解释。'
-          }, {
-            role: 'user',
-            content: formFocus
-          }]
-        })
+        body: JSON.stringify(payload)
       });
 
       if (!response.ok) {

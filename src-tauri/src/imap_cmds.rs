@@ -216,7 +216,7 @@ mod tests {
     fn test_extract_text_plain() {
         let raw_email = b"Content-Type: text/plain; charset=utf-8\r\n\r\nThis is a simple plain text email.";
         let parsed = parse_mail(raw_email).unwrap();
-        let text = extract_text_from_parsed_mail(&parsed);
+        let (text, _, _) = extract_mail_content(&parsed);
         assert_eq!(text.trim(), "This is a simple plain text email.");
     }
 
@@ -224,7 +224,7 @@ mod tests {
     fn test_extract_text_html() {
         let raw_email = b"Content-Type: text/html; charset=utf-8\r\n\r\n<html><body>Hello<br>World</body></html>";
         let parsed = parse_mail(raw_email).unwrap();
-        let text = extract_text_from_parsed_mail(&parsed);
+        let (text, _, _) = extract_mail_content(&parsed);
         assert_eq!(text.trim(), "<html><body>Hello\nWorld</body></html>");
     }
 
@@ -232,7 +232,7 @@ mod tests {
     fn test_extract_text_multipart() {
         let raw_email = b"Content-Type: multipart/alternative; boundary=\"boundary\"\r\n\r\n--boundary\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain text part.\r\n--boundary\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html>HTML part.</html>\r\n--boundary--";
         let parsed = parse_mail(raw_email).unwrap();
-        let text = extract_text_from_parsed_mail(&parsed);
+        let (text, _, _) = extract_mail_content(&parsed);
         assert_eq!(text.trim(), "Plain text part.");
     }
 
