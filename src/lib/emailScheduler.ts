@@ -2,6 +2,7 @@ import { useSettingsStore, useScannerStore } from '../store';
 import { invoke } from '@tauri-apps/api/core';
 import { decodeIMAPFolder } from './parser';
 import { extractTodosFromContent, type AIResult } from './ai';
+import { parseEmailThread } from './emailThreadParser';
 import { syncToNotion } from './notion';
 import { logger } from './logger';
 import { LazyStore } from '@tauri-apps/plugin-store';
@@ -108,9 +109,30 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
         try {
             logger.info(`Processing email UID ${email.uid} (Attempt ${attempt})`);
             
-            // 1. AI Extraction (truncation happens inside extractTodosFromContent)
+            // 1. AI Extraction (with Smart Thread Stripping & Denoising)
             if (!aiResult) {
-                const prompt = `邮件主题: ${email.subject}\n发件人: ${email.sender}\n日期: ${email.date}\n\n内容:\n${email.body_text}`;
+                let contentPayload = email.body_text;
+                const threadParsed = parseEmailThread(email.body_text || '');
+                if (threadParsed.hasHistory && threadParsed.historicalThreads.length > 0) {
+                    logger.info(`Email ${email.uid} has thread history (${threadParsed.historicalThreads.length} replies, total ${threadParsed.totalWords} chars, history ${threadParsed.reducedWords} chars). Constructing denoised prompt...`);
+                    
+                    let denoised = `【本次最新核心发信/回信正文 (权重 100%，请重点提炼此处动作要求)】：\n${threadParsed.latestMessage}\n\n`;
+                    denoised += `【历史转发与引用链背景摘要 (权重 20%，仅作为上下文与专业名词参考，切勿提取已完成的往期历史任务)】：\n`;
+                    let historyTextLen = 0;
+                    const maxHistoryLen = 4000;
+                    for (const h of threadParsed.historicalThreads) {
+                        const headerStr = `[历史回帖 #${h.index + 1} | ${h.sendTime || '近期'} | 发件人: ${h.sender || '未知'}] 主题: ${h.subject || '无'}\n`;
+                        const snippet = h.content.length > 800 ? h.content.substring(0, 800) + ' ...(单篇后文略)' : h.content;
+                        if (historyTextLen + headerStr.length + snippet.length > maxHistoryLen) {
+                            denoised += `${headerStr}${snippet.substring(0, Math.max(0, maxHistoryLen - historyTextLen))}\n...(更早期的 ${threadParsed.historicalThreads.length - h.index} 封历史转帖已为节约 Token 自动降噪裁剪)\n`;
+                            break;
+                        }
+                        denoised += `${headerStr}${snippet}\n---\n`;
+                        historyTextLen += headerStr.length + snippet.length + 4;
+                    }
+                    contentPayload = denoised;
+                }
+                const prompt = `邮件主题: ${email.subject}\n发件人: ${email.sender}\n日期: ${email.date}\n\n内容:\n${contentPayload}`;
                 aiResult = await extractTodosFromContent(prompt, compressedImages);
             }
 

@@ -21,13 +21,13 @@ export interface TodoItem {
  * @param text 原始文本
  * @param maxLength 安全截断阈值
  */
-function compressTextForAI(text: string, maxLength: number = 6000): string {
+function compressTextForAI(text: string, maxLength: number = 8000): string {
   if (!text) return "";
   // 替换多个连续空行/换行为单换行，替换连续空格为单空格，去除首尾空白
   let optimized = text.replace(/\n\s*\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
   // 超过阈值则截断
   if (optimized.length > maxLength) {
-    optimized = optimized.substring(0, maxLength) + '\n...(原文较长已作精简截取，请务必结合附带的图文与上下文做出最完整全面的要点提炼)';
+    optimized = optimized.substring(0, maxLength) + '\n\n...(注：为防止 Token 溢出与历史旧任务干扰，超出阈值的尾部历史转发记录已自动精简。提炼待办和要点时请将 100% 重心放在顶部的【最新核心正文】中！)';
   }
   return optimized;
 }

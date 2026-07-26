@@ -6,6 +6,7 @@ import { forceRunEmailScanner } from './lib/emailScheduler'
 import { useSettingsStore, useScannerStore } from './store'
 import { syncToNotion } from './lib/notion'
 import { decodeIMAPFolder } from './lib/parser'
+import { parseEmailThread } from './lib/emailThreadParser'
 
 interface EmailTasksPanelProps {
   onClose: () => void;
@@ -55,6 +56,8 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const [activeTab, setActiveTab] = useState<'todos' | 'original'>('todos');
   const [previewDrawerOpen, setPreviewDrawerOpen] = useState(false);
   const [selectedText, setSelectedText] = useState('');
+  const [selectionSource, setSelectionSource] = useState<string>('');
+  const [expandedThreads, setExpandedThreads] = useState<Record<number, boolean>>({});
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [emailViewMode, setEmailViewMode] = useState<'light' | 'dark'>('light');
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -254,6 +257,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   if (editingEntryIndex !== null) {
     const entry = history[editingEntryIndex];
     const result = entry.aiResult;
+    const parsedThread = parseEmailThread(entry.htmlBody || entry.rawBodyText || '', !!entry.htmlBody);
     return (
       <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
         <div className="glass-panel w-[95%] max-w-[760px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 h-[85vh]">
@@ -266,6 +270,8 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                   setActiveTab('todos');
                   setPreviewDrawerOpen(false);
                   setSelectedText('');
+                  setSelectionSource('');
+                  setExpandedThreads({});
                   setLightboxImg(null);
                   setEmailViewMode('light');
                 }}
@@ -467,17 +473,19 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                             if (curEntry.aiResult) {
                               const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
                               const titleProp = activeFields.find(p => p.type === 'title')?.name || 'title';
+                              const sourceTag = selectionSource ? ` [${selectionSource}]` : '';
                               const newTodo: any = {
                                 id: Math.random().toString(36).substring(2, 11),
                                 selected: true,
-                                [titleProp]: selectedText.length > 50 ? selectedText.substring(0, 50) + '...' : selectedText,
-                                备注: selectedText
+                                [titleProp]: (selectedText.length > 50 ? selectedText.substring(0, 50) + '...' : selectedText) + sourceTag,
+                                备注: selectedText + (selectionSource ? `\n(数据来源：${selectionSource})` : '')
                               };
                               curEntry.aiResult.todos.push(newTodo);
                               setHistory(newHistory);
                               await historyStore.set('history', newHistory);
                               await historyStore.save();
                               setSelectedText('');
+                              setSelectionSource('');
                               setActiveTab('todos');
                             }
                           }}
@@ -486,7 +494,10 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                           <span>➕ 从划选生成待办</span>
                         </button>
                         <button
-                          onClick={() => setSelectedText('')}
+                          onClick={() => {
+                            setSelectedText('');
+                            setSelectionSource('');
+                          }}
                           className="text-slate-400 hover:text-white p-1 rounded hover:bg-white/10"
                         >
                           <X className="w-4 h-4" />
@@ -543,44 +554,195 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                         </button>
                       </div>
 
-                      {emailViewMode === 'light' ? (
-                        <div className="rounded-xl overflow-hidden border border-white/20 shadow-2xl bg-slate-100">
-                          <div className="bg-slate-200/90 px-4 py-2 border-b border-slate-300 flex items-center justify-between text-xs text-slate-700 font-medium">
-                            <span className="flex items-center gap-1.5 font-semibold text-slate-800">
-                              <span>💡</span> 当前为白底原貌阅读，已完美还原商业邮件高亮、文字颜色与表格
-                            </span>
-                            <span className="text-slate-500">拖拽选词后可一键添加待办</span>
+                      {parsedThread.hasHistory ? (
+                        <div className="space-y-4">
+                          {/* 降噪数据统计条与一键控制栏 */}
+                          <div className="p-3 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-between text-xs shadow-sm">
+                            <div className="flex items-center gap-2 text-indigo-200">
+                              <span className="flex h-2 w-2 rounded-full bg-indigo-400 animate-pulse" />
+                              <span>
+                                📉 智能降噪：已自动折叠 <strong className="text-white font-semibold">{parsedThread.historicalThreads.length}</strong> 封往期会话，释放约 <strong className="text-white font-semibold">{parsedThread.reducedWords}</strong> 字冗余排版
+                              </span>
+                            </div>
+                            <button
+                              onClick={() => {
+                                const allOpen = parsedThread.historicalThreads.every(h => expandedThreads[h.index]);
+                                const nextState: Record<number, boolean> = {};
+                                parsedThread.historicalThreads.forEach(h => {
+                                  nextState[h.index] = !allOpen;
+                                });
+                                setExpandedThreads(nextState);
+                              }}
+                              className="px-3 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 hover:text-white transition-colors flex items-center gap-1.5 font-medium border border-indigo-500/30 shrink-0"
+                            >
+                              <span>{parsedThread.historicalThreads.every(h => expandedThreads[h.index]) ? '⏫ 收起全部历史' : '⏬ 展开全部历史'}</span>
+                            </button>
                           </div>
-                          {entry.htmlBody ? (
-                            <div 
-                              className="p-6 text-sm text-slate-900 leading-relaxed overflow-x-auto custom-scrollbar select-text bg-white min-h-[260px]"
-                              dangerouslySetInnerHTML={{ __html: entry.htmlBody }}
-                            />
-                          ) : (
-                            <pre className="p-6 text-sm text-slate-900 leading-relaxed whitespace-pre-wrap font-sans select-text bg-white min-h-[260px]">
-                              {entry.rawBodyText || '(空文本)'}
-                            </pre>
-                          )}
+
+                          {/* 置顶高亮：本次发信/最新回复正文 */}
+                          <div 
+                            className={`rounded-xl overflow-hidden border shadow-lg ${
+                              emailViewMode === 'light' 
+                                ? 'border-amber-400/60 bg-white' 
+                                : 'border-indigo-500/40 bg-slate-900/90'
+                            }`}
+                            onMouseUp={() => setSelectionSource('最新发信正文')}
+                          >
+                            <div className={`px-4 py-2.5 border-b flex items-center justify-between text-xs font-medium ${
+                              emailViewMode === 'light'
+                                ? 'bg-amber-50/90 border-amber-200 text-amber-900'
+                                : 'bg-indigo-950/70 border-indigo-500/30 text-indigo-200'
+                            }`}>
+                              <span className="flex items-center gap-2 font-bold">
+                                <span className={`px-2 py-0.5 rounded text-[11px] font-extrabold ${
+                                  emailViewMode === 'light' ? 'bg-amber-500 text-white shadow-sm' : 'bg-indigo-500 text-white shadow-sm'
+                                }`}>核心正文</span>
+                                本次发信 / 最新回复 (权重 100%)
+                              </span>
+                              <span className="opacity-75">拖拽选词可生成优先待办</span>
+                            </div>
+                            {entry.htmlBody ? (
+                              <div 
+                                className={`p-6 text-sm leading-relaxed overflow-x-auto custom-scrollbar select-text min-h-[160px] ${
+                                  emailViewMode === 'light' ? 'text-slate-900 bg-white' : 'text-slate-200 bg-slate-950/50 prose prose-invert max-w-none'
+                                }`}
+                                dangerouslySetInnerHTML={{ __html: emailViewMode === 'light' ? parsedThread.latestMessage : getDarkModeHtml(parsedThread.latestMessage) }}
+                              />
+                            ) : (
+                              <pre className={`p-6 text-sm leading-relaxed whitespace-pre-wrap font-sans select-text min-h-[160px] ${
+                                emailViewMode === 'light' ? 'text-slate-900 bg-white' : 'text-slate-200 bg-slate-950/50'
+                              }`}>
+                                {parsedThread.latestMessage || '(空文本)'}
+                              </pre>
+                            )}
+                          </div>
+
+                          {/* 手风琴历史会话矩阵 */}
+                          <div className="space-y-2.5 pt-2">
+                            <div className="flex items-center gap-2 text-xs font-semibold text-slate-400 px-1">
+                              <span>📚 往期转发与引用回帖链 (共 {parsedThread.historicalThreads.length} 封)</span>
+                              <span className="h-px flex-1 bg-white/10"></span>
+                            </div>
+                            {parsedThread.historicalThreads.map((thread) => {
+                              const isExpanded = !!expandedThreads[thread.index];
+                              return (
+                                <div 
+                                  key={thread.index} 
+                                  className={`rounded-xl overflow-hidden border transition-all duration-200 ${
+                                    emailViewMode === 'light' 
+                                      ? 'border-slate-300 bg-slate-50 shadow-sm' 
+                                      : 'border-white/10 bg-slate-900/70'
+                                  }`}
+                                  onMouseUp={() => setSelectionSource(`引自历史回帖 #${thread.index + 1}`)}
+                                >
+                                  {/* 手风琴头部 */}
+                                  <div 
+                                    onClick={() => setExpandedThreads(prev => ({ ...prev, [thread.index]: !prev[thread.index] }))}
+                                    className={`px-4 py-3 flex items-center justify-between cursor-pointer select-none transition-colors ${
+                                      emailViewMode === 'light'
+                                        ? 'hover:bg-slate-200/80 bg-slate-100/90 text-slate-700'
+                                        : 'hover:bg-white/5 bg-black/40 text-slate-300'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                                      <span className={`text-xs px-2 py-0.5 rounded font-mono font-bold shrink-0 ${
+                                        emailViewMode === 'light' ? 'bg-slate-300 text-slate-800' : 'bg-white/10 text-indigo-300'
+                                      }`}>
+                                        #{thread.index + 1}
+                                      </span>
+                                      <div className="min-w-0 flex-1 flex flex-col gap-0.5">
+                                        <div className="flex items-center gap-2 text-xs font-semibold">
+                                          <span className="truncate text-slate-200">{thread.sender || '往期发件人'}</span>
+                                          {thread.sendTime && (
+                                            <span className="text-[11px] opacity-70 shrink-0 font-normal text-slate-400">({thread.sendTime})</span>
+                                          )}
+                                        </div>
+                                        {thread.subject && (
+                                          <div className="text-[11px] opacity-75 truncate font-normal text-slate-400">
+                                            主题: {thread.subject}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <div className="flex items-center gap-3 shrink-0 pl-2">
+                                      <span className="text-[10px] opacity-60 font-mono px-1.5 py-0.5 rounded bg-white/5">{thread.wordCount} 字</span>
+                                      <span className="text-sm">{isExpanded ? '🔽' : '▶️'}</span>
+                                    </div>
+                                  </div>
+
+                                  {/* 手风琴展开内容 */}
+                                  {isExpanded && (
+                                    <div className={`border-t ${emailViewMode === 'light' ? 'border-slate-200 bg-white' : 'border-white/10 bg-slate-950/60'}`}>
+                                      {entry.htmlBody ? (
+                                        <div 
+                                          className={`p-5 text-sm leading-relaxed overflow-x-auto custom-scrollbar select-text ${
+                                            emailViewMode === 'light' ? 'text-slate-800' : 'text-slate-300 prose prose-invert max-w-none'
+                                          }`}
+                                          dangerouslySetInnerHTML={{ 
+                                            __html: emailViewMode === 'light' ? thread.content : getDarkModeHtml(thread.content) 
+                                          }}
+                                        />
+                                      ) : (
+                                        <pre className={`p-5 text-sm leading-relaxed whitespace-pre-wrap font-sans select-text ${
+                                          emailViewMode === 'light' ? 'text-slate-800' : 'text-slate-300'
+                                        }`}>
+                                          {thread.content}
+                                        </pre>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
                       ) : (
-                        <div className="rounded-xl overflow-hidden border border-white/10 shadow-xl bg-slate-900/90">
-                          <div className="bg-black/40 px-4 py-2 border-b border-white/5 flex items-center justify-between text-xs text-slate-400 font-medium">
-                            <span className="flex items-center gap-1.5 text-indigo-300">
-                              <span>🌙</span> 当前为深色纯净模式，已清洗原件排版色彩适配暗黑阅读
-                            </span>
-                            <span className="text-slate-500">拖拽选词后可一键添加待办</span>
+                        /* 无历史回帖时的普通单卡片原貌渲染 */
+                        emailViewMode === 'light' ? (
+                          <div 
+                            className="rounded-xl overflow-hidden border border-white/20 shadow-2xl bg-slate-100"
+                            onMouseUp={() => setSelectionSource('邮件正文')}
+                          >
+                            <div className="bg-slate-200/90 px-4 py-2 border-b border-slate-300 flex items-center justify-between text-xs text-slate-700 font-medium">
+                              <span className="flex items-center gap-1.5 font-semibold text-slate-800">
+                                <span>💡</span> 当前为白底原貌阅读，已完美还原商业邮件高亮、文字颜色与表格
+                              </span>
+                              <span className="text-slate-500">拖拽选词后可一键添加待办</span>
+                            </div>
+                            {entry.htmlBody ? (
+                              <div 
+                                className="p-6 text-sm text-slate-900 leading-relaxed overflow-x-auto custom-scrollbar select-text bg-white min-h-[260px]"
+                                dangerouslySetInnerHTML={{ __html: entry.htmlBody }}
+                              />
+                            ) : (
+                              <pre className="p-6 text-sm text-slate-900 leading-relaxed whitespace-pre-wrap font-sans select-text bg-white min-h-[260px]">
+                                {entry.rawBodyText || '(空文本)'}
+                              </pre>
+                            )}
                           </div>
-                          {entry.htmlBody ? (
-                            <div 
-                              className="p-6 text-sm text-slate-200 leading-relaxed overflow-x-auto custom-scrollbar select-text bg-slate-950/50 min-h-[260px] prose prose-invert max-w-none"
-                              dangerouslySetInnerHTML={{ __html: getDarkModeHtml(entry.htmlBody) }}
-                            />
-                          ) : (
-                            <pre className="p-6 text-sm text-slate-200 leading-relaxed whitespace-pre-wrap font-sans select-text bg-slate-950/50 min-h-[260px]">
-                              {entry.rawBodyText || '(空文本)'}
-                            </pre>
-                          )}
-                        </div>
+                        ) : (
+                          <div 
+                            className="rounded-xl overflow-hidden border border-white/10 shadow-xl bg-slate-900/90"
+                            onMouseUp={() => setSelectionSource('邮件正文')}
+                          >
+                            <div className="bg-black/40 px-4 py-2 border-b border-white/5 flex items-center justify-between text-xs text-slate-400 font-medium">
+                              <span className="flex items-center gap-1.5 text-indigo-300">
+                                <span>🌙</span> 当前为深色纯净模式，已清洗原件排版色彩适配暗黑阅读
+                              </span>
+                              <span className="text-slate-500">拖拽选词后可一键添加待办</span>
+                            </div>
+                            {entry.htmlBody ? (
+                              <div 
+                                className="p-6 text-sm text-slate-200 leading-relaxed overflow-x-auto custom-scrollbar select-text bg-slate-950/50 min-h-[260px] prose prose-invert max-w-none"
+                                dangerouslySetInnerHTML={{ __html: getDarkModeHtml(entry.htmlBody) }}
+                              />
+                            ) : (
+                              <pre className="p-6 text-sm text-slate-200 leading-relaxed whitespace-pre-wrap font-sans select-text bg-slate-950/50 min-h-[260px]">
+                                {entry.rawBodyText || '(空文本)'}
+                              </pre>
+                            )}
+                          </div>
+                        )
                       )}
                     </div>
                   </div>
