@@ -5,6 +5,7 @@ import { logger } from './logger';
 export interface AIResult {
   id?: string;
   summary: string;
+  key_points?: string[];
   todos: TodoItem[];
   syncedToNotion?: boolean;
 }
@@ -26,7 +27,7 @@ function compressTextForAI(text: string, maxLength: number = 6000): string {
   let optimized = text.replace(/\n\s*\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
   // 超过阈值则截断
   if (optimized.length > maxLength) {
-    optimized = optimized.substring(0, maxLength) + '\n...(文本已截断以保护 Token 限制)';
+    optimized = optimized.substring(0, maxLength) + '\n...(原文较长已作精简截取，请务必结合附带的图文与上下文做出最完整全面的要点提炼)';
   }
   return optimized;
 }
@@ -67,6 +68,23 @@ export async function extractTodosFromContent(textContent: string, base64Images:
   const now = new Date();
   const timeStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${['日', '一', '二', '三', '四', '五', '六'][now.getDay()]} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
+  const textLen = textContent ? textContent.length : 0;
+  const imgCount = base64Images.length;
+  const isComplex = textLen > 3000 || imgCount >= 2;
+  const isMedium = !isComplex && (textLen >= 500 || imgCount === 1);
+
+  let summaryDesc = "对内容的简短总结（100字以内）";
+  let keyPointsSchema = "";
+  let keyPointsHint = "";
+
+  if (isComplex) {
+    summaryDesc = "对内容的多维深度结构化概括（300-600字），详细陈述事件脉络、业务背景与前置依赖";
+    keyPointsSchema = `,\n  "key_points": ["核心要点/结论1", "核心要点/结论2", "核心要点/结论3"]`;
+    keyPointsHint = "\n请务必在 key_points 数组中分条提炼出3-5个最核心的背景结论或决策依赖要点。";
+  } else if (isMedium) {
+    summaryDesc = "对内容的结构化概述（200-300字），分层概括核心背景、诉求与行动要求";
+  }
+
   const systemPrompt = `你是一个智能助理，任务是从用户输入的内容中提取核心总结和待办事项。
 当前系统真实时间是：${timeStr} (请以此为基准推算“明天”、“下周”等相对时间名词的精确日期，必须转换为 YYYY-MM-DD 格式，绝不可臆想错乱的时间)。
 
@@ -75,12 +93,12 @@ export async function extractTodosFromContent(textContent: string, base64Images:
 
 请以严格的 JSON 格式输出，不要包含 Markdown 代码块标记（如 \`\`\`json ）。输出格式如下：
 {
-  "summary": "对内容的简短总结（100字以内）",
+  "summary": "${summaryDesc}"${keyPointsSchema},
   "todos": [
     ${jsonSchemaDesc}
   ]
 }
-如果没有待办事项，todos 数组留空。
+如果没有待办事项，todos 数组留空。${keyPointsHint}
 ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
 
   const contentArray: any[] = [];
@@ -172,6 +190,9 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
     const parsed = JSON.parse(rawContent) as AIResult;
     if (!parsed.todos || !Array.isArray(parsed.todos)) {
       parsed.todos = [];
+    }
+    if (!parsed.key_points || !Array.isArray(parsed.key_points)) {
+      parsed.key_points = undefined;
     }
     parsed.todos = parsed.todos.map(t => ({ 
       ...t, 

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use imap;
 use native_tls::TlsConnector;
 use mailparse::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Email {
@@ -10,6 +11,8 @@ pub struct Email {
     pub subject: String,
     pub date: String,
     pub body_text: String,
+    pub html_body: Option<String>,
+    pub inline_images: Vec<String>,
 }
 
 #[tauri::command]
@@ -44,37 +47,55 @@ pub async fn get_email_folders(
     Ok(folders)
 }
 
-fn extract_text_from_parsed_mail(parsed: &ParsedMail) -> String {
-    let mut text = String::new();
-    
-    if parsed.ctype.mimetype == "text/plain" {
-        if let Ok(body) = parsed.get_body() {
-            text.push_str(&body);
-        }
-    } else if parsed.ctype.mimetype == "text/html" {
-        if let Ok(body) = parsed.get_body() {
-            let stripped = body.replace("<br>", "\n").replace("<br/>", "\n");
-            text.push_str(&stripped);
-        }
-    } else if parsed.subparts.len() > 0 {
-        let mut found_plain = false;
-        for sub in &parsed.subparts {
-            if sub.ctype.mimetype == "text/plain" {
-                text.push_str(&extract_text_from_parsed_mail(sub));
-                found_plain = true;
-                break;
+fn extract_mail_content(parsed: &ParsedMail) -> (String, Option<String>, Vec<String>) {
+    let mut plain_texts = Vec::new();
+    let mut html_texts = Vec::new();
+    let mut images = Vec::new();
+
+    fn traverse(sub: &ParsedMail, plain: &mut Vec<String>, html: &mut Vec<String>, imgs: &mut Vec<String>) {
+        let mime = sub.ctype.mimetype.to_lowercase();
+        if mime == "text/plain" {
+            if let Ok(body) = sub.get_body() {
+                plain.push(body);
             }
-        }
-        if !found_plain {
-            for sub in &parsed.subparts {
-                if sub.ctype.mimetype == "text/html" {
-                    text.push_str(&extract_text_from_parsed_mail(sub));
-                    break;
+        } else if mime == "text/html" {
+            if let Ok(body) = sub.get_body() {
+                html.push(body);
+            }
+        } else if mime.starts_with("image/") {
+            if imgs.len() < 10 {
+                if let Ok(raw) = sub.get_body_raw() {
+                    let b64 = STANDARD.encode(&raw);
+                    imgs.push(format!("data:{};base64,{}", mime, b64));
                 }
             }
         }
+
+        for child in &sub.subparts {
+            traverse(child, plain, html, imgs);
+        }
     }
-    text
+
+    traverse(parsed, &mut plain_texts, &mut html_texts, &mut images);
+
+    let body_text = if !plain_texts.is_empty() {
+        plain_texts.join("\n")
+    } else if !html_texts.is_empty() {
+        html_texts.iter()
+            .map(|h| h.replace("<br>", "\n").replace("<br/>", "\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+
+    let html_body = if !html_texts.is_empty() {
+        Some(html_texts.join("<hr>"))
+    } else {
+        None
+    };
+
+    (body_text, html_body, images)
 }
 
 #[tauri::command]
@@ -135,7 +156,7 @@ pub async fn fetch_emails(
                         .map(|h| h.get_value())
                         .unwrap_or_default();
                         
-                    let body_text = extract_text_from_parsed_mail(&parsed);
+                    let (body_text, html_body, inline_images) = extract_mail_content(&parsed);
                     
                     emails.push(Email {
                         uid: *uid,
@@ -143,6 +164,8 @@ pub async fn fetch_emails(
                         subject,
                         date,
                         body_text,
+                        html_body,
+                        inline_images,
                     });
                 }
             }
@@ -211,5 +234,16 @@ mod tests {
         let parsed = parse_mail(raw_email).unwrap();
         let text = extract_text_from_parsed_mail(&parsed);
         assert_eq!(text.trim(), "Plain text part.");
+    }
+
+    #[test]
+    fn test_extract_content_with_image() {
+        let raw_email = b"Content-Type: multipart/mixed; boundary=\"imgbound\"\r\n\r\n--imgbound\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHere is an image:\r\n--imgbound\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: binary\r\n\r\nfakeimagebytes\r\n--imgbound--";
+        let parsed = parse_mail(raw_email).unwrap();
+        let (text, html, imgs) = extract_mail_content(&parsed);
+        assert_eq!(text.trim(), "Here is an image:");
+        assert_eq!(html, None);
+        assert_eq!(imgs.len(), 1);
+        assert!(imgs[0].starts_with("data:image/png;base64,"));
     }
 }

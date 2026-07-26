@@ -13,44 +13,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { parseFile } from './lib/parser'
 import { logger } from './lib/logger'
 import { useSettingsStore } from './store'
-const compressImage = async (file: File): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        let width = img.width;
-        let height = img.height;
-        const max = 1920;
-        if (width > max || height > max) {
-          if (width > height) {
-            height = Math.round((height * max) / width);
-            width = max;
-          } else {
-            width = Math.round((width * max) / height);
-            height = max;
-          }
-        }
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(0, 0, width, height);
-          ctx.drawImage(img, 0, 0, width, height);
-          resolve(canvas.toDataURL('image/jpeg', 0.8));
-        } else {
-          resolve(event.target?.result as string);
-        }
-      };
-      img.onerror = () => reject(new Error('图片加载失败'));
-      img.src = event.target?.result as string;
-    };
-    reader.onerror = () => reject(new Error('文件读取失败'));
-    reader.readAsDataURL(file);
-  });
-};
+import { compressImage } from './lib/imageUtils'
 
 export default function App() {
   const [input, setInput] = useState('')

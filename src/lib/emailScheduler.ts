@@ -5,6 +5,7 @@ import { extractTodosFromContent, type AIResult } from './ai';
 import { syncToNotion } from './notion';
 import { logger } from './logger';
 import { LazyStore } from '@tauri-apps/plugin-store';
+import { compressBase64Image } from './imageUtils';
 
 export interface EmailHistoryItem {
     batchId: string;
@@ -18,6 +19,9 @@ export interface EmailHistoryItem {
     emailDate?: string;
     syncedToNotion?: boolean;
     folder?: string;
+    rawBodyText?: string;
+    htmlBody?: string;
+    inlineImages?: string[];
 }
 
 const historyStore = new LazyStore('email_history.enc');
@@ -73,7 +77,10 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
             emailDate: email.date,
             status: 'success', // Consider it success so it's not retried as error
             syncedToNotion: false, // or undefined, as it was skipped
-            folder
+            folder,
+            rawBodyText: email.body_text,
+            htmlBody: email.html_body,
+            inlineImages: email.inline_images || []
         };
     }
 
@@ -83,6 +90,18 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
 
     let aiResult: AIResult | undefined = undefined;
     let synced = false;
+    let compressedImages: string[] = [];
+    if (email.inline_images && email.inline_images.length > 0) {
+        for (const imgStr of email.inline_images) {
+            try {
+                const compressed = await compressBase64Image(imgStr, 1280, 0.75);
+                compressedImages.push(compressed);
+            } catch (err) {
+                logger.warn(`Failed to compress image in email ${email.uid}, using original`, err);
+                compressedImages.push(imgStr);
+            }
+        }
+    }
 
     while (attempt < maxAttempts) {
         attempt++;
@@ -92,7 +111,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
             // 1. AI Extraction (truncation happens inside extractTodosFromContent)
             if (!aiResult) {
                 const prompt = `邮件主题: ${email.subject}\n发件人: ${email.sender}\n日期: ${email.date}\n\n内容:\n${email.body_text}`;
-                aiResult = await extractTodosFromContent(prompt, []);
+                aiResult = await extractTodosFromContent(prompt, compressedImages);
             }
 
             // 2. Notion Sync (Only if autoSyncToNotion is true)
@@ -140,7 +159,10 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                 status: 'success',
                 aiResult,
                 syncedToNotion: synced,
-                folder
+                folder,
+                rawBodyText: email.body_text,
+                htmlBody: email.html_body,
+                inlineImages: compressedImages
             };
 
         } catch (e: any) {
@@ -164,7 +186,10 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
         status: 'failed',
         error: lastError,
         aiResult,
-        folder
+        folder,
+        rawBodyText: email.body_text,
+        htmlBody: email.html_body,
+        inlineImages: compressedImages
     };
 }
 
