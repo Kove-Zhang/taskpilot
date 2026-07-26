@@ -39,7 +39,7 @@ function cleanMetadataField(val: string): string {
  * 核心解析引擎：切割邮件长文并分离出最新回信与往期回帖链
  * 兼容铁塔/网易/腾讯/Outlook/Exchange 等主流企业邮箱格式
  */
-export function parseEmailThread(content: string, isHtml: boolean = false): ParsedEmailThread {
+export function parseEmailThread(content: string, _isHtml: boolean = false): ParsedEmailThread {
   if (!content || !content.trim()) {
     return {
       latestMessage: '',
