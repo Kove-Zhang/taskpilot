@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown, Mail, Plus, Trash2, ShieldCheck, ChevronDown, ChevronUp, Lock } from 'lucide-react'
+import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown, Mail, Plus, Trash2, ShieldCheck, ChevronDown, ChevronUp, Lock, Maximize2 } from 'lucide-react'
 import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from './store'
 import { logger } from './lib/logger'
 import { fetch } from '@tauri-apps/plugin-http'
 import { invoke } from '@tauri-apps/api/core'
+import { ZenEditorModal } from './components/ZenEditorModal'
 
 
 import { decodeIMAPFolder } from './lib/parser'
@@ -40,6 +41,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [providerTestResults, setProviderTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string }>>({});
   const [formFocus, setFormFocus] = useState(personalFocus);
+  const [isFocusEditorOpen, setIsFocusEditorOpen] = useState(false);
   const [formNotionKey, setFormNotionKey] = useState(notionApiKey);
   const [formNotionDb, setFormNotionDb] = useState(notionDatabaseId);
   const [formLogging, setFormLogging] = useState(enableLogging);
@@ -785,6 +787,14 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                   <Wand2 className="w-4 h-4" /> 个人关注方向
                 </h3>
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setIsFocusEditorOpen(true)}
+                    className="text-xs flex items-center gap-1 bg-indigo-500/20 text-indigo-300 px-2 py-1 rounded hover:bg-indigo-500/30 transition border border-indigo-500/30"
+                    title="全屏放大沉浸式编辑与保存"
+                  >
+                    <Maximize2 className="w-3 h-3" />
+                    放大编辑
+                  </button>
                   {previousFocus !== null && (
                     <button
                       onClick={() => {
@@ -1394,6 +1404,31 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </div>
 
       </div>
+
+      {/* Zen Expand Editor Modal for Personal Focus */}
+      <ZenEditorModal
+        isOpen={isFocusEditorOpen}
+        title="沉浸式编辑：个人关注方向 (待办提取规则)"
+        value={formFocus}
+        placeholder="例如：我是一名前端开发，请侧重提取关于 UI、交互、接口联调的待办..."
+        onSave={(newVal) => {
+          setFormFocus(newVal);
+          if (previousFocus !== null && newVal !== previousFocus) {
+            setPreviousFocus(null);
+          }
+        }}
+        onClose={() => setIsFocusEditorOpen(false)}
+        showAiOptimize={true}
+        onAiOptimize={handleOptimizePrompt}
+        isOptimizing={optimizingPrompt}
+        canUndo={previousFocus !== null}
+        onUndo={() => {
+          if (previousFocus !== null) {
+            setFormFocus(previousFocus);
+            setPreviousFocus(null);
+          }
+        }}
+      />
     </div>
   )
 }
