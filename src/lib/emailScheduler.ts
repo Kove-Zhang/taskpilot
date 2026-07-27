@@ -166,7 +166,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                     user: emailConfig.user,
                     pass: emailConfig.pass,
                     ssl: emailConfig.ssl,
-                    folder: emailConfig.targetFolder,
+                    folder: folder,
                     uid: email.uid
                 });
             }
@@ -292,10 +292,15 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                         // If it wasn't added inside processSingleEmail, it means it skipped or failed
                     }
                     
-                    // Immediately save to history for real-time feedback
+                    // Immediately save to history for real-time feedback (with deduplication for retried failed items)
                     if (result.aiResult || result.status === 'failed') {
                         let existing: EmailHistoryItem[] = await historyStore.get('history') || [];
-                        existing.unshift(result);
+                        const existingIdx = existing.findIndex(item => item.folder === result.folder && item.emailUid === result.emailUid);
+                        if (existingIdx >= 0) {
+                            existing[existingIdx] = result;
+                        } else {
+                            existing.unshift(result);
+                        }
                         if (existing.length > 500) existing = existing.slice(0, 500);
                         await historyStore.set('history', existing);
                         await historyStore.save();

@@ -232,7 +232,10 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     if (!entry.aiResult || !entry.aiResult.todos) return;
     
     const selectedTodos = entry.aiResult.todos.filter(t => t.selected !== false && !t.synced);
-    if (selectedTodos.length === 0) return;
+    if (selectedTodos.length === 0) {
+      alert("当前没有可同步的待办事项：您选中的条目可能已全部同步至 Notion，或未勾选任何有效事项。");
+      return;
+    }
     
     setSyncing(true);
     try {
