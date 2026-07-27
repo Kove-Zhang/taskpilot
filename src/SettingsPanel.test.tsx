@@ -20,7 +20,7 @@ describe('SettingsPanel', () => {
   it('renders settings fields correctly', () => {
     render(<SettingsPanel onClose={() => {}} />)
     expect(screen.getByText('API Base URL')).toBeInTheDocument()
-    expect(screen.getByText('Model Name (多模态)')).toBeInTheDocument()
+    expect(screen.getByText('Model Name (如 gpt-4o)')).toBeInTheDocument()
   })
 
   it('updates state when typing into API URL', () => {

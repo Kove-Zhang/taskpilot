@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2, Trash2 } from 'lucide-react'
+import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2, Trash2, Play, Pause, Square, Rocket, ScrollText, ArrowRight, Clock, UploadCloud, Terminal } from 'lucide-react'
 import { LazyStore } from '@tauri-apps/plugin-store'
 import type { EmailHistoryItem } from './lib/emailScheduler'
 import { forceRunEmailScanner } from './lib/emailScheduler'
@@ -49,7 +49,17 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const { notionProperties, fieldMappings } = useSettingsStore();
   const [history, setHistory] = useState<EmailHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const { running, progressMsg, historyVersion } = useScannerStore();
+  const { running, paused, progressMsg, scanLogs, historyVersion, setPaused, requestStop } = useScannerStore();
+  const [hideStatusBar, setHideStatusBar] = useState(false);
+
+  useEffect(() => {
+    if (running) setHideStatusBar(false);
+  }, [running]);
+  const [showMiniLog, setShowMiniLog] = useState(false);
+  const [inReviewMode, setInReviewMode] = useState(false);
+  const [reviewFilterUnreviewed, setReviewFilterUnreviewed] = useState(true);
+  const [reviewFilterReviewed, setReviewFilterReviewed] = useState(false);
+  const [reviewIndex, setReviewIndex] = useState(0);
   const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
   const [editingEntryIndex, setEditingEntryIndex] = useState<number | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -67,6 +77,77 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   }>({ isOpen: false, message: '', onConfirm: () => {} });
   
   const [selectedGroup, setSelectedGroup] = useState<{ folder: string, date: string } | null>(null);
+
+  const reviewList = useMemo(() => {
+    return history.map((item, originalIndex) => ({ ...item, originalIndex })).filter(item => {
+      const isReviewed = !!item.reviewed;
+      if (reviewFilterUnreviewed && reviewFilterReviewed) return true;
+      if (reviewFilterUnreviewed && !reviewFilterReviewed) return !isReviewed;
+      if (!reviewFilterUnreviewed && reviewFilterReviewed) return isReviewed;
+      return false;
+    }).sort((a, b) => {
+      const timeA = a.emailDate ? new Date(a.emailDate).getTime() : a.timestamp;
+      const timeB = b.emailDate ? new Date(b.emailDate).getTime() : b.timestamp;
+      return timeB - timeA;
+    });
+  }, [history, reviewFilterUnreviewed, reviewFilterReviewed]);
+
+  const toggleReviewed = async (originalIndex: number, targetStatus?: boolean) => {
+    const newHistory = [...history];
+    const current = newHistory[originalIndex];
+    if (!current) return;
+    const nextStatus = targetStatus !== undefined ? targetStatus : !current.reviewed;
+    newHistory[originalIndex] = { ...current, reviewed: nextStatus };
+    setHistory(newHistory);
+    await historyStore.set('history', newHistory);
+    await historyStore.save();
+  };
+
+  useEffect(() => {
+    if (!inReviewMode) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      
+      const currentItem = reviewList[reviewIndex];
+      if (e.key === 'Enter' || e.code === 'Space') {
+        e.preventDefault();
+        if (currentItem) {
+          toggleReviewed(currentItem.originalIndex, true);
+          if (reviewFilterReviewed) {
+            if (reviewIndex < reviewList.length - 1) {
+              setReviewIndex(reviewIndex + 1);
+            }
+          } else {
+            if (reviewIndex >= reviewList.length - 1 && reviewIndex > 0) {
+              setReviewIndex(reviewIndex - 1);
+            }
+          }
+        }
+      } else if (e.key === 'ArrowRight' || e.key === 'n' || e.key === 'N') {
+        e.preventDefault();
+        if (reviewIndex < reviewList.length - 1) {
+          setReviewIndex(reviewIndex + 1);
+        }
+      } else if (e.key === 'ArrowLeft' || e.key === 'p' || e.key === 'P') {
+        e.preventDefault();
+        if (reviewIndex > 0) {
+          setReviewIndex(reviewIndex - 1);
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        setInReviewMode(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [inReviewMode, reviewList, reviewIndex]);
+
+  useEffect(() => {
+    setActiveTab('todos');
+    setPreviewDrawerOpen(false);
+    setSelectedText('');
+    setSelectionSource('');
+  }, [reviewIndex, inReviewMode]);
 
   const { grouped, folders } = useMemo(() => {
     const indexedHistory = history.map((item, originalIndex) => ({ ...item, originalIndex }));
@@ -105,10 +186,18 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     setSelectedGroup({ folder: firstFolder, date: firstDate });
   }, [grouped, folders, selectedGroup]);
 
-  const updateTodo = async (todoId: string, field: string, value: any) => {
-    if (editingEntryIndex === null) return;
+  const getActiveTargetIndex = (customIdx?: number): number | null => {
+    if (typeof customIdx === 'number') return customIdx;
+    if (editingEntryIndex !== null) return editingEntryIndex;
+    if (inReviewMode && reviewList[reviewIndex]) return reviewList[reviewIndex].originalIndex;
+    return null;
+  };
+
+  const updateTodo = async (todoId: string, field: string, value: any, targetIdx?: number) => {
+    const idx = getActiveTargetIndex(targetIdx);
+    if (idx === null) return;
     const newHistory = [...history];
-    const entry = newHistory[editingEntryIndex];
+    const entry = newHistory[idx];
     if (!entry.aiResult) return;
     
     entry.aiResult.todos = entry.aiResult.todos.map(t => 
@@ -119,10 +208,11 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     await historyStore.save();
   }
 
-  const handleAddTodo = async () => {
-    if (editingEntryIndex === null) return;
+  const handleAddTodo = async (targetIdx?: number) => {
+    const idx = getActiveTargetIndex(targetIdx);
+    if (idx === null) return;
     const newHistory = [...history];
-    const entry = newHistory[editingEntryIndex];
+    const entry = newHistory[idx];
     if (!entry.aiResult) return;
 
     entry.aiResult.todos.push({
@@ -135,9 +225,10 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     await historyStore.save();
   }
 
-  const handleSyncNotion = async () => {
-    if (editingEntryIndex === null) return;
-    const entry = history[editingEntryIndex];
+  const handleSyncNotion = async (targetIdx?: number) => {
+    const idx = getActiveTargetIndex(targetIdx);
+    if (idx === null) return;
+    const entry = history[idx];
     if (!entry.aiResult || !entry.aiResult.todos) return;
     
     const selectedTodos = entry.aiResult.todos.filter(t => t.selected !== false && !t.synced);
@@ -150,7 +241,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
       const failed = syncRes.filter(r => !r.success);
       
       const newHistory = [...history];
-      const targetEntry = { ...newHistory[editingEntryIndex] };
+      const targetEntry = { ...newHistory[idx] };
       if (targetEntry.aiResult) {
         targetEntry.aiResult = {
           ...targetEntry.aiResult,
@@ -163,15 +254,15 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
         };
       }
       targetEntry.syncedToNotion = failed.length === 0;
-      newHistory[editingEntryIndex] = targetEntry;
+      newHistory[idx] = targetEntry;
       
       setHistory(newHistory);
       await historyStore.set('history', newHistory);
       await historyStore.save();
       
       if (failed.length > 0) {
-        const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\\n');
-        throw new Error(`部分同步失败 (${failed.length}/${selectedTodos.length}):\\n${errorMsgs}`);
+        const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\n');
+        throw new Error(`部分同步失败 (${failed.length}/${selectedTodos.length}):\n${errorMsgs}`);
       }
     } catch (e: any) {
       console.error(e);
@@ -254,41 +345,165 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     }
   }
 
-  if (editingEntryIndex !== null) {
-    const entry = history[editingEntryIndex];
+  if (inReviewMode) {
+    const currentReviewItem = reviewList[reviewIndex];
+    return (
+      <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-in fade-in duration-200">
+        <div className="glass-panel w-[95%] max-w-[860px] h-[90vh] flex flex-col shadow-2xl border border-pink-500/30 rounded-xl overflow-hidden">
+          
+          {/* Top Header of Review Mode */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between p-4 bg-slate-900/80 border-b border-white/10 gap-3 shrink-0">
+            <div className="flex items-center gap-3">
+              <span className="text-base font-semibold text-white flex items-center gap-2">
+                <Rocket className="w-5 h-5 text-pink-400 animate-pulse" />
+                逐条审核模式
+              </span>
+              <span className="text-xs text-slate-400 font-mono bg-white/5 px-2.5 py-1 rounded-full">
+                进度: {reviewList.length > 0 ? reviewIndex + 1 : 0} / {reviewList.length}
+              </span>
+            </div>
+            
+            {/* Multi-select Checkboxes */}
+            <div className="flex items-center gap-4 bg-black/40 px-3 py-1.5 rounded-lg border border-white/5 text-xs">
+              <span className="text-slate-400">过滤显示:</span>
+              <label className="flex items-center gap-1.5 cursor-pointer text-slate-200 hover:text-white select-none">
+                <input 
+                  type="checkbox" 
+                  checked={reviewFilterUnreviewed} 
+                  onChange={(e) => {
+                    setReviewFilterUnreviewed(e.target.checked);
+                    setReviewIndex(0);
+                  }}
+                  className="rounded border-slate-600 bg-slate-800 text-pink-500 focus:ring-0 w-3.5 h-3.5"
+                />
+                未审核
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer text-slate-200 hover:text-white select-none">
+                <input 
+                  type="checkbox" 
+                  checked={reviewFilterReviewed} 
+                  onChange={(e) => {
+                    setReviewFilterReviewed(e.target.checked);
+                    setReviewIndex(0);
+                  }}
+                  className="rounded border-slate-600 bg-slate-800 text-pink-500 focus:ring-0 w-3.5 h-3.5"
+                />
+                已审核
+              </label>
+            </div>
+
+            <button 
+              onClick={() => setInReviewMode(false)}
+              className="text-xs bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 self-end sm:self-auto"
+            >
+              <X className="w-4 h-4" /> 退出逐条模式 (Esc)
+            </button>
+          </div>
+
+          {/* Body content of Review Mode */}
+          <div className="flex-1 overflow-hidden p-6 bg-slate-950/40 flex flex-col justify-between">
+            {reviewList.length === 0 ? (
+              <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2 my-auto">
+                <CheckCircle2 className="w-12 h-12 text-slate-600 mb-2" />
+                <p className="text-base">当前勾选的过滤条件下暂无邮件记录</p>
+                <p className="text-xs text-slate-600">请尝试勾选右上角的“未审核”或“已审核”查看更多内容</p>
+              </div>
+            ) : currentReviewItem ? (
+              <div className="flex flex-col gap-4 max-w-4xl mx-auto w-full flex-1 overflow-hidden">
+                {/* Email Metadata Card */}
+                <div className="bg-slate-900/60 border border-white/10 rounded-xl p-5 shadow-lg flex flex-col gap-3 shrink-0">
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <span className="text-xs font-semibold text-pink-400 bg-pink-500/10 px-2.5 py-1 rounded-md border border-pink-500/20 mb-2 inline-block">
+                        {currentReviewItem.folder ? decodeIMAPFolder(currentReviewItem.folder) : 'INBOX'}
+                      </span>
+                      <h3 className="text-lg font-bold text-white mt-1">{currentReviewItem.subject || '(无主题)'}</h3>
+                    </div>
+                    <button
+                      onClick={() => toggleReviewed(currentReviewItem.originalIndex)}
+                      className={`h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all border shrink-0 ${
+                        currentReviewItem.reviewed
+                          ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/25 shadow-sm shadow-emerald-500/10'
+                          : 'bg-amber-500/15 text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
+                      }`}
+                    >
+                      {currentReviewItem.reviewed ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <Clock className="w-3.5 h-3.5 shrink-0" />}
+                      {currentReviewItem.reviewed ? '已审核 (点击人工解除)' : '未审核 (点击手动标记)'}
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-4 text-xs text-slate-400 border-t border-white/5 pt-3 mt-1 font-mono">
+                    <span>发件人: <strong className="text-slate-300 font-sans">{currentReviewItem.sender}</strong></span>
+                    <span>时间: {currentReviewItem.emailDate ? new Date(currentReviewItem.emailDate).toLocaleString() : new Date(currentReviewItem.timestamp).toLocaleString()}</span>
+                    <span>状态: <span className={currentReviewItem.status === 'success' ? 'text-emerald-400' : 'text-red-400'}>{currentReviewItem.status === 'success' ? '解析成功' : '解析失败'}</span></span>
+                  </div>
+                </div>
+
+                {/* Unified Feature-Parity Review Content */}
+                <div className="flex-1 overflow-hidden flex flex-col mt-1">
+                  {renderEmailDetailsContent(currentReviewItem, currentReviewItem.originalIndex)}
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          {/* Ergonomic Bottom Control Bar */}
+          <div className="p-4 bg-slate-900 border-t border-white/10 flex flex-wrap items-center justify-between gap-3 shrink-0">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  if (reviewIndex > 0) setReviewIndex(reviewIndex - 1);
+                }}
+                disabled={reviewIndex <= 0 || reviewList.length === 0}
+                className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white disabled:opacity-30 disabled:pointer-events-none text-xs font-medium transition-all flex items-center gap-1.5"
+              >
+                <ArrowLeft className="w-4 h-4" /> 返回上一条 (←/P)
+              </button>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => {
+                  if (reviewIndex < reviewList.length - 1) setReviewIndex(reviewIndex + 1);
+                }}
+                disabled={reviewIndex >= reviewList.length - 1 || reviewList.length === 0}
+                className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white disabled:opacity-30 disabled:pointer-events-none text-xs font-medium transition-all flex items-center gap-1.5 border border-white/5"
+              >
+                跳过不标记，下一条 (→/N) <ArrowRight className="w-4 h-4" />
+              </button>
+              
+              <button
+                onClick={() => {
+                  if (currentReviewItem) {
+                    toggleReviewed(currentReviewItem.originalIndex, true);
+                    if (reviewFilterReviewed) {
+                      if (reviewIndex < reviewList.length - 1) setReviewIndex(reviewIndex + 1);
+                    } else {
+                      if (reviewIndex >= reviewList.length - 1 && reviewIndex > 0) {
+                        setReviewIndex(reviewIndex - 1);
+                      }
+                    }
+                  }
+                }}
+                disabled={reviewList.length === 0}
+                className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-pink-500 to-purple-600 hover:from-pink-600 hover:to-purple-700 text-white font-medium text-xs shadow-lg shadow-pink-500/20 transition-all flex items-center gap-2 disabled:opacity-30 disabled:pointer-events-none"
+              >
+                <CheckCircle2 className="w-4 h-4" /> 标记已审并查看下一条 (Enter/Space)
+              </button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    );
+  }
+
+  function renderEmailDetailsContent(entry: EmailHistoryItem, entryIndex: number) {
     const result = entry.aiResult;
     const parsedThread = parseEmailThread(entry.htmlBody || entry.rawBodyText || '', !!entry.htmlBody);
     return (
-      <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-        <div className="glass-panel w-[95%] max-w-[760px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 h-[85vh]">
-          {/* Header */}
-          <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
-            <h2 className="text-xl font-semibold text-white flex items-center gap-2">
-              <button 
-                onClick={() => {
-                  setEditingEntryIndex(null);
-                  setActiveTab('todos');
-                  setPreviewDrawerOpen(false);
-                  setSelectedText('');
-                  setSelectionSource('');
-                  setExpandedThreads({});
-                  setLightboxImg(null);
-                  setEmailViewMode('light');
-                }}
-                className="hover:bg-white/10 p-1.5 rounded transition-colors mr-1"
-              >
-                <ArrowLeft className="w-5 h-5" />
-              </button>
-              <span className="truncate max-w-[320px]" title={entry.subject}>处理待办 - {entry.subject || '(无主题)'}</span>
-            </h2>
-            {entry.syncedToNotion && (
-              <div className="text-xs bg-green-500/20 text-green-400 px-2 py-1 rounded border border-green-500/30 font-medium">
-                已推送
-              </div>
-            )}
-          </div>
-          
-          {/* Dual Tab Switcher */}
+      <>
+        {/* Dual Tab Switcher */}
           <div className="flex border-b border-white/10 shrink-0 gap-6">
             <button
               onClick={() => setActiveTab('todos')}
@@ -363,7 +578,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                           <input
                             type="checkbox"
                             checked={todo.selected !== false}
-                            onChange={(e) => updateTodo(todo.id, 'selected', e.target.checked)}
+                            onChange={(e) => updateTodo(todo.id, 'selected', e.target.checked, entryIndex)}
                             disabled={entry.syncedToNotion}
                             className="w-4 h-4 rounded bg-slate-800 border-slate-600 focus:ring-offset-slate-900"
                           />
@@ -375,7 +590,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                               <select
                                 key={field.id}
                                 value={todo[field.name] || ''}
-                                onChange={(e) => updateTodo(todo.id, field.name, e.target.value)}
+                                onChange={(e) => updateTodo(todo.id, field.name, e.target.value, entryIndex)}
                                 disabled={entry.syncedToNotion}
                                 className="text-xs font-mono text-purple-400 bg-purple-500/10 border-0 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-purple-500 outline-none disabled:opacity-50 disabled:cursor-not-allowed max-w-[100px] truncate shrink-0"
                               >
@@ -391,7 +606,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                                 key={field.id}
                                 type="date"
                                 value={todo[field.name] || ''}
-                                onChange={(e) => updateTodo(todo.id, field.name, e.target.value)}
+                                onChange={(e) => updateTodo(todo.id, field.name, e.target.value, entryIndex)}
                                 disabled={entry.syncedToNotion}
                                 className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-slate-400 outline-none disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
                               />
@@ -402,7 +617,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                                 <input 
                                   type="checkbox" 
                                   checked={todo[field.name] === true} 
-                                  onChange={e => updateTodo(todo.id, field.name, e.target.checked)} 
+                                  onChange={e => updateTodo(todo.id, field.name, e.target.checked, entryIndex)} 
                                   disabled={entry.syncedToNotion} 
                                   className="rounded bg-slate-800 border-slate-600 focus:ring-offset-slate-900" 
                                 />
@@ -415,7 +630,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                                 key={field.id} 
                                 type="text" 
                                 value={todo[field.name] || ''} 
-                                onChange={e => updateTodo(todo.id, field.name, e.target.value)} 
+                                onChange={e => updateTodo(todo.id, field.name, e.target.value, entryIndex)} 
                                 disabled={entry.syncedToNotion} 
                                 placeholder={field.name} 
                                 className="w-[120px] shrink-0 bg-transparent text-xs border-b border-white/10 focus:border-purple-500/50 outline-none text-slate-300 px-1" 
@@ -428,7 +643,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                     
                     {!entry.syncedToNotion && (
                       <button 
-                        onClick={handleAddTodo}
+                        onClick={() => handleAddTodo(entryIndex)}
                         className="w-full py-2 flex items-center justify-center gap-1 text-xs text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-md border border-dashed border-white/10 transition-colors"
                       >
                         ➕ 手动添加待办
@@ -439,7 +654,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                   {result.todos.length > 0 && (
                     <div className="flex justify-end mt-4">
                        <button 
-                         onClick={handleSyncNotion}
+                         onClick={() => handleSyncNotion(entryIndex)}
                          disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || entry.syncedToNotion}
                          className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${entry.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
                        >
@@ -468,9 +683,9 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                       <div className="flex items-center gap-2 shrink-0">
                         <button
                           onClick={async () => {
-                            const newHistory = [...history];
-                            const curEntry = newHistory[editingEntryIndex];
-                            if (curEntry.aiResult) {
+                          const newHistory = [...history];
+                          const curEntry = newHistory[entryIndex];
+                          if (curEntry && curEntry.aiResult) {
                               const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
                               const titleProp = activeFields.find(p => p.type === 'title')?.name || 'title';
                               const sourceTag = selectionSource ? ` [${selectionSource}]` : '';
@@ -752,6 +967,59 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
               <div className="text-center text-slate-500 py-10">无大模型解析结果</div>
             )}
           </div>
+      </>
+    );
+  }
+
+  if (editingEntryIndex !== null) {
+    const entry = history[editingEntryIndex];
+    if (!entry) return null;
+    return (
+      <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
+        <div className="glass-panel w-[95%] max-w-[760px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 h-[85vh]">
+          {/* Header */}
+          <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
+            <h2 className="text-xl font-semibold text-white flex items-center gap-2">
+              <button 
+                onClick={() => {
+                  setEditingEntryIndex(null);
+                  setActiveTab('todos');
+                  setPreviewDrawerOpen(false);
+                  setSelectedText('');
+                  setSelectionSource('');
+                  setExpandedThreads({});
+                  setLightboxImg(null);
+                  setEmailViewMode('light');
+                }}
+                className="hover:bg-white/10 p-1.5 rounded transition-colors mr-1"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <span className="truncate max-w-[320px]" title={entry.subject}>处理待办 - {entry.subject || '(无主题)'}</span>
+            </h2>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => toggleReviewed(editingEntryIndex!)}
+                className={`h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all border shrink-0 ${
+                  entry.reviewed
+                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25 shadow-sm shadow-emerald-500/10'
+                    : 'bg-amber-500/15 text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
+                }`}
+                title={entry.reviewed ? '点击解除审核标记' : '点击标记为已审核'}
+              >
+                {entry.reviewed ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <Clock className="w-3.5 h-3.5 shrink-0" />}
+                {entry.reviewed ? '已审核' : '未审核'}
+              </button>
+              {entry.syncedToNotion && (
+                <div className="h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 bg-sky-500/15 text-sky-300 border border-sky-500/30 shadow-sm shadow-sky-500/10 shrink-0">
+                  <UploadCloud className="w-3.5 h-3.5 shrink-0" />
+                  <span>已推送</span>
+                </div>
+              )}
+            </div>
+          </div>
+          
+          {renderEmailDetailsContent(entry, editingEntryIndex)}
         </div>
       </div>
     );
@@ -768,6 +1036,17 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
             邮箱监听历史
           </h2>
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => {
+                setInReviewMode(true);
+                setReviewIndex(0);
+              }}
+              disabled={history.length === 0}
+              className="text-xs flex items-center gap-1.5 bg-gradient-to-r from-purple-500/20 to-pink-500/20 hover:from-purple-500/30 hover:to-pink-500/30 text-pink-300 border border-pink-500/30 px-3 py-1.5 rounded-lg transition-all shadow-sm disabled:opacity-50 font-medium"
+            >
+              <Rocket className="w-3.5 h-3.5 text-pink-400" /> 逐条审核模式 🚀
+            </button>
+            
             <button onClick={clearAllHistory} className="text-xs flex items-center gap-1 text-slate-400 hover:text-red-400 transition-colors">
               <Trash2 className="w-3.5 h-3.5" /> 清空
             </button>
@@ -776,13 +1055,108 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
               disabled={running}
               className="text-xs flex items-center gap-1 bg-pink-500/20 hover:bg-pink-500/30 text-pink-300 px-3 py-1.5 rounded transition-colors disabled:opacity-50"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${running ? 'animate-spin' : ''}`} /> {running ? (progressMsg || '执行中...') : '立即执行扫描'}
+              <RefreshCw className={`w-3.5 h-3.5 ${running ? 'animate-spin' : ''}`} /> {running ? '执行中...' : '立即执行扫描'}
             </button>
+            {hideStatusBar && (running || scanLogs.length > 0 || progressMsg) && (
+              <button
+                onClick={() => setHideStatusBar(false)}
+                className="text-xs flex items-center gap-1.5 bg-gradient-to-r from-blue-500/20 to-indigo-500/20 hover:from-blue-500/30 hover:to-indigo-500/30 text-blue-300 border border-blue-500/30 px-3 py-1.5 rounded-lg transition-all shadow-sm font-medium animate-pulse"
+                title="呼出扫描控制与日志面板"
+              >
+                <Terminal className="w-3.5 h-3.5 text-blue-400" /> 扫描状态 ({scanLogs.length})
+              </button>
+            )}
             <button onClick={onClose} className="p-1 hover:bg-white/10 rounded-md transition-colors text-slate-400 hover:text-white">
               <X className="w-5 h-5" />
             </button>
           </div>
         </div>
+
+        {/* Integrated Scan Control & Status Bar */}
+        {!hideStatusBar && (running || scanLogs.length > 0 || progressMsg) && (
+          <div className="bg-slate-900/90 border border-pink-500/30 rounded-xl p-3 shadow-lg shrink-0 animate-in fade-in slide-in-from-top-2 duration-200 flex flex-col gap-2.5">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2 shrink-0">
+                {running ? (
+                  <>
+                    <button
+                      onClick={() => setPaused(!paused)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm ${
+                        paused 
+                          ? 'bg-blue-500 text-white hover:bg-blue-600 shadow-blue-500/20 animate-pulse' 
+                          : 'bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:bg-amber-500/30'
+                      }`}
+                    >
+                      {paused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                      {paused ? '继续扫描' : '暂停扫描'}
+                    </button>
+
+                    <button
+                      onClick={() => requestStop()}
+                      className="px-3 py-1.5 rounded-lg bg-red-500/20 text-red-300 border border-red-500/30 hover:bg-red-500/30 text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm"
+                    >
+                      <Square className="w-3.5 h-3.5 fill-current" /> 停止扫描
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-xs text-slate-400 font-medium flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> 扫描队列就绪
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 flex-1 min-w-0 justify-end w-full sm:w-auto bg-black/30 px-3 py-1.5 rounded-lg border border-white/5">
+                <span className={`w-2 h-2 rounded-full shrink-0 ${
+                  running ? (paused ? 'bg-amber-400 animate-ping' : 'bg-blue-400 animate-pulse') : 'bg-slate-600'
+                }`} />
+                
+                <span 
+                  className="flex-1 min-w-0 font-mono text-xs text-slate-300 truncate text-left sm:text-right cursor-help"
+                  title={progressMsg || (running ? '正在扫描邮件...' : '扫信空闲')}
+                >
+                  {progressMsg || (running ? (paused ? '扫描已暂停等待中...' : '正在同步拉取与解析邮件...') : '当前无正在执行的扫描任务')}
+                </span>
+
+                {scanLogs.length > 0 && (
+                  <button
+                    onClick={() => setShowMiniLog(!showMiniLog)}
+                    className="text-xs text-pink-300 hover:text-pink-200 flex items-center gap-1 bg-white/5 hover:bg-white/10 px-2 py-0.5 rounded transition-colors shrink-0 font-sans ml-1"
+                  >
+                    <ScrollText className="w-3 h-3" />
+                    {showMiniLog ? '收起日志' : `明细 (${scanLogs.length})`}
+                    {showMiniLog ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                  </button>
+                )}
+                <button
+                  onClick={() => setHideStatusBar(true)}
+                  className="text-xs text-slate-400 hover:text-white p-1 hover:bg-white/10 rounded transition-colors ml-1"
+                  title="收起此状态日志板，可于顶部导航栏重新呼出"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {showMiniLog && scanLogs.length > 0 && (
+              <div className="w-full max-h-32 bg-black/80 rounded-lg p-2.5 overflow-y-auto text-xs font-mono text-slate-400 border border-white/10 custom-scrollbar space-y-1 mt-1">
+                <div className="text-[10px] text-slate-500 border-b border-white/5 pb-1 mb-1 flex justify-between items-center">
+                  <span>后台执行步骤明细日志 (最近 100 条)</span>
+                  <button 
+                    onClick={() => useScannerStore.getState().clearScanLogs()} 
+                    className="hover:text-red-400 transition-colors"
+                  >
+                    清空日志
+                  </button>
+                </div>
+                {scanLogs.map((log, idx) => (
+                  <div key={idx} className="truncate hover:text-slate-200 transition-colors" title={log}>
+                    {log}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Content */}
         <div className="flex-1 overflow-hidden flex border-t border-white/5">
@@ -859,14 +1233,30 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                               </span>
                             </div>
                             <div className="flex items-center gap-2">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleReviewed(idx);
+                                }}
+                                className={`h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all border shrink-0 ${
+                                  entry.reviewed
+                                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25 shadow-sm shadow-emerald-500/10'
+                                    : 'bg-amber-500/15 text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
+                                }`}
+                                title={entry.reviewed ? '已审核 (点击人工解除)' : '未审核 (点击标记为已审核)'}
+                              >
+                                {entry.reviewed ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <Clock className="w-3.5 h-3.5 shrink-0" />}
+                                {entry.reviewed ? '已审核' : '未审核'}
+                              </button>
                               {entry.syncedToNotion && (
-                                <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30">
-                                  已推送
-                                </span>
+                                <div className="h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 bg-sky-500/15 text-sky-300 border border-sky-500/30 shadow-sm shadow-sky-500/10 shrink-0">
+                                  <UploadCloud className="w-3.5 h-3.5 shrink-0" />
+                                  <span>已推送</span>
+                                </div>
                               )}
-                              <span className="text-xs text-slate-500 font-mono bg-black/30 px-1.5 rounded">
+                              <div className="h-6 px-2 py-0.5 rounded-md text-xs text-slate-400 font-mono bg-slate-800/80 border border-slate-700/50 flex items-center gap-1 shrink-0">
                                 UID: {entry.emailUid}
-                              </span>
+                              </div>
                               <button onClick={(e) => removeHistoryItem(idx, e)} className="p-1 opacity-0 group-hover:opacity-100 hover:bg-white/10 rounded-md transition-all text-slate-400 hover:text-red-400">
                                 <Trash2 className="w-4 h-4" />
                               </button>

@@ -30,6 +30,13 @@ const secureStorage: StateStorage = {
         if (parsed.state?.emailConfig?.pass) {
           parsed.state.emailConfig.pass = await invoke('decrypt_secret', { cipherText: parsed.state.emailConfig.pass });
         }
+        if (parsed.state?.llmProviders && Array.isArray(parsed.state.llmProviders)) {
+          for (const p of parsed.state.llmProviders) {
+            if (p.apiKey) {
+              p.apiKey = await invoke('decrypt_secret', { cipherText: p.apiKey });
+            }
+          }
+        }
         return JSON.stringify(parsed);
       } catch (e) {
         console.warn("Parse or decrypt error:", e);
@@ -52,6 +59,13 @@ const secureStorage: StateStorage = {
       if (parsed.state?.emailConfig?.pass) {
         parsed.state.emailConfig.pass = await invoke('encrypt_secret', { value: parsed.state.emailConfig.pass });
       }
+      if (parsed.state?.llmProviders && Array.isArray(parsed.state.llmProviders)) {
+        for (const p of parsed.state.llmProviders) {
+          if (p.apiKey) {
+            p.apiKey = await invoke('encrypt_secret', { value: p.apiKey });
+          }
+        }
+      }
       await tauriStore.set(name, JSON.stringify(parsed));
       await tauriStore.save();
     } catch (e) {
@@ -67,6 +81,16 @@ const secureStorage: StateStorage = {
     }
   }
 };
+
+export interface LLMProvider {
+  id: string;
+  name: string;
+  apiBaseUrl: string;
+  apiKey: string;
+  modelName: string;
+  enabled: boolean;
+  priority: number;
+}
 
 export type FieldType = 'title' | 'rich_text' | 'select' | 'multi_select' | 'date' | 'checkbox' | 'number' | string;
 
@@ -115,6 +139,11 @@ interface SettingsState {
   tokenLimit: number;
   enableReasoning: boolean;
   emailConfig: EmailConfig;
+  llmProviders?: LLMProvider[];
+  enableFailover: boolean;
+  failoverRetryCount: number;
+  setLLMProviders: (providers: LLMProvider[]) => void;
+  setFailoverConfig: (enable: boolean, retryCount: number) => void;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
   setPersonalFocus: (focus: string) => void;
   setNotionSettings: (key: string, dbId: string) => void;
@@ -158,7 +187,23 @@ export const useSettingsStore = create<SettingsState>()(
         autoReadDays: 3,
         manualReadDays: 7
       },
-      setApiSettings: (apiBaseUrl, apiKey, modelName) => set({ apiBaseUrl, apiKey, modelName }),
+      enableFailover: true,
+      failoverRetryCount: 1,
+      setApiSettings: (apiBaseUrl, apiKey, modelName) => set((state) => {
+        const providers = state.llmProviders && state.llmProviders.length > 0
+          ? state.llmProviders.map((p, idx) => idx === 0 ? { ...p, apiBaseUrl, apiKey, modelName } : p)
+          : [{ id: 'default-provider', name: '默认模型服务商', apiBaseUrl, apiKey, modelName, enabled: true, priority: 1 }];
+        return { apiBaseUrl, apiKey, modelName, llmProviders: providers };
+      }),
+      setLLMProviders: (llmProviders) => set(() => {
+        const sorted = [...llmProviders].sort((a, b) => a.priority - b.priority);
+        const top = sorted.find(p => p.enabled) || sorted[0];
+        if (top) {
+          return { llmProviders, apiBaseUrl: top.apiBaseUrl, apiKey: top.apiKey, modelName: top.modelName };
+        }
+        return { llmProviders };
+      }),
+      setFailoverConfig: (enableFailover, failoverRetryCount) => set({ enableFailover, failoverRetryCount }),
       setPersonalFocus: (personalFocus) => set({ personalFocus }),
       setNotionSettings: (notionApiKey, notionDatabaseId) => set({ notionApiKey, notionDatabaseId }),
       setEnableLogging: (enableLogging) => set({ enableLogging }),
@@ -185,18 +230,68 @@ export const useSettingsStore = create<SettingsState>()(
 
 export interface ScannerState {
   running: boolean;
+  paused: boolean;
+  stopRequested: boolean;
   progressMsg: string;
+  scanLogs: string[];
   historyVersion: number;
   setRunning: (running: boolean) => void;
+  setPaused: (paused: boolean) => void;
+  requestStop: () => void;
   setProgressMsg: (progressMsg: string) => void;
+  addScanLog: (log: string) => void;
+  clearScanLogs: () => void;
+  resetScanControl: () => void;
   incrementHistoryVersion: () => void;
 }
 
 export const useScannerStore = create<ScannerState>((set) => ({
   running: false,
+  paused: false,
+  stopRequested: false,
   progressMsg: '',
+  scanLogs: [],
   historyVersion: 0,
   setRunning: (running) => set({ running }),
-  setProgressMsg: (progressMsg) => set({ progressMsg }),
+  setPaused: (paused) => set({ paused }),
+  requestStop: () => set({ stopRequested: true, paused: false }),
+  setProgressMsg: (progressMsg) => set((state) => {
+    const timeStr = new Date().toLocaleTimeString();
+    const formattedLog = `[${timeStr}] ${progressMsg}`;
+    const newLogs = [formattedLog, ...state.scanLogs].slice(0, 100);
+    return { progressMsg, scanLogs: newLogs };
+  }),
+  addScanLog: (log) => set((state) => {
+    const timeStr = new Date().toLocaleTimeString();
+    const formattedLog = `[${timeStr}] ${log}`;
+    const newLogs = [formattedLog, ...state.scanLogs].slice(0, 100);
+    return { scanLogs: newLogs };
+  }),
+  clearScanLogs: () => set({ scanLogs: [] }),
+  resetScanControl: () => set({ running: false, paused: false, stopRequested: false, progressMsg: '', scanLogs: [] }),
   incrementHistoryVersion: () => set((state) => ({ historyVersion: state.historyVersion + 1 }))
 }))
+
+export function getSortedLLMProviders(): LLMProvider[] {
+  const state = useSettingsStore.getState();
+  let providers = state.llmProviders;
+  if (!providers || providers.length === 0) {
+    if (state.apiKey || state.apiBaseUrl || state.modelName) {
+      providers = [{
+        id: 'default-provider',
+        name: '默认模型服务商',
+        apiBaseUrl: state.apiBaseUrl || 'https://api.openai.com/v1',
+        apiKey: state.apiKey || '',
+        modelName: state.modelName || 'gpt-4o',
+        enabled: true,
+        priority: 1
+      }];
+      setTimeout(() => {
+        useSettingsStore.getState().setLLMProviders(providers!);
+      }, 0);
+    } else {
+      return [];
+    }
+  }
+  return [...providers].sort((a, b) => a.priority - b.priority);
+}

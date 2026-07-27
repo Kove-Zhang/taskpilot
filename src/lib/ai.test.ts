@@ -16,7 +16,7 @@ describe('AI Helper Methods', () => {
   })
 
   it('generateWriting should throw if no API key', async () => {
-    useSettingsStore.setState({ apiKey: '' })
+    useSettingsStore.setState({ apiKey: '', llmProviders: [] })
     await expect(generateWriting('Write email', [])).rejects.toThrow('请先在设置中配置 API Key')
   })
 

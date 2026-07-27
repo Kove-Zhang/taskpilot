@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown, Mail } from 'lucide-react'
-import { useSettingsStore } from './store'
+import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown, Mail, Plus, Trash2, ShieldCheck, ChevronDown, ChevronUp, Lock } from 'lucide-react'
+import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from './store'
 import { logger } from './lib/logger'
 import { fetch } from '@tauri-apps/plugin-http'
 import { invoke } from '@tauri-apps/api/core'
@@ -15,13 +15,30 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig,
-    setApiSettings, setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig
+    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount,
+    setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig, setLLMProviders, setFailoverConfig
   } = useSettingsStore();
 
-  const [formBaseUrl, setFormBaseUrl] = useState(apiBaseUrl);
-  const [formApiKey, setFormApiKey] = useState(apiKey);
-  const [formModelName, setFormModelName] = useState(modelName);
+  const [formProviders, setFormProviders] = useState<LLMProvider[]>(() => {
+    const list = getSortedLLMProviders();
+    if (list.length === 0) {
+      return [{
+        id: 'default-' + Date.now(),
+        name: '默认服务商',
+        apiBaseUrl: apiBaseUrl || 'https://api.openai.com/v1',
+        apiKey: apiKey || '',
+        modelName: modelName || 'gpt-4o',
+        enabled: true,
+        priority: 1
+      }];
+    }
+    return list;
+  });
+  const [formEnableFailover, setFormEnableFailover] = useState<boolean>(enableFailover !== undefined ? enableFailover : true);
+  const [formRetryCount, setFormRetryCount] = useState<number>(failoverRetryCount || 1);
+  const [showFailoverGuide, setShowFailoverGuide] = useState<boolean>(false);
+  const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
+  const [providerTestResults, setProviderTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string }>>({});
   const [formFocus, setFormFocus] = useState(personalFocus);
   const [formNotionKey, setFormNotionKey] = useState(notionApiKey);
   const [formNotionDb, setFormNotionDb] = useState(notionDatabaseId);
@@ -62,10 +79,6 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [liveShortcut, setLiveShortcut] = useState('');
   const [activeTab, setActiveTab] = useState<'ai' | 'integration' | 'email' | 'system'>('ai');
 
-  const [testingConnection, setTestingConnection] = useState(false);
-  const [testResult, setTestResult] = useState<'none' | 'success' | 'error'>('none');
-  const [testErrorMsg, setTestErrorMsg] = useState('');
-
   const [optimizingPrompt, setOptimizingPrompt] = useState(false);
   const [previousFocus, setPreviousFocus] = useState<string | null>(null);
 
@@ -74,7 +87,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [notionTestErrorMsg, setNotionTestErrorMsg] = useState('');
 
   const handleSave = () => {
-    setApiSettings(formBaseUrl, formApiKey, formModelName);
+    setLLMProviders(formProviders);
+    setFailoverConfig(formEnableFailover, formRetryCount);
     setPersonalFocus(formFocus);
     setNotionSettings(formNotionKey, formNotionDb);
     setEnableLogging(formLogging);
@@ -170,24 +184,20 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     }
   };
 
-  const handleTestConnection = async () => {
-    if (!formBaseUrl || !formApiKey) {
-      setTestResult('error');
-      setTestErrorMsg('请填写 API Base URL 和 API Key');
+  const testProviderConnection = async (provider: LLMProvider) => {
+    if (!provider.apiKey || !provider.apiBaseUrl || !provider.modelName) {
+      setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'error', msg: '请完整填写 URL、Key 和模型名称' } }));
       return;
     }
-    
-    setTestingConnection(true);
-    setTestResult('none');
-    setTestErrorMsg('');
-    
+    setTestingProviderId(provider.id);
+    setProviderTestResults(prev => ({ ...prev, [provider.id]: undefined as any }));
     try {
-      const isOSeries = /^o\d+/.test(formModelName.toLowerCase());
-      const isClaude = formModelName.toLowerCase().includes('claude');
-      const isDeepSeek = formModelName.toLowerCase().includes('deepseek') || formModelName.toLowerCase().includes('reasoner') || formModelName.toLowerCase().includes('thinking');
+      const isOSeries = /^o\d+/.test(provider.modelName.toLowerCase());
+      const isClaude = provider.modelName.toLowerCase().includes('claude');
+      const isDeepSeek = provider.modelName.toLowerCase().includes('deepseek') || provider.modelName.toLowerCase().includes('reasoner') || provider.modelName.toLowerCase().includes('thinking');
 
       const payload: any = {
-        model: formModelName,
+        model: provider.modelName,
         messages: [{ role: 'user', content: 'Say "OK" if you receive this.' }]
       };
       
@@ -203,7 +213,6 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         } else if (isClaude) {
           payload.thinking = { type: "disabled" };
         } else if (isDeepSeek) {
-          // Attempt proxy-compatible instructions, safely ignore if not supported by all proxies.
           payload.reasoning_effort = "low";
         }
       } else {
@@ -214,14 +223,14 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         }
       }
 
-      const normalizedUrl = formBaseUrl.trim().endsWith('/') ? formBaseUrl.trim().slice(0, -1) : formBaseUrl.trim();
-      logger.info('Testing API connection...', { baseUrl: normalizedUrl, payload });
+      const normalizedUrl = provider.apiBaseUrl.trim().endsWith('/') ? provider.apiBaseUrl.trim().slice(0, -1) : provider.apiBaseUrl.trim();
+      logger.info('Testing provider API connection...', { baseUrl: normalizedUrl, model: provider.modelName });
 
       const response = await fetch(`${normalizedUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${formApiKey}`
+          'Authorization': `Bearer ${provider.apiKey}`
         },
         body: JSON.stringify(payload)
       });
@@ -233,18 +242,17 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
       const data = await response.json();
       if (data.choices && data.choices.length > 0) {
-        setTestResult('success');
-        logger.info('API connection test successful', data);
+        setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'success' } }));
+        logger.info('Provider API connection test successful', data);
       } else {
         throw new Error('Invalid response format');
       }
-    } catch (err: any) {
-      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
-      setTestResult('error');
-      setTestErrorMsg(msg);
-      logger.error('API connection test failed', msg);
+    } catch (e: any) {
+      const msg = typeof e === 'string' ? e : e.message || JSON.stringify(e);
+      setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'error', msg: msg.slice(0, 100) } }));
+      logger.error('Provider API connection test failed', msg);
     } finally {
-      setTestingConnection(false);
+      setTestingProviderId(null);
     }
   };
 
@@ -320,8 +328,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   };
 
   const handleOptimizePrompt = async () => {
-    if (!formBaseUrl || !formApiKey || !formModelName) {
-      alert("请先配置并保存上方的大模型信息！");
+    const topProvider = formProviders.find(p => p.enabled) || formProviders[0];
+    if (!topProvider || !topProvider.apiBaseUrl || !topProvider.apiKey || !topProvider.modelName) {
+      alert("请先在上方配置至少一个有效的大模型服务商及 API Key！");
       return;
     }
     if (!formFocus.trim()) {
@@ -331,10 +340,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
     setOptimizingPrompt(true);
     try {
-      const normalizedUrl = formBaseUrl.trim().endsWith('/') ? formBaseUrl.trim().slice(0, -1) : formBaseUrl.trim();
-      const isOSeries = /^o\d+/.test(formModelName.toLowerCase());
-      const isClaude = formModelName.toLowerCase().includes('claude');
-      const isDeepSeek = formModelName.toLowerCase().includes('deepseek') || formModelName.toLowerCase().includes('reasoner') || formModelName.toLowerCase().includes('thinking');
+      const normalizedUrl = topProvider.apiBaseUrl.trim().endsWith('/') ? topProvider.apiBaseUrl.trim().slice(0, -1) : topProvider.apiBaseUrl.trim();
+      const isOSeries = /^o\d+/.test(topProvider.modelName.toLowerCase());
+      const isClaude = topProvider.modelName.toLowerCase().includes('claude');
+      const isDeepSeek = topProvider.modelName.toLowerCase().includes('deepseek') || topProvider.modelName.toLowerCase().includes('reasoner') || topProvider.modelName.toLowerCase().includes('thinking');
 
       const messages: any[] = [{
         role: 'system',
@@ -351,7 +360,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       }
 
       const payload: any = {
-        model: formModelName,
+        model: topProvider.modelName,
         messages
       };
 
@@ -375,7 +384,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${formApiKey}`
+          'Authorization': `Bearer ${topProvider.apiKey}`
         },
         body: JSON.stringify(payload)
       });
@@ -452,75 +461,318 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           
           {/* --- TAB: AI & Focus --- */}
           <div className={`space-y-6 animate-in fade-in slide-in-from-right-4 duration-300 ${activeTab !== 'ai' ? 'hidden' : ''}`}>
-            {/* AI Model Settings */}
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-medium text-purple-300 flex items-center gap-2">
-                  <BrainCircuit className="w-4 h-4" /> AI 大模型配置
-                </h3>
-                <button 
-                  onClick={handleTestConnection}
-                  disabled={testingConnection}
-                  className="text-xs flex items-center gap-1 bg-purple-500/20 text-purple-300 px-2 py-1 rounded hover:bg-purple-500/30 transition disabled:opacity-50"
-                >
-                  {testingConnection ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
-                  测试连接
-                </button>
+            {/* AI Failover Guide Banner */}
+            <div className="bg-gradient-to-r from-purple-500/10 via-pink-500/10 to-blue-500/10 border border-purple-500/20 rounded-xl p-4 shadow-md transition-all">
+              <div 
+                className="flex items-center justify-between cursor-pointer select-none"
+                onClick={() => setShowFailoverGuide(!showFailoverGuide)}
+              >
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-purple-400" />
+                  <h4 className="text-xs font-semibold text-purple-200 tracking-wide">
+                    多大模型智能调度与故障转移指南 (AI Failover Guide)
+                  </h4>
+                </div>
+                <div className="flex items-center gap-2 text-xs text-purple-400 hover:text-purple-300">
+                  <span>{showFailoverGuide ? '收起指南' : '了解工作原理'}</span>
+                  {showFailoverGuide ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                </div>
               </div>
-              {testResult === 'success' && (
-                <div className="flex items-center gap-1 text-xs text-green-400 bg-green-500/10 p-2 rounded border border-green-500/20">
-                  <CheckCircle2 className="w-3.5 h-3.5" /> 连接成功，模型响应正常！
-                </div>
-              )}
-              {testResult === 'error' && (
-                <div className="flex items-center gap-1 text-xs text-red-400 bg-red-500/10 p-2 rounded border border-red-500/20">
-                  <XCircle className="w-3.5 h-3.5 shrink-0" /> <span className="truncate">失败: {testErrorMsg}</span>
-                </div>
-              )}
-              <div className="grid gap-3">
-                <div>
-                  <label className="text-xs text-slate-400 mb-1 block">API Base URL</label>
-                  <input 
-                    type="text" value={formBaseUrl} onChange={e => setFormBaseUrl(e.target.value)}
-                    className="w-full bg-slate-900/50 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500 outline-none"
-                    placeholder="https://api.openai.com/v1"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1 block">API Key</label>
-                  <input 
-                    type="password" value={formApiKey} onChange={e => setFormApiKey(e.target.value)}
-                    className="w-full bg-slate-900/50 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500 outline-none"
-                    placeholder="sk-..."
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400 mb-1 block">Model Name (多模态)</label>
-                  <input 
-                    type="text" value={formModelName} onChange={e => setFormModelName(e.target.value)}
-                    className="w-full bg-slate-900/50 border border-white/10 rounded p-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500 outline-none"
-                    placeholder="gpt-4o"
-                  />
-                  <p className="text-[11px] text-slate-500 mt-1">
-                    💡 若需使用截图提取功能，请确保填写的模型支持视觉识别（如 gpt-4o）。
+
+              {showFailoverGuide && (
+                <div className="mt-3 pt-3 border-t border-white/10 text-xs text-slate-300 space-y-2 leading-relaxed font-sans">
+                  <p className="flex items-start gap-2">
+                    <span className="text-purple-400 font-bold shrink-0">1. 触发时机：</span>
+                    <span>当网络超时、API 速率限制 (429) 或服务端异常 (5xx) 达到单节点重试上限时，系统自动顺位降级轮换至下一可用服务商。</span>
+                  </p>
+                  <p className="flex items-start gap-2">
+                    <span className="text-pink-400 font-bold shrink-0">2. 优先级排序：</span>
+                    <span>通过列表右侧的 <ArrowUp className="w-3 h-3 inline text-slate-400" /> <ArrowDown className="w-3 h-3 inline text-slate-400" /> 按钮调整顺序。排在最上方的已启用服务商拥有第一优先级。</span>
+                  </p>
+                  <p className="flex items-start gap-2">
+                    <span className="text-blue-400 font-bold shrink-0">3. 零额外消耗：</span>
+                    <span>故障转移为本地逻辑控制，未调通的请求不会产生额外 Token 扣费或无效调用。</span>
+                  </p>
+                  <p className="flex items-start gap-2">
+                    <span className="text-emerald-400 font-bold shrink-0">4. 安全无忧：</span>
+                    <span>您的所有 API Key 均采用 Rust 强加密算法在本地持久化存储，保护核心敏感隐私。</span>
                   </p>
                 </div>
-                
-                <div className="flex items-center gap-2 mt-1">
-                  <input
-                    type="checkbox"
-                    id="enableReasoning"
-                    checked={formEnableReasoning}
-                    onChange={(e) => setFormEnableReasoning(e.target.checked)}
-                    className="w-3.5 h-3.5 rounded border-white/20 bg-black/20 text-purple-500 focus:ring-purple-500/50"
-                  />
-                  <label htmlFor="enableReasoning" className="text-xs text-slate-300 select-none cursor-pointer">
-                    允许大模型进入深度思考模式
-                  </label>
+              )}
+            </div>
+
+            {/* Multi-LLM Provider Settings */}
+            <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-medium text-purple-300 flex items-center gap-2">
+                    <BrainCircuit className="w-4 h-4" /> 多供应商模型管理
+                  </h3>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    按优先级排列多个模型，当第一顺位服务不可用时将自动平滑轮换
+                  </p>
                 </div>
-                <p className="text-[11px] text-slate-500">
-                  针对支持推理的模型（如 o1, o3-mini, claude-3.7 等），开启后推理能力更强但响应较慢。默认关闭（将向模型发送压制思考的 API 参数及禁用提示词）
-                </p>
+
+                <button
+                  onClick={() => {
+                    const newProvider: LLMProvider = {
+                      id: 'provider-' + Date.now(),
+                      name: '新模型服务商',
+                      apiBaseUrl: 'https://api.openai.com/v1',
+                      apiKey: '',
+                      modelName: 'gpt-4o',
+                      enabled: true,
+                      priority: formProviders.length + 1
+                    };
+                    setFormProviders([...formProviders, newProvider]);
+                  }}
+                  className="text-xs flex items-center gap-1.5 bg-gradient-to-r from-purple-500 to-pink-600 hover:from-purple-600 hover:to-pink-700 text-white font-medium px-3 py-1.5 rounded-lg shadow-sm transition self-start sm:self-auto"
+                >
+                  <Plus className="w-3.5 h-3.5" /> 添加服务商
+                </button>
+              </div>
+
+              {/* Provider List (Card/Table view) */}
+              <div className="space-y-3">
+                {formProviders.map((provider, index) => {
+                  const testRes = providerTestResults[provider.id];
+                  return (
+                    <div 
+                      key={provider.id} 
+                      className={`p-4 rounded-xl border transition-all ${
+                        provider.enabled 
+                          ? 'bg-slate-900/70 border-white/15 shadow-md' 
+                          : 'bg-slate-950/40 border-white/5 opacity-60'
+                      }`}
+                    >
+                      <div className="flex flex-col gap-3 mb-3 pb-3 border-b border-white/5">
+                        {/* Row 1: Name, Badge, Enable Switch, Delete */}
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2.5 flex-1 min-w-0">
+                            <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold font-mono shrink-0 ${
+                              index === 0 && provider.enabled
+                                ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
+                                : 'bg-white/5 text-slate-400'
+                            }`}>
+                              #{index + 1}
+                            </span>
+                            
+                            <input
+                              type="text"
+                              value={provider.name}
+                              onChange={(e) => {
+                                const updated = [...formProviders];
+                                updated[index] = { ...provider, name: e.target.value };
+                                setFormProviders(updated);
+                              }}
+                              className="bg-transparent border border-transparent hover:border-white/10 focus:border-purple-500 rounded px-2 py-1 text-sm font-semibold text-white focus:bg-slate-800 outline-none flex-1 max-w-[200px] min-w-[120px] transition truncate"
+                              placeholder="服务商名称 (如 OpenAI)"
+                            />
+
+                            {index === 0 && provider.enabled && (
+                              <span className="text-[10px] bg-purple-500/20 text-purple-300 px-2 py-0.5 rounded-full border border-purple-500/30 shrink-0 font-medium">
+                                首选主力
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <label className="flex items-center cursor-pointer select-none bg-black/40 px-2.5 py-1 rounded-md border border-white/5">
+                              <input
+                                type="checkbox"
+                                checked={provider.enabled}
+                                onChange={(e) => {
+                                  const updated = [...formProviders];
+                                  updated[index] = { ...provider, enabled: e.target.checked };
+                                  setFormProviders(updated);
+                                }}
+                                className="rounded border-slate-600 bg-slate-800 text-purple-500 focus:ring-0 w-3.5 h-3.5 mr-1.5"
+                              />
+                              <span className="text-xs text-slate-300">{provider.enabled ? '启用' : '停用'}</span>
+                            </label>
+
+                            <button
+                              onClick={() => {
+                                if (formProviders.length <= 1) {
+                                  alert("至少需要保留一个大模型服务商");
+                                  return;
+                                }
+                                const updated = formProviders.filter((_, i) => i !== index);
+                                setFormProviders(updated.map((p, i) => ({ ...p, priority: i + 1 })));
+                              }}
+                              className="p-1.5 hover:bg-red-500/20 text-slate-400 hover:text-red-400 rounded-md transition"
+                              title="删除此服务商"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Row 2: Test API & Priority Move Controls */}
+                        <div className="flex items-center justify-between gap-2 pt-1">
+                          <button
+                            onClick={() => testProviderConnection(provider)}
+                            disabled={testingProviderId === provider.id || !provider.enabled}
+                            className="text-xs bg-white/5 hover:bg-white/10 text-slate-300 px-3 py-1.5 rounded-md transition flex items-center gap-1.5 disabled:opacity-40 font-medium border border-white/5"
+                            title="测试此服务商 API 连通性"
+                          >
+                            {testingProviderId === provider.id ? <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-400" /> : <Sparkles className="w-3.5 h-3.5 text-purple-400" />}
+                            测试连通性
+                          </button>
+
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs text-slate-500 mr-1 hidden sm:inline">优先级调换:</span>
+                            <div className="flex items-center bg-black/40 rounded-md p-0.5 border border-white/5">
+                              <button
+                                onClick={() => {
+                                  if (index <= 0) return;
+                                  const updated = [...formProviders];
+                                  const tmp = updated[index - 1];
+                                  updated[index - 1] = updated[index];
+                                  updated[index] = tmp;
+                                  setFormProviders(updated.map((p, i) => ({ ...p, priority: i + 1 })));
+                                }}
+                                disabled={index <= 0}
+                                className="px-2 py-1 hover:bg-white/10 text-slate-400 hover:text-white rounded disabled:opacity-20 transition flex items-center gap-1 text-xs"
+                                title="上移优先级"
+                              >
+                                <ArrowUp className="w-3.5 h-3.5" /> 上移
+                              </button>
+                              <div className="w-[1px] h-3 bg-white/10 mx-0.5" />
+                              <button
+                                onClick={() => {
+                                  if (index >= formProviders.length - 1) return;
+                                  const updated = [...formProviders];
+                                  const tmp = updated[index + 1];
+                                  updated[index + 1] = updated[index];
+                                  updated[index] = tmp;
+                                  setFormProviders(updated.map((p, i) => ({ ...p, priority: i + 1 })));
+                                }}
+                                disabled={index >= formProviders.length - 1}
+                                className="px-2 py-1 hover:bg-white/10 text-slate-400 hover:text-white rounded disabled:opacity-20 transition flex items-center gap-1 text-xs"
+                                title="下移优先级"
+                              >
+                                下移 <ArrowDown className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Test Result Message */}
+                      {testRes && (
+                        <div className={`mb-3 p-2 rounded text-xs flex items-center gap-1.5 ${
+                          testRes.status === 'success' 
+                            ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20' 
+                            : 'bg-red-500/10 text-red-300 border border-red-500/20'
+                        }`}>
+                          {testRes.status === 'success' ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-400" /> : <XCircle className="w-3.5 h-3.5 shrink-0 text-red-400" />}
+                          <span className="truncate">{testRes.status === 'success' ? '测试成功，API 响应正常！' : `连接失败: ${testRes.msg}`}</span>
+                        </div>
+                      )}
+
+                      {/* Provider Inputs Grid */}
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                          <label className="text-xs text-slate-400 mb-1 block font-mono">API Base URL</label>
+                          <input
+                            type="text"
+                            value={provider.apiBaseUrl}
+                            onChange={(e) => {
+                              const updated = [...formProviders];
+                              updated[index] = { ...provider, apiBaseUrl: e.target.value };
+                              setFormProviders(updated);
+                            }}
+                            className="w-full bg-black/40 border border-white/10 rounded-lg p-2 text-xs text-slate-200 focus:ring-1 focus:ring-purple-500 outline-none font-mono"
+                            placeholder="https://api.openai.com/v1"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="text-xs text-slate-400 mb-1 block font-mono flex items-center justify-between">
+                            <span>API Key</span>
+                            <span className="text-[10px] text-emerald-400/80 flex items-center gap-0.5"><Lock className="w-2.5 h-2.5" /> 加密存储</span>
+                          </label>
+                          <input
+                            type="password"
+                            value={provider.apiKey}
+                            onChange={(e) => {
+                              const updated = [...formProviders];
+                              updated[index] = { ...provider, apiKey: e.target.value };
+                              setFormProviders(updated);
+                            }}
+                            className="w-full bg-black/40 border border-white/10 rounded-lg p-2 text-xs text-slate-200 focus:ring-1 focus:ring-purple-500 outline-none font-mono"
+                            placeholder="sk-..."
+                          />
+                        </div>
+
+                        <div>
+                          <label className="text-xs text-slate-400 mb-1 block font-mono">Model Name (如 gpt-4o)</label>
+                          <input
+                            type="text"
+                            value={provider.modelName}
+                            onChange={(e) => {
+                              const updated = [...formProviders];
+                              updated[index] = { ...provider, modelName: e.target.value };
+                              setFormProviders(updated);
+                            }}
+                            className="w-full bg-black/40 border border-white/10 rounded-lg p-2 text-xs text-slate-200 focus:ring-1 focus:ring-purple-500 outline-none font-mono"
+                            placeholder="gpt-4o / claude-3-7-sonnet / deepseek-chat"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Global Reasoning & Failover Controls */}
+              <div className="bg-slate-900/40 p-4 rounded-xl border border-white/10 space-y-3 mt-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="enableFailover"
+                      checked={formEnableFailover}
+                      onChange={(e) => setFormEnableFailover(e.target.checked)}
+                      className="w-4 h-4 rounded border-white/20 bg-black/20 text-purple-500 focus:ring-purple-500/50 cursor-pointer"
+                    />
+                    <label htmlFor="enableFailover" className="text-xs font-medium text-slate-200 select-none cursor-pointer flex items-center gap-1.5">
+                      <RotateCcw className="w-3.5 h-3.5 text-pink-400" /> 开启异常自动轮换 (Failover Rotation)
+                    </label>
+                  </div>
+
+                  <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <span>单节点失败最大重试次数：</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="5"
+                      value={formRetryCount}
+                      onChange={(e) => setFormRetryCount(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
+                      className="w-16 bg-black/40 border border-white/10 rounded px-2 py-1 text-xs text-center text-white font-mono focus:ring-1 focus:ring-purple-500 outline-none"
+                    />
+                    <span>次</span>
+                  </div>
+                </div>
+
+                <div className="border-t border-white/5 pt-3 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="enableReasoning"
+                      checked={formEnableReasoning}
+                      onChange={(e) => setFormEnableReasoning(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded border-white/20 bg-black/20 text-purple-500 focus:ring-purple-500/50 cursor-pointer"
+                    />
+                    <label htmlFor="enableReasoning" className="text-xs text-slate-300 select-none cursor-pointer">
+                      允许大模型进入深度思考与推理模式
+                    </label>
+                  </div>
+                  <span className="text-[11px] text-slate-500">
+                    (仅支持 o1, o3-mini, claude-3.7 等具有推理能力的模型)
+                  </span>
+                </div>
               </div>
             </div>
 

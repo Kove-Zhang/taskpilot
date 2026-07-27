@@ -1,4 +1,4 @@
-import { useSettingsStore } from '../store'
+import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from '../store'
 import { fetch } from '@tauri-apps/plugin-http';
 import { logger } from './logger';
 
@@ -32,12 +32,126 @@ function compressTextForAI(text: string, maxLength: number = 8000): string {
   return optimized;
 }
 
-export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
-  const { apiBaseUrl, apiKey, modelName, personalFocus, notionProperties, fieldMappings, tokenLimit, enableReasoning } = useSettingsStore.getState();
+/**
+ * 带多供应商轮换与重试机制的 AI 调用核心引擎
+ */
+async function callAIWithFailover(
+  buildPayload: (provider: LLMProvider) => any,
+  logContextName: string
+): Promise<string> {
+  const { enableFailover, failoverRetryCount, apiBaseUrl, apiKey, modelName } = useSettingsStore.getState();
+  let providers = getSortedLLMProviders().filter(p => p.enabled);
 
-  if (!apiKey) {
-    throw new Error("请先在设置中配置 API Key");
+  // 若提供商列表为空或均无可用的 API Key，尝试回退到传统的单节点设置
+  if (providers.length === 0 || providers.every(p => !p.apiKey || !p.apiKey.trim())) {
+    if (!apiKey || !apiKey.trim()) {
+      throw new Error("请先在设置中配置 API Key");
+    }
+    providers = [{
+      id: 'legacy',
+      name: '默认服务商',
+      apiBaseUrl,
+      apiKey,
+      modelName,
+      enabled: true,
+      priority: 1
+    }];
   }
+
+  const maxRetriesPerProvider = Math.max(1, failoverRetryCount || 1);
+  let lastError: Error | null = null;
+
+  for (let pIndex = 0; pIndex < providers.length; pIndex++) {
+    const provider = providers[pIndex];
+    if (!provider.apiKey) {
+      logger.warn(`服务商 [${provider.name}] 未配置 API Key，跳过。`);
+      continue;
+    }
+
+    const payload = buildPayload(provider);
+    const normalizedUrl = provider.apiBaseUrl.endsWith('/') ? provider.apiBaseUrl.slice(0, -1) : provider.apiBaseUrl;
+    const endpoint = `${normalizedUrl}/chat/completions`;
+
+    // 对当前服务商进行最大 maxRetriesPerProvider 次尝试
+    for (let attempt = 1; attempt <= maxRetriesPerProvider; attempt++) {
+      try {
+        const logPayload = { ...payload };
+        if (logPayload.messages) {
+          logPayload.messages = logPayload.messages.map((m: any) => {
+            if (m.role === 'user' && Array.isArray(m.content)) {
+              return {
+                role: m.role,
+                content: m.content.map((c: any) => ({
+                  type: c.type,
+                  text: c.type === 'text' ? `[Text length: ${c.text?.length}]` : undefined,
+                  image_url: c.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined
+                }))
+              };
+            }
+            return m;
+          });
+        }
+
+        logger.info(`[${logContextName}] 发起调用 -> 服务商: [${provider.name}] (模型: ${provider.modelName}, 尝试 ${attempt}/${maxRetriesPerProvider})`, { payload: logPayload });
+        
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${provider.apiKey}`
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          const status = response.status;
+          // 判断是否为限流或服务端异常（429, 500+），或者是未达到单个供应商最大重试次数
+          const isRateLimitOrServerErr = status === 429 || status >= 500;
+          const errMsg = `API 请求失败 [${provider.name}] (${status}): ${errText}`;
+          if (isRateLimitOrServerErr || attempt < maxRetriesPerProvider) {
+            logger.warn(errMsg);
+            lastError = new Error(errMsg);
+            if (attempt < maxRetriesPerProvider) {
+              await new Promise(r => setTimeout(r, 1000 * attempt)); // 指数退避重试
+              continue; // 继续重试当前供应商
+            }
+          } else {
+            lastError = new Error(errMsg);
+            break; // 中断当前供应商重试，转入下一个供应商
+          }
+        } else {
+          const data = await response.json();
+          logger.info(`[${logContextName}] 成功收到回复 <- 服务商: [${provider.name}]`, { response: data });
+          if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+            throw new Error(`服务商 [${provider.name}] 返回数据结构异常: ${JSON.stringify(data)}`);
+          }
+          return data.choices[0].message.content;
+        }
+      } catch (err: any) {
+        logger.warn(`[${logContextName}] 呼叫异常 -> 服务商: [${provider.name}] (尝试 ${attempt}/${maxRetriesPerProvider}): ${err.message || err}`);
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt < maxRetriesPerProvider) {
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+      }
+    }
+
+    // 若当前供应商所有重试均失败，检查是否允许轮换
+    if (!enableFailover) {
+      logger.warn(`未开启异常自动轮换，终止调用。`);
+      break;
+    }
+    if (pIndex < providers.length - 1) {
+      logger.info(`触发大模型自动故障转移，顺位轮换至下一服务商: [${providers[pIndex + 1].name}]...`);
+    }
+  }
+
+  throw lastError || new Error("所有大模型服务商均调用失败，请检查网络或 API 配置。");
+}
+
+export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
+  const { personalFocus, notionProperties, fieldMappings, tokenLimit, enableReasoning } = useSettingsStore.getState();
 
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
   
@@ -121,70 +235,38 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
     });
   }
 
-  const payload: any = {
-    model: modelName || "gpt-4o",
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: contentArray }
-    ]
-  };
+  const rawContent = await callAIWithFailover((provider) => {
+    const model = provider.modelName || "gpt-4o";
+    const payload: any = {
+      model: model,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: contentArray }
+      ]
+    };
 
-  const isOSeries = /^o\d+/.test((modelName || "").toLowerCase());
-  const isClaude = (modelName || "").toLowerCase().includes('claude');
-  const isDeepSeek = (modelName || "").toLowerCase().includes('deepseek') || (modelName || "").toLowerCase().includes('reasoner') || (modelName || "").toLowerCase().includes('thinking');
+    const isOSeries = /^o\d+/.test(model.toLowerCase());
+    const isClaude = model.toLowerCase().includes('claude');
+    const isDeepSeek = model.toLowerCase().includes('deepseek') || model.toLowerCase().includes('reasoner') || model.toLowerCase().includes('thinking');
 
-  if (!enableReasoning) {
-    if (isOSeries) {
-      payload.reasoning_effort = "low";
-    } else if (isClaude) {
-      payload.thinking = { type: "disabled" };
-    } else if (isDeepSeek) {
-      payload.reasoning_effort = "low";
+    if (!enableReasoning) {
+      if (isOSeries) {
+        payload.reasoning_effort = "low";
+      } else if (isClaude) {
+        payload.thinking = { type: "disabled" };
+      } else if (isDeepSeek) {
+        payload.reasoning_effort = "low";
+      }
+    } else {
+      if (isOSeries) {
+        payload.reasoning_effort = "high";
+      } else if (isClaude) {
+        payload.thinking = { type: "enabled", budget_tokens: 4096 };
+      }
     }
-  } else {
-    if (isOSeries) {
-      payload.reasoning_effort = "high";
-    } else if (isClaude) {
-      payload.thinking = { type: "enabled", budget_tokens: 4096 };
-    }
-  }
-
-  const logPayload = { ...payload };
-  logPayload.messages = payload.messages.map((m: any) => {
-    if (m.role === 'user' && Array.isArray(m.content)) {
-      return {
-        role: m.role,
-        content: m.content.map((c: any) => ({
-          type: c.type,
-          text: c.type === 'text' ? `[Text length: ${c.text?.length}]` : undefined,
-          image_url: c.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined
-        }))
-      };
-    }
-    return m;
-  });
-
-  logger.info('Sending extraction prompt to AI', { payload: logPayload });
-
-  const normalizedUrl = apiBaseUrl.endsWith('/') ? apiBaseUrl.slice(0, -1) : apiBaseUrl;
-  const response = await fetch(`${normalizedUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`API 请求失败 (${response.status}): ${err}`);
-  }
-
-  const data = await response.json();
-  logger.info('Received extraction response from AI', { response: data });
-  const rawContent = data.choices[0].message.content;
+    return payload;
+  }, "提取待办");
   
   try {
     const parsed = JSON.parse(rawContent) as AIResult;
@@ -210,11 +292,7 @@ export async function generateWriting(
   originalText?: string,
   originalImages?: string[]
 ): Promise<string> {
-  const { apiBaseUrl, apiKey, modelName, enableReasoning } = useSettingsStore.getState();
-
-  if (!apiKey) {
-    throw new Error("请先在设置中配置 API Key");
-  }
+  const { enableReasoning } = useSettingsStore.getState();
 
   const systemPrompt = `你是一个高级AI撰写助手。你的任务是根据用户提供的【待办事项上下文】和【撰写意图】，生成结构清晰、语气恰当的长文本（如邮件、报告等）。
 请直接输出生成的文本内容，不要输出任何多余的解释说明。`;
@@ -250,67 +328,37 @@ export async function generateWriting(
     });
   }
 
-  const payload: any = {
-    model: modelName || "gpt-4o",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: contentArray }
-    ]
-  };
+  const rawContent = await callAIWithFailover((provider) => {
+    const model = provider.modelName || "gpt-4o";
+    const payload: any = {
+      model: model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: contentArray }
+      ]
+    };
 
-  const isOSeries = /^o\d+/.test((modelName || "").toLowerCase());
-  const isClaude = (modelName || "").toLowerCase().includes('claude');
-  const isDeepSeek = (modelName || "").toLowerCase().includes('deepseek') || (modelName || "").toLowerCase().includes('reasoner') || (modelName || "").toLowerCase().includes('thinking');
+    const isOSeries = /^o\d+/.test(model.toLowerCase());
+    const isClaude = model.toLowerCase().includes('claude');
+    const isDeepSeek = model.toLowerCase().includes('deepseek') || model.toLowerCase().includes('reasoner') || model.toLowerCase().includes('thinking');
 
-  if (!enableReasoning) {
-    if (isOSeries) {
-      payload.reasoning_effort = "low";
-    } else if (isClaude) {
-      payload.thinking = { type: "disabled" };
-    } else if (isDeepSeek) {
-      payload.reasoning_effort = "low";
+    if (!enableReasoning) {
+      if (isOSeries) {
+        payload.reasoning_effort = "low";
+      } else if (isClaude) {
+        payload.thinking = { type: "disabled" };
+      } else if (isDeepSeek) {
+        payload.reasoning_effort = "low";
+      }
+    } else {
+      if (isOSeries) {
+        payload.reasoning_effort = "high";
+      } else if (isClaude) {
+        payload.thinking = { type: "enabled", budget_tokens: 4096 };
+      }
     }
-  } else {
-    if (isOSeries) {
-      payload.reasoning_effort = "high";
-    } else if (isClaude) {
-      payload.thinking = { type: "enabled", budget_tokens: 4096 };
-    }
-  }
+    return payload;
+  }, "内容撰写");
 
-  const logPayload = { ...payload };
-  logPayload.messages = payload.messages.map((m: any) => {
-    if (m.role === 'user' && Array.isArray(m.content)) {
-      return {
-        role: m.role,
-        content: m.content.map((c: any) => ({
-          type: c.type,
-          text: c.type === 'text' ? `[Text length: ${c.text?.length}]` : undefined,
-          image_url: c.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined
-        }))
-      };
-    }
-    return m;
-  });
-
-  logger.info('Sending writing prompt to AI', { payload: logPayload });
-
-  const normalizedUrl = apiBaseUrl.endsWith('/') ? apiBaseUrl.slice(0, -1) : apiBaseUrl;
-  const response = await fetch(`${normalizedUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`API 请求失败 (${response.status}): ${err}`);
-  }
-
-  const data = await response.json();
-  logger.info('Received writing response from AI', { response: data });
-  return data.choices[0].message.content;
+  return rawContent;
 }

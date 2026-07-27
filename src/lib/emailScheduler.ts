@@ -23,6 +23,7 @@ export interface EmailHistoryItem {
     rawBodyText?: string;
     htmlBody?: string;
     inlineImages?: string[];
+    reviewed?: boolean;
 }
 
 const historyStore = new LazyStore('email_history.enc');
@@ -228,6 +229,7 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
         return;
     }
 
+    scannerStore.resetScanControl();
     scannerStore.setRunning(true);
     lastRunTimestamp = Date.now();
     logger.info("Starting email scanner batch...");
@@ -239,6 +241,18 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
         const folders = emailConfig.targetFolder ? emailConfig.targetFolder.split(',').map(f => f.trim()).filter(Boolean) : ['INBOX'];
         
         for (const folder of folders) {
+            if (useScannerStore.getState().stopRequested) {
+                logger.info("用户停止扫描，终止本次运行。");
+                break;
+            }
+            while (useScannerStore.getState().paused && !useScannerStore.getState().stopRequested) {
+                await new Promise(r => setTimeout(r, 500));
+            }
+            if (useScannerStore.getState().stopRequested) {
+                logger.info("用户停止扫描，终止本次运行。");
+                break;
+            }
+
             logger.info(`Fetching emails from folder: ${folder}`);
             try {
                 scannerStore.setProgressMsg(`拉取目录 ${decodeIMAPFolder(folder)}...`);
@@ -258,8 +272,21 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
 
                 let processedCount = 0;
                 for (const email of emails) {
+                    if (useScannerStore.getState().stopRequested) {
+                        logger.info("用户停止扫描，终止本次运行。");
+                        break;
+                    }
+                    while (useScannerStore.getState().paused && !useScannerStore.getState().stopRequested) {
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+                    if (useScannerStore.getState().stopRequested) {
+                        logger.info("用户停止扫描，终止本次运行。");
+                        break;
+                    }
+
                     processedCount++;
-                    scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length})...`);
+                    const shortSub = email.subject ? (email.subject.length > 18 ? email.subject.slice(0, 18) + '...' : email.subject) : '无主题';
+                    scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${shortSub}`);
                     const result = await processSingleEmail(email, batchId, folder, processedUids);
                     if (!processedUids.includes(`${folder}_${email.uid}`)) {
                         // If it wasn't added inside processSingleEmail, it means it skipped or failed
@@ -294,7 +321,12 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
     } finally {
         const store = useScannerStore.getState();
         store.setRunning(false);
-        store.setProgressMsg('');
+        store.setPaused(false);
+        if (store.stopRequested) {
+            store.setProgressMsg('主动停止扫描');
+        } else {
+            store.setProgressMsg('扫描任务完成');
+        }
     }
 }
 
