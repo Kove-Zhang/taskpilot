@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "Task Pilot",
-        "width": 800,
-        "height": 600,
+        "width": 1024,
+        "height": 768,
         "resizable": false,
         "fullscreen": false,
         "transparent": true,

@@ -350,7 +350,7 @@ export default function App() {
         onClick={async () => await getCurrentWindow().hide()}
       >
         <div 
-          className={`glass-panel w-full max-w-2xl mx-auto p-6 flex flex-col gap-4 shadow-2xl transition-all duration-300 ${isDragging ? 'border-purple-500 bg-purple-500/10' : ''}`}
+          className={`glass-panel w-full max-w-3xl mx-auto p-6 flex flex-col gap-4 shadow-2xl transition-all duration-300 ${isDragging ? 'border-purple-500 bg-purple-500/10' : ''}`}
           onClick={(e) => e.stopPropagation()}
         >
         

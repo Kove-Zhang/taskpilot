@@ -411,7 +411,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="glass-panel w-full max-w-lg p-6 flex flex-col gap-6 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200">
+      <div className="glass-panel w-full max-w-[820px] p-6 flex flex-col gap-6 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200">
         
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-3">
@@ -457,7 +457,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </div>
 
         {/* Content */}
-        <div className="flex flex-col gap-5 overflow-y-auto min-h-[50vh] max-h-[60vh] pr-2 custom-scrollbar relative">
+        <div className="flex flex-col gap-5 overflow-y-auto min-h-[55vh] max-h-[72vh] pr-2 custom-scrollbar relative">
           
           {/* --- TAB: AI & Focus --- */}
           <div className={`space-y-6 animate-in fade-in slide-in-from-right-4 duration-300 ${activeTab !== 'ai' ? 'hidden' : ''}`}>

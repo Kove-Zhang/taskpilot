@@ -97,7 +97,7 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
 
   return (
     <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="glass-panel w-[95%] max-w-[760px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh]">
+      <div className="glass-panel w-[95%] max-w-[900px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh]">
         
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">

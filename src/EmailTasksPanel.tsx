@@ -349,7 +349,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     const currentReviewItem = reviewList[reviewIndex];
     return (
       <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-in fade-in duration-200">
-        <div className="glass-panel w-[95%] max-w-[860px] h-[90vh] flex flex-col shadow-2xl border border-pink-500/30 rounded-xl overflow-hidden">
+        <div className="glass-panel w-[95%] max-w-[960px] h-[90vh] flex flex-col shadow-2xl border border-pink-500/30 rounded-xl overflow-hidden">
           
           {/* Top Header of Review Mode */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between p-4 bg-slate-900/80 border-b border-white/10 gap-3 shrink-0">
@@ -976,7 +976,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     if (!entry) return null;
     return (
       <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-        <div className="glass-panel w-[95%] max-w-[760px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 h-[85vh]">
+        <div className="glass-panel w-[95%] max-w-[920px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 h-[85vh]">
           {/* Header */}
           <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
             <h2 className="text-xl font-semibold text-white flex items-center gap-2">
@@ -995,7 +995,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <span className="truncate max-w-[320px]" title={entry.subject}>处理待办 - {entry.subject || '(无主题)'}</span>
+              <span className="truncate max-w-[480px]" title={entry.subject}>处理待办 - {entry.subject || '(无主题)'}</span>
             </h2>
             <div className="flex items-center gap-2">
               <button
@@ -1027,7 +1027,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
 
   return (
     <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="glass-panel w-[95%] max-w-[760px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh]">
+      <div className="glass-panel w-[95%] max-w-[940px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh]">
         
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
