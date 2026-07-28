@@ -142,6 +142,7 @@ interface SettingsState {
   llmProviders?: LLMProvider[];
   enableFailover: boolean;
   failoverRetryCount: number;
+  isWindowMode: boolean;
   setLLMProviders: (providers: LLMProvider[]) => void;
   setFailoverConfig: (enable: boolean, retryCount: number) => void;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
@@ -154,6 +155,7 @@ interface SettingsState {
   setTokenLimit: (limit: number) => void;
   setEnableReasoning: (enable: boolean) => void;
   setEmailConfig: (config: Partial<EmailConfig>) => void;
+  setWindowMode: (enable: boolean) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -189,6 +191,7 @@ export const useSettingsStore = create<SettingsState>()(
       },
       enableFailover: true,
       failoverRetryCount: 1,
+      isWindowMode: false,
       setApiSettings: (apiBaseUrl, apiKey, modelName) => set((state) => {
         const providers = state.llmProviders && state.llmProviders.length > 0
           ? state.llmProviders.map((p, idx) => idx === 0 ? { ...p, apiBaseUrl, apiKey, modelName } : p)
@@ -220,6 +223,7 @@ export const useSettingsStore = create<SettingsState>()(
       setEmailConfig: (config: Partial<EmailConfig>) => set((state) => ({ 
         emailConfig: { ...state.emailConfig, ...config } 
       })),
+      setWindowMode: (isWindowMode) => set({ isWindowMode }),
     }),
     {
       name: 'task-pilot-settings',

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import type { ClipboardEvent, ChangeEvent, DragEvent } from 'react'
-import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail } from 'lucide-react'
+import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail, Minus, Maximize2 } from 'lucide-react'
 import SettingsPanel from './SettingsPanel'
 import HistoryPanel from './HistoryPanel'
 import EmailTasksPanel from './EmailTasksPanel'
@@ -28,7 +28,7 @@ export default function App() {
   const [syncing, setSyncing] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   
-  const { notionProperties, fieldMappings } = useSettingsStore()
+  const { notionProperties, fieldMappings, isWindowMode } = useSettingsStore()
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled).sort((a, b) => {
     const orderA = fieldMappings[a.id]?.order ?? 999;
     const orderB = fieldMappings[b.id]?.order ?? 999;
@@ -49,28 +49,27 @@ export default function App() {
   const isScreenshotting = useRef(false)
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let unlisten: () => void;
     startEmailScheduler();
-      const setup = async () => {
-      // Sync shortcut on mount
+    
+    getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (!focused && !isDragging && !isWindowMode && !isFileDialogOpen.current && !isScreenshotting.current) {
+        getCurrentWindow().hide();
+      }
+    }).then(fn => unlisten = fn);
+
+    const setup = async () => {
       const globalShortcut = useSettingsStore.getState().globalShortcut;
       invoke('update_shortcut', { shortcut: globalShortcut }).catch(e => {
           logger.error('Failed to sync initial global shortcut', e);
-      });
-
-      unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-        // If window loses focus and we are not opening a file dialog or taking a screenshot, hide it
-        if (!focused && !isFileDialogOpen.current && !isScreenshotting.current) {
-          getCurrentWindow().hide();
-        }
       });
     };
     setup();
     return () => {
       if (unlisten) unlisten();
-        stopEmailScheduler();
+      stopEmailScheduler();
     }
-  }, []);
+  }, [isDragging, isWindowMode]);
 
   const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData.items;
@@ -144,7 +143,6 @@ export default function App() {
       isScreenshotting.current = true;
       await win.hide();
       await invoke("trigger_screenshot");
-      // Wait a moment before restoring the window, or just let user press Alt+Space
       setTimeout(() => {
         win.show();
         isScreenshotting.current = false;
@@ -215,7 +213,6 @@ export default function App() {
       const succeeded = syncResults.filter(r => r.success);
 
       if (failed.length > 0) {
-        // Collect errors
         const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\n');
         setError(`部分同步失败 (${failed.length}/${selectedTodos.length}):\n${errorMsgs}`);
         logger.warn('Partial Notion sync failure', { failedCount: failed.length, errors: failed.map(f => f.error) });
@@ -225,17 +222,16 @@ export default function App() {
         if (!prev) return prev;
         return {
           ...prev,
-          syncedToNotion: failed.length === 0, // only true if all succeeded
+          syncedToNotion: failed.length === 0,
           todos: prev.todos.map(t => {
             if (succeeded.find(s => s.id === t.id)) {
-              return { ...t, synced: true }; // Custom flag for UI if we want
+              return { ...t, synced: true };
             }
             return t;
           })
         };
       });
       
-      // Update history to persist individual sync statuses even on partial failure
       const dataJson = await invoke<string>("load_history").catch(() => "[]");
       let history = JSON.parse(dataJson || "[]");
       history = history.map((h: any) => h.result?.id === result.id ? { 
@@ -349,20 +345,39 @@ export default function App() {
       onDrop={handleDrop}
     >
       <div 
-        className="min-h-full p-4 flex flex-col items-center justify-center"
-        onClick={async () => await getCurrentWindow().hide()}
+        className="min-h-[100vh] w-full overflow-y-auto custom-scrollbar flex flex-col items-center justify-center p-4 sm:p-8"
+        onClick={async () => { if (!isWindowMode) await getCurrentWindow().hide() }}
       >
+        {isWindowMode && (
+          <>
+            <div data-tauri-drag-region className="fixed top-0 left-0 right-0 h-10 cursor-move z-40" />
+            <div className="fixed top-3 right-3 flex items-center z-50 overflow-hidden rounded-md backdrop-blur-md bg-white/5 border border-white/10 shadow-lg">
+              <button onClick={() => getCurrentWindow().minimize()} className="p-2 text-slate-400 hover:text-white hover:bg-white/10 transition-colors" title="最小化">
+                <Minus className="w-4 h-4" />
+              </button>
+              <div className="w-px h-4 bg-white/10"></div>
+              <button onClick={() => getCurrentWindow().toggleMaximize()} className="p-2 text-slate-400 hover:text-white hover:bg-white/10 transition-colors" title="全屏">
+                <Maximize2 className="w-4 h-4" />
+              </button>
+              <div className="w-px h-4 bg-white/10"></div>
+              <button onClick={() => getCurrentWindow().hide()} className="p-2 text-slate-400 hover:text-red-400 hover:bg-red-500/20 transition-colors" title="隐藏">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </>
+        )}
         <div 
-          className={`glass-panel w-full max-w-3xl mx-auto p-6 flex flex-col gap-4 shadow-2xl transition-all duration-300 ${isDragging ? 'border-purple-500 bg-purple-500/10' : ''}`}
+          className={`glass-panel w-full mx-auto flex flex-col shadow-2xl transition-all duration-300 ${isWindowMode ? 'max-w-5xl p-8 gap-6 rounded-2xl' : 'max-w-3xl p-6 gap-4 rounded-xl'} ${isDragging ? 'border-purple-500 bg-purple-500/10' : ''}`}
           onClick={(e) => e.stopPropagation()}
         >
+          <div className="contents">
         
         <div className="flex items-center justify-between border-b border-white/10 pb-4">
           <div className="flex items-center gap-2">
             <Sparkles className="w-5 h-5 text-purple-400" />
             <h1 className="text-lg font-semibold text-white tracking-wide">Task Pilot</h1>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 relative z-10">
             <button 
               onClick={startNewSession}
               className="p-2 hover:bg-white/10 rounded-full transition-colors group"
@@ -400,7 +415,7 @@ export default function App() {
             onChange={(e) => setInput(e.target.value)}
             onPaste={handlePaste}
             placeholder={isDragging ? "松开鼠标以解析文件..." : "粘贴文字/图片，或拖拽文件 (Word/PDF/Excel) 到这里..."}
-            className={`w-full bg-slate-900/50 border border-white/10 rounded-lg p-4 min-h-[120px] text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none ${isDragging ? 'pointer-events-none' : ''}`}
+            className={`w-full bg-slate-900/50 border border-white/10 rounded-lg p-4 text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none ${isWindowMode ? 'min-h-[240px]' : 'min-h-[120px]'} ${isDragging ? 'pointer-events-none' : ''}`}
           />
           {images.length > 0 && (
             <div className="absolute bottom-4 left-4 flex gap-2">
@@ -617,8 +632,8 @@ export default function App() {
             )}
           </div>
         )}
-
-      </div>
+          </div>
+        </div>
       </div>
 
       {previewImage && (

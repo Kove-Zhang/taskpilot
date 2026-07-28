@@ -46,7 +46,7 @@ const getDarkModeHtml = (html: string) => {
 };
 
 export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
-  const { notionProperties, fieldMappings } = useSettingsStore();
+  const { notionProperties, fieldMappings, isWindowMode } = useSettingsStore();
   const [history, setHistory] = useState<EmailHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const { running, paused, progressMsg, scanLogs, historyVersion, setPaused, requestStop } = useScannerStore();
@@ -351,8 +351,8 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   if (inReviewMode) {
     const currentReviewItem = reviewList[reviewIndex];
     return (
-      <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-in fade-in duration-200">
-        <div className="glass-panel w-[95%] max-w-[960px] h-[90vh] flex flex-col shadow-2xl border border-pink-500/30 rounded-xl overflow-hidden">
+      <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md animate-in fade-in duration-200 p-4 sm:p-8">
+        <div className={`glass-panel flex flex-col shadow-2xl border border-pink-500/30 overflow-hidden ${isWindowMode ? 'w-full max-w-6xl h-[95vh] rounded-2xl' : 'w-[95%] max-w-[960px] h-[90vh] rounded-xl'}`}>
           
           {/* Top Header of Review Mode */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between p-4 bg-slate-900/80 border-b border-white/10 gap-3 shrink-0">
@@ -412,7 +412,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                 <p className="text-xs text-slate-600">请尝试勾选右上角的“未审核”或“已审核”查看更多内容</p>
               </div>
             ) : currentReviewItem ? (
-              <div className="flex flex-col gap-4 max-w-4xl mx-auto w-full flex-1 overflow-hidden">
+              <div className={`flex flex-col gap-4 mx-auto w-full flex-1 overflow-hidden ${isWindowMode ? 'max-w-7xl' : 'max-w-4xl'}`}>
                 {/* Email Metadata Card */}
                 <div className="bg-slate-900/60 border border-white/10 rounded-xl p-5 shadow-lg flex flex-col gap-3 shrink-0">
                   <div className="flex items-start justify-between gap-4">
@@ -978,8 +978,8 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     const entry = history[editingEntryIndex];
     if (!entry) return null;
     return (
-      <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-        <div className="glass-panel w-[95%] max-w-[920px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 h-[85vh]">
+      <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 sm:p-8">
+        <div className={`glass-panel flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 ${isWindowMode ? 'w-full max-w-5xl p-8 h-[90vh] rounded-2xl' : 'w-[95%] max-w-[920px] p-6 h-[85vh] rounded-xl'}`}>
           {/* Header */}
           <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
             <h2 className="text-xl font-semibold text-white flex items-center gap-2">
@@ -1029,8 +1029,8 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   }
 
   return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="glass-panel w-[95%] max-w-[940px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh]">
+    <div className={`absolute inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm ${isWindowMode ? 'p-0 pt-12' : 'p-4'}`}>
+      <div className={`glass-panel flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 ${isWindowMode ? 'w-full h-full max-w-none rounded-none border-0 p-8' : 'w-[95%] max-w-[940px] p-6 h-[85vh] rounded-xl'}`}>
         
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">

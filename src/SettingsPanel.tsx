@@ -4,6 +4,7 @@ import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from './sto
 import { logger } from './lib/logger'
 import { fetch } from '@tauri-apps/plugin-http'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ZenEditorModal } from './components/ZenEditorModal'
 
 
@@ -16,8 +17,8 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount,
-    setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig, setLLMProviders, setFailoverConfig
+    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount, isWindowMode,
+    setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig, setLLMProviders, setFailoverConfig, setWindowMode
   } = useSettingsStore();
 
   const [formProviders, setFormProviders] = useState<LLMProvider[]>(() => {
@@ -46,6 +47,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [formNotionDb, setFormNotionDb] = useState(notionDatabaseId);
   const [formLogging, setFormLogging] = useState(enableLogging);
   const [formGlobalShortcut, setFormGlobalShortcut] = useState(globalShortcut);
+  const [formWindowMode, setFormWindowMode] = useState(isWindowMode);
   const [formTokenLimit, setFormTokenLimit] = useState(tokenLimit);
   const [formEnableReasoning, setFormEnableReasoning] = useState(enableReasoning);
   const [formEmailConfig, setFormEmailConfig] = useState(emailConfig);
@@ -99,6 +101,18 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setEnableReasoning(formEnableReasoning);
     setEmailConfig(formEmailConfig);
     Object.entries(formFieldMappings).forEach(([k, v]) => setFieldMapping(k, v));
+    setWindowMode(formWindowMode);
+
+    const win = getCurrentWindow();
+    if (formWindowMode) {
+      win.setSkipTaskbar(false).catch(console.error);
+      win.setAlwaysOnTop(false).catch(console.error);
+      win.setResizable(true).catch(console.error);
+    } else {
+      win.setSkipTaskbar(true).catch(console.error);
+      win.setAlwaysOnTop(true).catch(console.error);
+      win.setResizable(false).catch(console.error);
+    }
     
     // 同步到后端 Rust
     import('@tauri-apps/api/core').then(m => {
@@ -412,8 +426,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   };
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="glass-panel w-full max-w-[820px] p-6 flex flex-col gap-6 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200">
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 sm:p-8">
+      <div className={`glass-panel flex flex-col gap-6 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 ${isWindowMode ? 'w-full max-w-5xl p-8 max-h-[90vh] rounded-2xl' : 'w-full max-w-[820px] p-6 max-h-[90vh] rounded-xl'}`}>
+        <div className={`flex flex-col h-full mx-auto w-full ${isWindowMode ? 'max-w-6xl' : ''}`}>
         
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-3">
@@ -459,7 +474,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </div>
 
         {/* Content */}
-        <div className="flex flex-col gap-5 overflow-y-auto min-h-[55vh] max-h-[72vh] pr-2 custom-scrollbar relative">
+        <div className={`flex flex-col gap-5 overflow-y-auto pr-2 custom-scrollbar relative ${isWindowMode ? 'h-full flex-1' : 'min-h-[55vh] max-h-[72vh]'}`}>
           
           {/* --- TAB: AI & Focus --- */}
           <div className={`space-y-6 animate-in fade-in slide-in-from-right-4 duration-300 ${activeTab !== 'ai' ? 'hidden' : ''}`}>
@@ -1308,6 +1323,24 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                     )}
                   </div>
                 </div>
+
+                <div className="flex items-center justify-between bg-slate-900/50 p-3 rounded border border-white/10 hover:border-white/20 transition-colors mt-2">
+                  <div className="flex flex-col gap-1">
+                    <label htmlFor="enableWindowMode" className="text-sm font-medium text-slate-200 cursor-pointer">
+                      启用窗口化模式 (常驻桌面)
+                    </label>
+                    <span className="text-xs text-slate-500">
+                      开启后，失去焦点时界面将不再自动隐藏，并在右上角显示窗口控制按钮。
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    id="enableWindowMode"
+                    checked={formWindowMode}
+                    onChange={(e) => setFormWindowMode(e.target.checked)}
+                    className="w-5 h-5 rounded border-white/20 bg-black/20 text-teal-500 focus:ring-teal-500/50 cursor-pointer"
+                  />
+                </div>
               </div>
             </div>
             
@@ -1403,6 +1436,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           </button>
         </div>
 
+        </div>
       </div>
 
       {/* Zen Expand Editor Modal for Personal Focus */}

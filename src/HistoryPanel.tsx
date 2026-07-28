@@ -17,7 +17,7 @@ interface HistoryPanelProps {
 }
 
 export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) {
-  const { notionProperties, fieldMappings } = useSettingsStore();
+  const { notionProperties, fieldMappings, isWindowMode } = useSettingsStore();
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [confirmingIdx, setConfirmingIdx] = useState<number | null>(null);
@@ -96,8 +96,8 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
   }
 
   return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-      <div className="glass-panel w-[95%] max-w-[900px] p-6 flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh]">
+    <div className="absolute inset-0 z-40 flex items-center justify-center p-4 sm:p-8 bg-black/40 backdrop-blur-sm">
+      <div className={`glass-panel w-full flex flex-col gap-4 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 h-[85vh] ${isWindowMode ? 'max-w-5xl p-8 rounded-2xl' : 'max-w-[900px] p-6 rounded-xl'}`}>
         
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
