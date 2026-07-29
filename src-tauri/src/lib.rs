@@ -48,12 +48,9 @@ fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, 
     if key_path.exists() {
         if let Ok(key_bytes) = fs::read(&key_path) {
             if key_bytes.len() == 32 {
-                // Migrate to keyring
-                if entry.set_password(&STANDARD.encode(&key_bytes)).is_ok() {
-                    // Securely wipe and remove legacy file only if migrated successfully
-                    let _ = fs::write(&key_path, vec![0u8; 32]);
-                    let _ = fs::remove_file(&key_path);
-                }
+                // Try to migrate to keyring, but do NOT delete the legacy file
+                // because keyring can be volatile/broken on some Windows setups.
+                let _ = entry.set_password(&STANDARD.encode(&key_bytes));
                 return Ok(key_bytes);
             }
         }
@@ -62,10 +59,11 @@ fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, 
     // Generate new key
     let key = Aes256Gcm::generate_key(OsRng);
     let key_vec = key.to_vec();
-    if entry.set_password(&STANDARD.encode(&key_vec)).is_err() {
-        // Fallback to local file if keyring fails
-        let _ = fs::write(&key_path, &key_vec);
-    }
+    
+    // Always write to local file as a reliable fallback
+    let _ = fs::write(&key_path, &key_vec);
+    let _ = entry.set_password(&STANDARD.encode(&key_vec));
+    
     Ok(key_vec)
 }
 
@@ -265,13 +263,14 @@ fn get_or_create_secret_key() -> Result<Vec<u8>, String> {
         }
     }
     
-    let key = Aes256Gcm::generate_key(OsRng);
-    let key_vec = key.to_vec();
-    if entry.set_password(&STANDARD.encode(&key_vec)).is_err() {
-        // Fallback to deterministic machine key if keyring fails
-        return Ok(get_machine_key()?.to_vec());
-    }
-    Ok(key_vec)
+    // If keyring fails to retrieve, use the deterministic machine key
+    // instead of generating a random key, because keyring might fail to persist it.
+    let machine_key = get_machine_key()?.to_vec();
+    
+    // Try to save it to keyring anyway
+    let _ = entry.set_password(&STANDARD.encode(&machine_key));
+    
+    Ok(machine_key)
 }
 
 #[tauri::command]
@@ -314,7 +313,11 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
         }
     }
     
-    Ok(cipher_text)
+    // If we reach here, it IS a valid base64 string of correct length, but we CANNOT decrypt it.
+    // It's highly likely it is a corrupted/orphaned encrypted string.
+    // Returning the raw ciphertext causes double-encryption bugs and UI confusion.
+    // We MUST return an empty string to clear the corrupted state so the user can re-enter it.
+    Ok("".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
