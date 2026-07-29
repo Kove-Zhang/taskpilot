@@ -184,7 +184,12 @@ export default function App() {
       setResult(res);
       logger.info('AI extraction success', { todosCount: res.todos.length });
       try {
-        const historyJson = await invoke<string>("load_history");
+        let historyJson = "[]";
+        try {
+          historyJson = await invoke<string>("load_history");
+        } catch (loadErr) {
+          logger.warn("Failed to load old history, starting fresh.", loadErr);
+        }
         let historyArr = JSON.parse(historyJson || "[]");
         historyArr.unshift({ 
           timestamp: new Date().toISOString(), 

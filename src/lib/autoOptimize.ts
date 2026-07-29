@@ -104,7 +104,16 @@ ${finalStr}
 }
 
 export async function analyzeHistoryAndUpdateFocus() {
-  const dataJson = await invoke<string>("load_history");
+  let dataJson;
+  try {
+    dataJson = await invoke<string>("load_history");
+  } catch (err: any) {
+    const errorStr = typeof err === 'string' ? err : (err.message || String(err));
+    if (errorStr.includes("aead::Error")) {
+      throw new Error("安全密钥变更导致历史记录解密失败。请在主界面提取并保存一条新任务以重置加密文件，随后即可重试。");
+    }
+    throw new Error(errorStr);
+  }
   const data = JSON.parse(dataJson || "[]");
   
   if (!Array.isArray(data) || data.length === 0) {

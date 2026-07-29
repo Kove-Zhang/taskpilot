@@ -963,7 +963,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                            setFormAutoFocus(newFocus);
                            showAlert("历史记录分析完毕，您的个人偏好已演进更新！");
                          } catch (e: any) {
-                           showAlert("历史记录分析失败: " + e.message);
+                           const msg = typeof e === 'string' ? e : (e.message || JSON.stringify(e));
+                           showAlert("历史记录分析失败: " + msg);
                          } finally {
                            setAnalyzingHistory(false);
                          }
