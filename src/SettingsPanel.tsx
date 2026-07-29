@@ -68,10 +68,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     setFolderError('');
     try {
       const folders = await invoke<string[]>('get_email_folders', {
-        host: formEmailConfig.host,
+        host: formEmailConfig.host.trim(),
         port: formEmailConfig.port,
-        user: formEmailConfig.user,
-        pass: formEmailConfig.pass,
+        user: formEmailConfig.user.trim(),
+        pass: formEmailConfig.pass.trim(),
         ssl: formEmailConfig.ssl
       });
       setAvailableFolders(folders);
