@@ -49,10 +49,11 @@ fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, 
         if let Ok(key_bytes) = fs::read(&key_path) {
             if key_bytes.len() == 32 {
                 // Migrate to keyring
-                let _ = entry.set_password(&STANDARD.encode(&key_bytes));
-                // Securely wipe and remove legacy file
-                let _ = fs::write(&key_path, vec![0u8; 32]);
-                let _ = fs::remove_file(&key_path);
+                if entry.set_password(&STANDARD.encode(&key_bytes)).is_ok() {
+                    // Securely wipe and remove legacy file only if migrated successfully
+                    let _ = fs::write(&key_path, vec![0u8; 32]);
+                    let _ = fs::remove_file(&key_path);
+                }
                 return Ok(key_bytes);
             }
         }
@@ -61,7 +62,10 @@ fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, 
     // Generate new key
     let key = Aes256Gcm::generate_key(OsRng);
     let key_vec = key.to_vec();
-    let _ = entry.set_password(&STANDARD.encode(&key_vec));
+    if entry.set_password(&STANDARD.encode(&key_vec)).is_err() {
+        // Fallback to local file if keyring fails
+        let _ = fs::write(&key_path, &key_vec);
+    }
     Ok(key_vec)
 }
 
@@ -263,7 +267,10 @@ fn get_or_create_secret_key() -> Result<Vec<u8>, String> {
     
     let key = Aes256Gcm::generate_key(OsRng);
     let key_vec = key.to_vec();
-    let _ = entry.set_password(&STANDARD.encode(&key_vec));
+    if entry.set_password(&STANDARD.encode(&key_vec)).is_err() {
+        // Fallback to deterministic machine key if keyring fails
+        return Ok(get_machine_key()?.to_vec());
+    }
     Ok(key_vec)
 }
 
