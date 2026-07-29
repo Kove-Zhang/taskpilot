@@ -271,6 +271,16 @@ export interface ScannerState {
   incrementHistoryVersion: () => void;
 }
 
+export interface UIState {
+  historySelectedDate: string | null;
+  setHistorySelectedDate: (date: string | null) => void;
+}
+
+export const useUIStore = create<UIState>((set) => ({
+  historySelectedDate: null,
+  setHistorySelectedDate: (date) => set({ historySelectedDate: date })
+}))
+
 export const useScannerStore = create<ScannerState>((set) => ({
   running: false,
   paused: false,

@@ -244,9 +244,9 @@ export default function App() {
       history = history.map((h: any) => h.result?.id === result.id ? { 
         ...h, 
         result: { 
-          ...h.result, 
+          ...result, 
           syncedToNotion: failed.length === 0,
-          todos: h.result.todos.map((t: any) => {
+          todos: result.todos.map((t: any) => {
             if (succeeded.find(s => s.id === t.id)) {
               return { ...t, synced: true };
             }

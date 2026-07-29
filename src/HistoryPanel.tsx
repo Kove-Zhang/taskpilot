@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { X, Clock, Trash2, ChevronDown, ChevronUp } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import type { AIResult } from './lib/ai'
-import { useSettingsStore } from './store'
+import { useSettingsStore, useUIStore } from './store'
 
 interface HistoryEntry {
   timestamp: string;
@@ -22,7 +22,12 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
   const [loading, setLoading] = useState(true);
   const [confirmingIdx, setConfirmingIdx] = useState<number | null>(null);
   const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
-  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const { historySelectedDate, setHistorySelectedDate } = useUIStore();
+  const [selectedDate, setSelectedDate] = useState<string | null>(historySelectedDate);
+
+  useEffect(() => {
+    setHistorySelectedDate(selectedDate);
+  }, [selectedDate, setHistorySelectedDate]);
 
   const { grouped, dates } = useMemo(() => {
     const indexedHistory = history.map((item, originalIndex) => ({ ...item, originalIndex }));
@@ -54,7 +59,7 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
       return;
     }
     setSelectedDate(dates[0]);
-  }, [grouped, dates, selectedDate]);
+  }, [grouped, dates]);
 
   const toggleExpand = (key: string) => {
     setExpandedTodos(prev => ({ ...prev, [key]: !prev[key] }));
@@ -185,10 +190,14 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                               const titleProp = activeFields.find(p => p.type === 'title')?.name || 'title';
                               const priorityProp = activeFields.find(p => p.name.includes('优先') || p.name === 'priority' || p.type === 'select')?.name || 'priority';
                               
+                              const isUnselected = t.selected === false;
+                              const isSynced = t.synced === true;
+                              
                               return (
-                                <div key={i} className="text-xs text-slate-400 flex items-center gap-2">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-blue-500/50 shrink-0" />
-                                  {t[priorityProp] && <span className="text-purple-400 shrink-0">[{t[priorityProp]}]</span>}
+                                <div key={i} className={`text-xs flex items-center gap-2 ${isUnselected ? 'text-slate-600 line-through opacity-60' : 'text-slate-400'}`}>
+                                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isSynced ? 'bg-green-500/80' : isUnselected ? 'bg-slate-600/50' : 'bg-blue-500/50'}`} />
+                                  {isSynced && <span className="text-green-500 shrink-0 border border-green-500/30 bg-green-500/10 px-1 rounded text-[10px]">已推</span>}
+                                  {t[priorityProp] && <span className={isUnselected ? 'text-slate-600' : 'text-purple-400 shrink-0'}>[{t[priorityProp]}]</span>}
                                   <span className="truncate">{t[titleProp] || t.title || t.Name || '未命名待办'}</span>
                                 </div>
                               )
