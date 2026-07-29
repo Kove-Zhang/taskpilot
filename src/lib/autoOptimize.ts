@@ -3,6 +3,7 @@ import type { TodoItem } from './ai';
 import { callAIWithFailover } from './ai';
 import { logger } from './logger';
 import { invoke } from '@tauri-apps/api/core';
+import { LazyStore } from '@tauri-apps/plugin-store';
 
 function buildNotionSchemaDescription(): string {
   const { notionProperties, fieldMappings } = useSettingsStore.getState();
@@ -116,16 +117,38 @@ export async function analyzeHistoryAndUpdateFocus() {
   }
   const data = JSON.parse(dataJson || "[]");
   
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error("没有历史记录可供分析。");
+  const emailHistoryStore = new LazyStore('email_history.enc');
+  const emailData: any[] = await emailHistoryStore.get('history') || [];
+
+  if ((!Array.isArray(data) || data.length === 0) && emailData.filter(r => r.syncedToNotion === true).length === 0) {
+    throw new Error("没有有效的历史记录可供分析。");
   }
 
-  // Pick top 20 or less
-  const records = data.slice(0, 20).map((r: any) => ({
+  const manualRecords = Array.isArray(data) ? data.map((r: any) => ({
+    source: "手动输入提取",
+    timestamp: new Date(r.timestamp).getTime() || 0,
     summary: r.result?.summary,
     key_points: r.result?.key_points,
     final_todos: r.result?.todos
+  })) : [];
+
+  const emailRecords = emailData.filter(r => r.syncedToNotion === true).map((r: any) => ({
+    source: "邮件自动同步",
+    timestamp: r.timestamp || 0,
+    summary: r.aiResult?.summary,
+    key_points: r.aiResult?.key_points,
+    final_todos: r.aiResult?.todos
   }));
+
+  const records = [...manualRecords, ...emailRecords]
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 30)
+    .map(r => ({
+      source: r.source,
+      summary: r.summary,
+      key_points: r.key_points,
+      final_todos: r.final_todos
+    }));
 
   let recordsJson = JSON.stringify(records, null, 2);
   if (recordsJson.length > 15000) {
