@@ -455,11 +455,11 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 sm:p-8">
-      <div className={`glass-panel flex flex-col gap-6 shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 ${isWindowMode ? 'w-full max-w-5xl p-8 max-h-[90vh] rounded-2xl' : 'w-full max-w-[820px] p-6 max-h-[90vh] rounded-xl'}`}>
-        <div className={`flex flex-col h-full mx-auto w-full ${isWindowMode ? 'max-w-6xl' : ''}`}>
+      <div className={`glass-panel flex flex-col min-h-[60vh] shadow-2xl relative animate-in fade-in zoom-in-95 duration-200 ${isWindowMode ? 'w-full max-w-5xl p-8 max-h-[90vh] rounded-2xl' : 'w-full max-w-[820px] p-6 max-h-[90vh] rounded-xl'}`}>
+        <div className={`flex flex-col flex-1 min-h-0 mx-auto w-full overflow-hidden ${isWindowMode ? 'max-w-6xl' : ''}`}>
         
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-white/10 pb-3">
+        <div className="flex-none flex items-center justify-between border-b border-white/10 pb-3 mb-2">
           <h2 className="text-xl font-semibold text-white flex items-center gap-2">
             <Settings className="w-5 h-5 text-purple-400" />
             全局设置
@@ -470,7 +470,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </div>
 
         {/* Tabs */}
-        <div className="flex items-center gap-6 border-b border-white/5">
+        <div className="flex-none flex items-center gap-6 border-b border-white/5 mb-4">
           <button
             onClick={() => setActiveTab('ai')}
             className={`pb-3 text-sm font-medium transition-colors relative ${activeTab === 'ai' ? 'text-purple-400' : 'text-slate-400 hover:text-slate-300'}`}
@@ -502,7 +502,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </div>
 
         {/* Content */}
-        <div className={`flex flex-col gap-5 overflow-y-auto pr-2 custom-scrollbar relative ${isWindowMode ? 'h-full flex-1' : 'min-h-[55vh] max-h-[72vh]'}`}>
+        <div className="flex flex-col gap-5 flex-1 min-h-0 overflow-y-auto pr-2 custom-scrollbar relative">
           
           {/* --- TAB: AI & Focus --- */}
           <div className={`space-y-6 animate-in fade-in slide-in-from-right-4 duration-300 ${activeTab !== 'ai' ? 'hidden' : ''}`}>
@@ -1558,7 +1558,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </div>
 
         {/* Footer */}
-        <div className="pt-4 mt-2 border-t border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="flex-none pt-4 mt-2 border-t border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <p className="text-[10px] text-slate-500/80 leading-relaxed max-w-md">
             🔒 <strong className="font-medium text-slate-400">隐私与数据声明</strong><br/>
             所有文件（PDF/Word/Excel 等）的解析读取 100% 在本地沙箱执行。提取和润色过程会调用您配置的 API Base URL 发送请求，请勿向不受信任的服务端发送机密信息。
