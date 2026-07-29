@@ -73,8 +73,18 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     message: string;
+    isAlert?: boolean;
     onConfirm: () => void;
   }>({ isOpen: false, message: '', onConfirm: () => {} });
+
+  const showAlert = (message: string) => {
+    setConfirmDialog({
+      isOpen: true,
+      message,
+      isAlert: true,
+      onConfirm: () => setConfirmDialog(prev => ({ ...prev, isOpen: false }))
+    });
+  };
   
   const [selectedGroup, setSelectedGroup] = useState<{ folder: string, date: string } | null>(null);
 
@@ -235,7 +245,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     
     const selectedTodos = entry.aiResult.todos.filter(t => t.selected !== false && !t.synced);
     if (selectedTodos.length === 0) {
-      alert("当前没有可同步的待办事项：您选中的条目可能已全部同步至 Notion，或未勾选任何有效事项。");
+      showAlert("当前没有可同步的待办事项：您选中的条目可能已全部同步至 Notion，或未勾选任何有效事项。");
       return;
     }
     
@@ -278,7 +288,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
       }
     } catch (e: any) {
       console.error(e);
-      alert('同步失败: ' + (e.message || String(e)));
+      showAlert('同步失败: ' + (e.message || String(e)));
     } finally {
       setSyncing(false);
     }
@@ -1363,18 +1373,22 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
       {confirmDialog.isOpen && (
         <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}>
           <div className="bg-slate-900 border border-white/10 rounded-xl p-6 max-w-sm w-full shadow-2xl flex flex-col gap-4 animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
-            <h3 className="text-lg font-semibold text-white">确认操作</h3>
-            <p className="text-sm text-slate-300 leading-relaxed">{confirmDialog.message}</p>
+            <h3 className="text-lg font-semibold text-white">
+              {confirmDialog.isAlert ? "提示" : "确认操作"}
+            </h3>
+            <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">{confirmDialog.message}</p>
             <div className="flex justify-end gap-3 mt-2">
-              <button
-                onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
-                className="px-4 py-2 text-sm text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 rounded-md transition-colors"
-              >
-                取消
-              </button>
+              {!confirmDialog.isAlert && (
+                <button
+                  onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
+                  className="px-4 py-2 text-sm text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 rounded-md transition-colors"
+                >
+                  取消
+                </button>
+              )}
               <button
                 onClick={confirmDialog.onConfirm}
-                className="px-4 py-2 text-sm text-white bg-pink-600 hover:bg-pink-500 rounded-md shadow-lg shadow-pink-500/20 transition-all active:scale-95"
+                className={`px-4 py-2 text-sm text-white rounded-md shadow-lg transition-all active:scale-95 ${confirmDialog.isAlert ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-500/20' : 'bg-pink-600 hover:bg-pink-500 shadow-pink-500/20'}`}
               >
                 确定
               </button>
