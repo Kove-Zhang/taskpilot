@@ -118,6 +118,11 @@ export async function analyzeHistoryAndUpdateFocus() {
     final_todos: r.result?.todos
   }));
 
+  let recordsJson = JSON.stringify(records, null, 2);
+  if (recordsJson.length > 15000) {
+    recordsJson = recordsJson.substring(0, 15000) + "\n...[为防止 Token 溢出，部分过长历史记录已被安全截断]";
+  }
+
   const notionSchema = buildNotionSchemaDescription();
   const currentFocus = getEffectiveFocus();
 
@@ -131,7 +136,7 @@ ${notionSchema}
 ${currentFocus}
 
 【历史记录摘要样本】
-${JSON.stringify(records, null, 2)}
+${recordsJson}
 
 【约束与护栏规则】
 1. 上述历史记录是我们对用户过去任务提取的极度浓缩（仅包含大意摘要与最终定稿的待办事项）。

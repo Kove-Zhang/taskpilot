@@ -65,8 +65,11 @@ fn extract_mail_content(parsed: &ParsedMail) -> (String, Option<String>, Vec<Str
         } else if mime.starts_with("image/") {
             if imgs.len() < 10 {
                 if let Ok(raw) = sub.get_body_raw() {
-                    let b64 = STANDARD.encode(&raw);
-                    imgs.push(format!("data:{};base64,{}", mime, b64));
+                    // Prevent OOM: skip inline images larger than 500KB
+                    if raw.len() < 500 * 1024 {
+                        let b64 = STANDARD.encode(&raw);
+                        imgs.push(format!("data:{};base64,{}", mime, b64));
+                    }
                 }
             }
         }

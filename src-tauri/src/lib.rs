@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 use sha2::{Sha256, Digest};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use keyring::Entry;
+use std::io::Write;
 
 mod imap_cmds;
 use imap_cmds::{get_email_folders, fetch_emails, mark_email_read};
@@ -27,6 +29,40 @@ fn get_key_path(app_handle: &tauri::AppHandle) -> PathBuf {
     fs::create_dir_all(&path).unwrap();
     path.push("secret.key");
     path
+}
+
+fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, String> {
+    let entry = Entry::new("task-pilot", "history-key").map_err(|e| e.to_string())?;
+    
+    // Check if secure key exists
+    if let Ok(password) = entry.get_password() {
+        if let Ok(key) = STANDARD.decode(&password) {
+            if key.len() == 32 {
+                return Ok(key);
+            }
+        }
+    }
+    
+    // Check legacy file
+    let key_path = get_key_path(app_handle);
+    if key_path.exists() {
+        if let Ok(key_bytes) = fs::read(&key_path) {
+            if key_bytes.len() == 32 {
+                // Migrate to keyring
+                let _ = entry.set_password(&STANDARD.encode(&key_bytes));
+                // Securely wipe and remove legacy file
+                let _ = fs::write(&key_path, vec![0u8; 32]);
+                let _ = fs::remove_file(&key_path);
+                return Ok(key_bytes);
+            }
+        }
+    }
+    
+    // Generate new key
+    let key = Aes256Gcm::generate_key(OsRng);
+    let key_vec = key.to_vec();
+    let _ = entry.set_password(&STANDARD.encode(&key_vec));
+    Ok(key_vec)
 }
 
 fn encrypt_history(data: &str, key_bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -55,17 +91,21 @@ fn decrypt_history(encrypted_data: &[u8], key_bytes: &[u8]) -> Result<String, St
 
 #[tauri::command]
 fn save_history(app_handle: tauri::AppHandle, data: String) -> Result<(), String> {
-    let key_path = get_key_path(&app_handle);
-    let key_bytes = if key_path.exists() {
-        fs::read(&key_path).map_err(|e| e.to_string())?
-    } else {
-        let key = Aes256Gcm::generate_key(OsRng);
-        fs::write(&key_path, key.as_slice()).map_err(|e| e.to_string())?;
-        key.to_vec()
-    };
-
+    let key_bytes = get_or_migrate_history_key(&app_handle)?;
     let final_data = encrypt_history(&data, &key_bytes)?;
-    fs::write(get_storage_path(&app_handle), final_data).map_err(|e| e.to_string())?;
+    
+    let path = get_storage_path(&app_handle);
+    let mut tmp_path = path.clone();
+    tmp_path.set_extension("enc.tmp");
+    
+    // Atomic write
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+        file.write_all(&final_data).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+    }
+    
+    fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -76,12 +116,7 @@ fn load_history(app_handle: tauri::AppHandle) -> Result<String, String> {
         return Ok("[]".to_string());
     }
 
-    let key_path = get_key_path(&app_handle);
-    if !key_path.exists() {
-        return Ok("[]".to_string());
-    }
-
-    let key_bytes = fs::read(&key_path).map_err(|e| e.to_string())?;
+    let key_bytes = get_or_migrate_history_key(&app_handle)?;
     let encrypted_data = fs::read(&path).map_err(|e| e.to_string())?;
     
     decrypt_history(&encrypted_data, &key_bytes)
@@ -205,7 +240,7 @@ fn encrypt_secret(value: String) -> Result<String, String> {
     if value.is_empty() {
         return Ok("".to_string());
     }
-    let key = get_machine_key()?;
+    let key = get_or_create_secret_key()?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
     
@@ -213,6 +248,23 @@ fn encrypt_secret(value: String) -> Result<String, String> {
     let mut final_data = nonce.to_vec();
     final_data.extend_from_slice(&ciphertext);
     Ok(STANDARD.encode(final_data))
+}
+
+fn get_or_create_secret_key() -> Result<Vec<u8>, String> {
+    let entry = Entry::new("task-pilot", "secrets-key").map_err(|e| e.to_string())?;
+    
+    if let Ok(password) = entry.get_password() {
+        if let Ok(key) = STANDARD.decode(&password) {
+            if key.len() == 32 {
+                return Ok(key);
+            }
+        }
+    }
+    
+    let key = Aes256Gcm::generate_key(OsRng);
+    let key_vec = key.to_vec();
+    let _ = entry.set_password(&STANDARD.encode(&key_vec));
+    Ok(key_vec)
 }
 
 #[tauri::command]
@@ -230,18 +282,32 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
         return Ok(cipher_text); // Probably plain text that happens to be valid base64
     }
     
-    let key = get_machine_key()?;
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    let cipher = match Aes256Gcm::new_from_slice(&key) {
-        Ok(c) => c,
-        Err(_) => return Ok(cipher_text),
-    };
     
-    match cipher.decrypt(nonce, ciphertext) {
-        Ok(plaintext) => Ok(String::from_utf8(plaintext).unwrap_or(cipher_text)),
-        Err(_) => Ok(cipher_text), // If decryption fails, it might be plaintext
+    // Try new Keyring key first
+    if let Ok(key) = get_or_create_secret_key() {
+        if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
+            if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+                if let Ok(s) = String::from_utf8(plaintext) {
+                    return Ok(s);
+                }
+            }
+        }
     }
+    
+    // Fallback to legacy machine_uid key
+    if let Ok(key) = get_machine_key() {
+        if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
+            if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+                if let Ok(s) = String::from_utf8(plaintext) {
+                    return Ok(s);
+                }
+            }
+        }
+    }
+    
+    Ok(cipher_text)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
