@@ -48,16 +48,29 @@ export default function App() {
   const isFileDialogOpen = useRef(false)
   const isScreenshotting = useRef(false)
 
+  const isDraggingRef = useRef(isDragging);
+  useEffect(() => { isDraggingRef.current = isDragging; }, [isDragging]);
+  
+  const isWindowModeRef = useRef(isWindowMode);
+  useEffect(() => { isWindowModeRef.current = isWindowMode; }, [isWindowMode]);
+
   useEffect(() => {
     let unlisten: () => void;
-    startEmailScheduler();
     
     getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-      if (!focused && !isDragging && !isWindowMode && !isFileDialogOpen.current && !isScreenshotting.current) {
+      if (!focused && !isDraggingRef.current && !isWindowModeRef.current && !isFileDialogOpen.current && !isScreenshotting.current) {
         getCurrentWindow().hide();
       }
     }).then(fn => unlisten = fn);
 
+    return () => {
+      if (unlisten) unlisten();
+    }
+  }, []);
+
+  useEffect(() => {
+    startEmailScheduler();
+    
     const setup = async () => {
       const globalShortcut = useSettingsStore.getState().globalShortcut;
       invoke('update_shortcut', { shortcut: globalShortcut }).catch(e => {
@@ -65,11 +78,11 @@ export default function App() {
       });
     };
     setup();
+    
     return () => {
-      if (unlisten) unlisten();
       stopEmailScheduler();
     }
-  }, [isDragging, isWindowMode]);
+  }, []);
 
   const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData.items;
