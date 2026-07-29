@@ -32,7 +32,7 @@ describe('AI Helper Methods', () => {
     // Mock the global fetch from @tauri-apps/plugin-http
     vi.mocked(await import('@tauri-apps/plugin-http')).fetch = mockFetch
 
-    const todos = [{ id: '1', title: 'Buy milk', priority: '★', type: 'Life' }]
+      const todos = [{ id: '1', title: 'test', priority: 'High', type: 'bug', planned_date: null }];
     const result = await generateWriting('Draft an email', todos)
 
     expect(result).toBe('This is the generated text.')

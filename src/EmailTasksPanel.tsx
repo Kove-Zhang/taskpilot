@@ -218,7 +218,9 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     entry.aiResult.todos.push({
       id: Math.random().toString(36).substring(2, 11),
       selected: true,
-      title: ''
+      title: '',
+      priority: 'Medium',
+      planned_date: null
     });
     setHistory(newHistory);
     await historyStore.set('history', newHistory);
@@ -262,6 +264,13 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
       setHistory(newHistory);
       await historyStore.set('history', newHistory);
       await historyStore.save();
+      
+      // 触发后台静默分析 (fire-and-forget)
+      if (entry.aiResult?.originalTodos) {
+        import('./lib/autoOptimize').then(m => {
+          m.backgroundReviewAndUpdateFocus(entry.aiResult!.originalTodos!, selectedTodos).catch(console.error);
+        });
+      }
       
       if (failed.length > 0) {
         const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\n');

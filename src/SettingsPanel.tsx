@@ -18,7 +18,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
     notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount, isWindowMode,
-    setPersonalFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig, setLLMProviders, setFailoverConfig, setWindowMode
+    promptMode, staticPersonalFocus, autoOptimizedFocus, staticFocusUpdatedAt, autoOptimizedUpdatedAt,
+    setPromptMode, setStaticFocus, setAutoOptimizedFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig, setLLMProviders, setFailoverConfig, setWindowMode
   } = useSettingsStore();
 
   const [formProviders, setFormProviders] = useState<LLMProvider[]>(() => {
@@ -41,7 +42,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [showFailoverGuide, setShowFailoverGuide] = useState<boolean>(false);
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [providerTestResults, setProviderTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string }>>({});
-  const [formFocus, setFormFocus] = useState(personalFocus);
+  
+  const [formPromptMode, setFormPromptMode] = useState<'static' | 'auto'>(promptMode);
+  const [formStaticFocus, setFormStaticFocus] = useState(staticPersonalFocus || personalFocus);
+  const [formAutoFocus, setFormAutoFocus] = useState(autoOptimizedFocus);
   const [isFocusEditorOpen, setIsFocusEditorOpen] = useState(false);
   const [formNotionKey, setFormNotionKey] = useState(notionApiKey);
   const [formNotionDb, setFormNotionDb] = useState(notionDatabaseId);
@@ -84,7 +88,24 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [activeTab, setActiveTab] = useState<'ai' | 'integration' | 'email' | 'system'>('ai');
 
   const [optimizingPrompt, setOptimizingPrompt] = useState(false);
+  const [analyzingHistory, setAnalyzingHistory] = useState(false);
   const [previousFocus, setPreviousFocus] = useState<string | null>(null);
+
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    message: string;
+    isAlert?: boolean;
+    onConfirm: () => void;
+  }>({ isOpen: false, message: '', onConfirm: () => {} });
+
+  const showAlert = (message: string) => {
+    setConfirmDialog({
+      isOpen: true,
+      message,
+      isAlert: true,
+      onConfirm: () => setConfirmDialog(prev => ({ ...prev, isOpen: false }))
+    });
+  };
 
   const [testingNotion, setTestingNotion] = useState(false);
   const [notionTestResult, setNotionTestResult] = useState<'none' | 'success' | 'error'>('none');
@@ -93,7 +114,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const handleSave = () => {
     setLLMProviders(formProviders);
     setFailoverConfig(formEnableFailover, formRetryCount);
-    setPersonalFocus(formFocus);
+    setPromptMode(formPromptMode);
+    setStaticFocus(formStaticFocus);
+    setAutoOptimizedFocus(formAutoFocus);
     setNotionSettings(formNotionKey, formNotionDb);
     setEnableLogging(formLogging);
     setGlobalShortcut(formGlobalShortcut);
@@ -118,7 +141,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     import('@tauri-apps/api/core').then(m => {
         m.invoke('update_shortcut', { shortcut: formGlobalShortcut }).catch(e => {
             console.error('Update shortcut failed', e);
-            alert(`快捷键应用失败: ${e}\n可能该快捷键不合法或被系统占用。`);
+            showAlert(`快捷键应用失败: ${e}\n可能该快捷键不合法或被系统占用。`);
         });
     });
 
@@ -346,11 +369,11 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const handleOptimizePrompt = async () => {
     const topProvider = formProviders.find(p => p.enabled) || formProviders[0];
     if (!topProvider || !topProvider.apiBaseUrl || !topProvider.apiKey || !topProvider.modelName) {
-      alert("请先在上方配置至少一个有效的大模型服务商及 API Key！");
+      showAlert("请先在上方配置至少一个有效的大模型服务商及 API Key！");
       return;
     }
-    if (!formFocus.trim()) {
-      alert("请先输入简单的关注方向描述，AI 才能帮您润色。");
+    if (!formStaticFocus.trim() && formPromptMode === 'static') {
+      showAlert("请先输入简单的关注方向描述，AI 才能帮您润色。");
       return;
     }
 
@@ -369,10 +392,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       if (!formEnableReasoning) {
         messages.push({
           role: 'user',
-          content: `${formFocus}\n\n(指令：请直接输出最终结果，跳过所有思维链、推导过程和思考步骤。)\n/no_think`
+          content: `${formPromptMode === 'static' ? formStaticFocus : formAutoFocus}\n\n(指令：请直接输出最终结果，跳过所有思维链、推导过程和思考步骤。)\n/no_think`
         });
       } else {
-        messages.push({ role: 'user', content: formFocus });
+        messages.push({ role: 'user', content: formPromptMode === 'static' ? formStaticFocus : formAutoFocus });
       }
 
       const payload: any = {
@@ -412,14 +435,19 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       const data = await response.json();
       logger.info('Received raw prompt optimization response from AI', { response: data });
       if (data.choices && data.choices.length > 0) {
-        setPreviousFocus(formFocus);
-        setFormFocus(data.choices[0].message.content.trim());
+        if (formPromptMode === 'static') {
+          setPreviousFocus(formStaticFocus);
+          setFormStaticFocus(data.choices[0].message.content.trim());
+        } else {
+          setPreviousFocus(formAutoFocus);
+          setFormAutoFocus(data.choices[0].message.content.trim());
+        }
         logger.info('Prompt optimization successful');
       }
     } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
       logger.error('Prompt optimization failed', msg);
-      alert(`润色失败: ${msg}`);
+      showAlert(`润色失败: ${msg}`);
     } finally {
       setOptimizingPrompt(false);
     }
@@ -611,7 +639,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                             <button
                               onClick={() => {
                                 if (formProviders.length <= 1) {
-                                  alert("至少需要保留一个大模型服务商");
+                                  showAlert("至少需要保留一个大模型服务商");
                                   return;
                                 }
                                 const updated = formProviders.filter((_, i) => i !== index);
@@ -799,49 +827,156 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-medium text-blue-300 flex items-center gap-2">
-                  <Wand2 className="w-4 h-4" /> 个人关注方向
+                  <Wand2 className="w-4 h-4" /> 个人关注方向与记忆机制
                 </h3>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setIsFocusEditorOpen(true)}
-                    className="text-xs flex items-center gap-1 bg-indigo-500/20 text-indigo-300 px-2 py-1 rounded hover:bg-indigo-500/30 transition border border-indigo-500/30"
-                    title="全屏放大沉浸式编辑与保存"
-                  >
-                    <Maximize2 className="w-3 h-3" />
-                    放大编辑
-                  </button>
-                  {previousFocus !== null && (
+              </div>
+              
+              <div className="flex items-center gap-4 bg-slate-900/40 p-1.5 rounded-lg border border-white/5 w-fit">
+                <button
+                  onClick={() => setFormPromptMode('static')}
+                  className={`px-4 py-1.5 rounded-md text-xs font-medium transition-all ${formPromptMode === 'static' ? 'bg-blue-500/20 text-blue-300 shadow-sm border border-blue-500/30' : 'text-slate-400 hover:text-slate-300'}`}
+                >
+                  静态手动模式
+                </button>
+                <button
+                  onClick={() => setFormPromptMode('auto')}
+                  className={`group relative px-4 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-1.5 ${formPromptMode === 'auto' ? 'bg-purple-500/20 text-purple-300 shadow-sm border border-purple-500/30' : 'text-slate-400 hover:text-slate-300'}`}
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  自动持续演进模式 (推荐)
+                  <div className="ml-1 flex items-center justify-center w-4 h-4 rounded-full bg-white/10 text-[10px] text-white/70 cursor-help">?</div>
+                  <div className="absolute hidden group-hover:block w-72 bg-slate-800 text-slate-200 text-xs p-3 rounded-xl border border-white/10 shadow-2xl z-50 -top-2 left-[105%] leading-relaxed">
+                    开启后，系统将在您每次修改并同步待办事项到 Notion 后，在后台通过对比您的修改痕迹，自动优化并微调您的个人关注点，让 AI 越用越懂您的特定工作流。
+                    <br/><br/>
+                    <span className="text-amber-400/90 font-medium">⚠️ 注意：此模式会在每次同步时，在后台额外触发一次轻量级的大模型调用来分析您的修改，这会产生一定的额外 Token 消耗。</span>
+                  </div>
+                </button>
+              </div>
+
+              {formPromptMode === 'static' ? (
+                <div className="relative group">
+                  <div className="absolute right-2 top-2 flex items-center gap-2 z-10">
+                    <button
+                      onClick={() => setIsFocusEditorOpen(true)}
+                      className="text-xs flex items-center gap-1 bg-indigo-500/80 text-white px-2 py-1 rounded hover:bg-indigo-500 transition shadow-sm backdrop-blur-sm"
+                      title="全屏放大沉浸式编辑与保存"
+                    >
+                      <Maximize2 className="w-3 h-3" />
+                      放大编辑
+                    </button>
+                    {previousFocus !== null && (
+                      <button
+                        onClick={() => {
+                          setFormStaticFocus(previousFocus);
+                          setPreviousFocus(null);
+                        }}
+                        className="text-xs flex items-center gap-1 bg-slate-500/80 text-white px-2 py-1 rounded hover:bg-slate-500 transition shadow-sm backdrop-blur-sm"
+                        title="撤销刚才的润色结果，恢复原文本"
+                      >
+                        <Undo2 className="w-3 h-3" />
+                        撤销润色
+                      </button>
+                    )}
+                    <button
+                      onClick={handleOptimizePrompt}
+                      disabled={optimizingPrompt || !formStaticFocus.trim()}
+                      className="text-xs flex items-center gap-1 bg-blue-500/80 text-white px-2 py-1 rounded hover:bg-blue-500 transition disabled:opacity-50 shadow-sm backdrop-blur-sm"
+                      title="让 AI 帮您润色和扩充提示词"
+                    >
+                      {optimizingPrompt ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                      智能润色
+                    </button>
+                  </div>
+                  <textarea 
+                    value={formStaticFocus} onChange={e => {
+                      setFormStaticFocus(e.target.value);
+                      if (previousFocus !== null) setPreviousFocus(null);
+                    }}
+                    className="w-full bg-slate-900/50 border border-white/10 rounded-xl p-3 pt-3 text-sm text-slate-200 min-h-[140px] resize-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all shadow-inner"
+                    placeholder="例如：我是一名前端开发，请侧重提取关于 UI、交互、接口联调的待办..."
+                  />
+                  {staticFocusUpdatedAt > 0 && (
+                     <div className="text-[10px] text-slate-500 text-right mt-1 font-mono">最后人工编辑时间: {new Date(staticFocusUpdatedAt).toLocaleString()}</div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="relative group">
+                    <div className="absolute right-2 top-2 flex items-center gap-2 z-10">
+                      <button
+                        onClick={() => {
+                          navigator.clipboard.writeText(formAutoFocus);
+                        }}
+                        className="text-xs flex items-center gap-1 bg-slate-700/80 text-white px-2 py-1 rounded hover:bg-slate-600 transition shadow-sm backdrop-blur-sm"
+                        title="复制提示词"
+                      >
+                        一键复制
+                      </button>
+                    </div>
+                    <textarea 
+                      value={formAutoFocus} 
+                      readOnly
+                      disabled
+                      className="w-full bg-slate-950/80 border border-white/5 rounded-xl p-3 text-sm text-slate-400 min-h-[140px] resize-none outline-none shadow-inner cursor-not-allowed"
+                      placeholder="系统将在此处自动生成优化后的提示词..."
+                    />
+                    {autoOptimizedUpdatedAt > 0 && (
+                      <div className="text-[10px] text-slate-500 text-right mt-1 font-mono">最后自动优化时间: {new Date(autoOptimizedUpdatedAt).toLocaleString()}</div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3 flex-wrap">
                     <button
                       onClick={() => {
-                        setFormFocus(previousFocus);
-                        setPreviousFocus(null);
+                        setFormStaticFocus(formAutoFocus);
+                        setFormPromptMode('static');
                       }}
-                      className="text-xs flex items-center gap-1 bg-slate-500/20 text-slate-300 px-2 py-1 rounded hover:bg-slate-500/40 transition"
-                      title="撤销刚才的润色结果，恢复原文本"
+                      className="text-xs flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-lg border border-white/5 transition"
                     >
-                      <Undo2 className="w-3 h-3" />
-                      撤销润色
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      退回静态模式继续编辑
                     </button>
-                  )}
-                  <button
-                    onClick={handleOptimizePrompt}
-                    disabled={optimizingPrompt || !formFocus.trim()}
-                    className="text-xs flex items-center gap-1 bg-blue-500/20 text-blue-300 px-2 py-1 rounded hover:bg-blue-500/30 transition disabled:opacity-50"
-                    title="让 AI 帮您润色和扩充提示词"
-                  >
-                    {optimizingPrompt ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-                    AI 智能润色
-                  </button>
+
+                    <button
+                      onClick={() => {
+                        setConfirmDialog({
+                          isOpen: true,
+                          message: "确定要用您当前的「静态手动模式」内容强制覆盖自动演进的最新成果吗？",
+                          onConfirm: () => {
+                            setFormAutoFocus(formStaticFocus);
+                            setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+                            // We can use a subtle notification instead of alert if possible, or just nothing since the text will update visibly.
+                          }
+                        });
+                      }}
+                      className="text-xs flex items-center gap-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 px-3 py-1.5 rounded-lg border border-amber-500/20 transition"
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                      用静态配置覆盖此内容
+                    </button>
+                    
+                    <button
+                      onClick={async () => {
+                         setAnalyzingHistory(true);
+                         try {
+                           const { analyzeHistoryAndUpdateFocus } = await import('./lib/autoOptimize');
+                           const newFocus = await analyzeHistoryAndUpdateFocus();
+                           setFormAutoFocus(newFocus);
+                           showAlert("历史记录分析完毕，您的个人偏好已演进更新！");
+                         } catch (e: any) {
+                           showAlert("历史记录分析失败: " + e.message);
+                         } finally {
+                           setAnalyzingHistory(false);
+                         }
+                      }}
+                      disabled={analyzingHistory}
+                      className="text-xs flex items-center gap-1.5 bg-gradient-to-r from-purple-600/80 to-pink-600/80 hover:from-purple-500 hover:to-pink-500 text-white px-3 py-1.5 rounded-lg shadow-md transition disabled:opacity-50"
+                    >
+                      {analyzingHistory ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Wand2 className="w-3.5 h-3.5" />}
+                      深度分析历史记录以生成偏好
+                    </button>
+                  </div>
                 </div>
-              </div>
-              <textarea 
-                value={formFocus} onChange={e => {
-                  setFormFocus(e.target.value);
-                  if (previousFocus !== null) setPreviousFocus(null);
-                }}
-                className="w-full bg-slate-900/50 border border-white/10 rounded p-2 text-sm text-slate-200 min-h-[120px] resize-none focus:ring-1 focus:ring-blue-500 outline-none"
-                placeholder="例如：我是一名前端开发，请侧重提取关于 UI、交互、接口联调的待办..."
-              />
+              )}
             </div>
           </div>
 
@@ -1443,10 +1578,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       <ZenEditorModal
         isOpen={isFocusEditorOpen}
         title="沉浸式编辑：个人关注方向 (待办提取规则)"
-        value={formFocus}
+        value={formStaticFocus}
         placeholder="例如：我是一名前端开发，请侧重提取关于 UI、交互、接口联调的待办..."
         onSave={(newVal) => {
-          setFormFocus(newVal);
+          setFormStaticFocus(newVal);
           if (previousFocus !== null && newVal !== previousFocus) {
             setPreviousFocus(null);
           }
@@ -1458,11 +1593,35 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         canUndo={previousFocus !== null}
         onUndo={() => {
           if (previousFocus !== null) {
-            setFormFocus(previousFocus);
+            setFormStaticFocus(previousFocus);
             setPreviousFocus(null);
           }
         }}
       />
+
+      {confirmDialog.isOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}>
+          <div className="bg-slate-900 border border-slate-700/50 rounded-xl p-6 max-w-sm w-full shadow-2xl space-y-4" onClick={e => e.stopPropagation()}>
+            <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">{confirmDialog.message}</p>
+            <div className="flex justify-end gap-3 pt-2">
+              {!confirmDialog.isAlert && (
+                <button 
+                  onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                >
+                  取消
+                </button>
+              )}
+              <button 
+                onClick={confirmDialog.onConfirm}
+                className={`px-4 py-2 rounded-lg text-sm font-medium text-white shadow-lg transition active:scale-95 ${confirmDialog.isAlert ? 'bg-blue-600/90 hover:bg-blue-500 shadow-blue-500/20' : 'bg-amber-600/90 hover:bg-amber-500 shadow-amber-500/20'}`}
+              >
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

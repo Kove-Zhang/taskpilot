@@ -129,7 +129,12 @@ interface SettingsState {
   apiBaseUrl: string;
   apiKey: string;
   modelName: string;
-  personalFocus: string;
+  personalFocus: string; // legacy fallback
+  promptMode: 'static' | 'auto';
+  staticPersonalFocus: string;
+  staticFocusUpdatedAt: number;
+  autoOptimizedFocus: string;
+  autoOptimizedUpdatedAt: number;
   notionApiKey: string;
   notionDatabaseId: string;
   enableLogging: boolean;
@@ -146,7 +151,10 @@ interface SettingsState {
   setLLMProviders: (providers: LLMProvider[]) => void;
   setFailoverConfig: (enable: boolean, retryCount: number) => void;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
-  setPersonalFocus: (focus: string) => void;
+  setPersonalFocus: (focus: string) => void; // Legacy
+  setPromptMode: (mode: 'static' | 'auto') => void;
+  setStaticFocus: (focus: string) => void;
+  setAutoOptimizedFocus: (focus: string) => void;
   setNotionSettings: (key: string, dbId: string) => void;
   setEnableLogging: (enable: boolean) => void;
   setGlobalShortcut: (shortcut: string) => void;
@@ -165,6 +173,11 @@ export const useSettingsStore = create<SettingsState>()(
       apiKey: '',
       modelName: 'gpt-4o',
       personalFocus: '关注内容的核心逻辑和可操作的待办事项。',
+      promptMode: 'static',
+      staticPersonalFocus: '',
+      staticFocusUpdatedAt: 0,
+      autoOptimizedFocus: '',
+      autoOptimizedUpdatedAt: 0,
       notionApiKey: '',
       notionDatabaseId: '',
       enableLogging: false,
@@ -208,6 +221,15 @@ export const useSettingsStore = create<SettingsState>()(
       }),
       setFailoverConfig: (enableFailover, failoverRetryCount) => set({ enableFailover, failoverRetryCount }),
       setPersonalFocus: (personalFocus) => set({ personalFocus }),
+      setPromptMode: (promptMode) => set({ promptMode }),
+      setStaticFocus: (staticPersonalFocus) => set({ 
+        staticPersonalFocus, 
+        staticFocusUpdatedAt: Date.now() 
+      }),
+      setAutoOptimizedFocus: (autoOptimizedFocus) => set({ 
+        autoOptimizedFocus, 
+        autoOptimizedUpdatedAt: Date.now() 
+      }),
       setNotionSettings: (notionApiKey, notionDatabaseId) => set({ notionApiKey, notionDatabaseId }),
       setEnableLogging: (enableLogging) => set({ enableLogging }),
       setGlobalShortcut: (globalShortcut) => set({ globalShortcut }),
@@ -299,3 +321,12 @@ export function getSortedLLMProviders(): LLMProvider[] {
   }
   return [...providers].sort((a, b) => a.priority - b.priority);
 }
+
+export function getEffectiveFocus(): string {
+  const state = useSettingsStore.getState();
+  if (state.promptMode === 'auto') {
+    return state.autoOptimizedFocus || state.staticPersonalFocus || state.personalFocus || '关注内容的核心逻辑和可操作的待办事项。';
+  }
+  return state.staticPersonalFocus || state.personalFocus || '关注内容的核心逻辑和可操作的待办事项。';
+}
+

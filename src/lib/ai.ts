@@ -1,4 +1,4 @@
-import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from '../store'
+import { useSettingsStore, getSortedLLMProviders, getEffectiveFocus, type LLMProvider } from '../store'
 import { fetch } from '@tauri-apps/plugin-http';
 import { logger } from './logger';
 
@@ -7,11 +7,15 @@ export interface AIResult {
   summary: string;
   key_points?: string[];
   todos: TodoItem[];
+  originalTodos?: TodoItem[]; // For auto memory optimization diff
   syncedToNotion?: boolean;
 }
 
 export interface TodoItem {
   id: string;
+  title: string;
+  priority: 'High' | 'Medium' | 'Low' | string;
+  planned_date: string | null;
   selected?: boolean;
   [key: string]: any;
 }
@@ -35,7 +39,7 @@ function compressTextForAI(text: string, maxLength: number = 8000): string {
 /**
  * 带多供应商轮换与重试机制的 AI 调用核心引擎
  */
-async function callAIWithFailover(
+export async function callAIWithFailover(
   buildPayload: (provider: LLMProvider) => any,
   logContextName: string
 ): Promise<string> {
@@ -151,7 +155,8 @@ async function callAIWithFailover(
 }
 
 export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
-  const { personalFocus, notionProperties, fieldMappings, tokenLimit, enableReasoning } = useSettingsStore.getState();
+  const { notionProperties, fieldMappings, tokenLimit, enableReasoning } = useSettingsStore.getState();
+  const personalFocus = getEffectiveFocus();
 
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
   
@@ -269,20 +274,26 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
   }, "提取待办");
   
   try {
-    const parsed = JSON.parse(rawContent) as AIResult;
-    if (!parsed.todos || !Array.isArray(parsed.todos)) {
-      parsed.todos = [];
+    const parsedResult = JSON.parse(rawContent) as AIResult;
+    if (!parsedResult.todos || !Array.isArray(parsedResult.todos)) {
+      parsedResult.todos = [];
     }
-    if (!parsed.key_points || !Array.isArray(parsed.key_points)) {
-      parsed.key_points = undefined;
+    if (!parsedResult.key_points || !Array.isArray(parsedResult.key_points)) {
+      parsedResult.key_points = undefined;
     }
-    parsed.todos = parsed.todos.map(t => ({ 
+    parsedResult.todos = parsedResult.todos.map(t => ({ 
       ...t, 
       selected: true
     }));
-    return parsed;
-  } catch (e) {
-    throw new Error("模型返回的数据无法解析为 JSON: " + rawContent);
+    return {
+      summary: parsedResult.summary,
+      key_points: parsedResult.key_points,
+      todos: parsedResult.todos,
+      originalTodos: JSON.parse(JSON.stringify(parsedResult.todos))
+    };
+  } catch (err) {
+    logger.error('Failed to parse AI response', { rawContent, error: err });
+    throw new Error('AI 返回的格式无法解析为 JSON');
   }
 }
 

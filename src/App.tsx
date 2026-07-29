@@ -231,6 +231,13 @@ export default function App() {
           })
         };
       });
+
+      // 触发后台静默分析 (fire-and-forget)
+      if (result.originalTodos) {
+        import('./lib/autoOptimize').then(m => {
+          m.backgroundReviewAndUpdateFocus(result.originalTodos!, selectedTodos).catch(console.error);
+        });
+      }
       
       const dataJson = await invoke<string>("load_history").catch(() => "[]");
       let history = JSON.parse(dataJson || "[]");
