@@ -31,7 +31,7 @@ export default function App() {
   const [toast, setToast] = useState<{title: string, message: string} | null>(null)
   const [showFeedback, setShowFeedback] = useState(false)
   const [feedbackText, setFeedbackText] = useState('')
-  const { notionProperties, fieldMappings, isWindowMode } = useSettingsStore()
+  const { notionProperties, fieldMappings, isWindowMode, globalShortcut } = useSettingsStore()
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled).sort((a, b) => {
     const orderA = fieldMappings[a.id]?.order ?? 999;
     const orderB = fieldMappings[b.id]?.order ?? 999;
@@ -88,18 +88,18 @@ export default function App() {
   useEffect(() => {
     startEmailScheduler();
     
-    const setup = async () => {
-      const globalShortcut = useSettingsStore.getState().globalShortcut;
-      invoke('update_shortcut', { shortcut: globalShortcut }).catch(e => {
-          logger.error('Failed to sync initial global shortcut', e);
-      });
-    };
-    setup();
-    
     return () => {
       stopEmailScheduler();
     }
   }, []);
+
+  useEffect(() => {
+    if (globalShortcut) {
+      invoke('update_shortcut', { shortcut: globalShortcut }).catch(e => {
+          logger.error('Failed to sync global shortcut', e);
+      });
+    }
+  }, [globalShortcut]);
 
   const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData.items;
