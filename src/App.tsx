@@ -28,6 +28,7 @@ export default function App() {
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
+  const [toast, setToast] = useState<{title: string, message: string} | null>(null)
   
   const { notionProperties, fieldMappings, isWindowMode } = useSettingsStore()
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled).sort((a, b) => {
@@ -67,6 +68,20 @@ export default function App() {
     return () => {
       if (unlisten) unlisten();
     }
+  }, []);
+
+  useEffect(() => {
+    const handleEvolutionCompleted = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      setToast({
+        title: customEvent.detail.title,
+        message: customEvent.detail.message
+      });
+      // 5 seconds auto dismiss
+      setTimeout(() => setToast(null), 5000);
+    };
+    window.addEventListener('ai-evolution-completed', handleEvolutionCompleted);
+    return () => window.removeEventListener('ai-evolution-completed', handleEvolutionCompleted);
   }, []);
 
   useEffect(() => {
@@ -680,6 +695,26 @@ export default function App() {
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} />}
       {showEmailHistory && <EmailTasksPanel onClose={() => setShowEmailHistory(false)} />}
+
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-[100] animate-in slide-in-from-bottom-8 slide-in-from-right-8 fade-in duration-500">
+          <div className="relative flex items-start gap-3 bg-slate-900/85 backdrop-blur-md border border-purple-500/40 p-4 pr-8 rounded-xl shadow-2xl shadow-purple-900/30 max-w-sm">
+            <div className="bg-purple-500/20 p-2 rounded-lg shrink-0 mt-0.5">
+              <Sparkles className="w-5 h-5 text-purple-400 animate-pulse" />
+            </div>
+            <div className="flex flex-col gap-1">
+              <h4 className="text-sm font-semibold text-purple-300 tracking-wide">{toast.title}</h4>
+              <p className="text-xs text-slate-400 leading-relaxed">{toast.message}</p>
+            </div>
+            <button 
+              onClick={() => setToast(null)}
+              className="absolute top-2 right-2 text-slate-500 hover:text-slate-300 bg-transparent hover:bg-white/10 p-1 rounded transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

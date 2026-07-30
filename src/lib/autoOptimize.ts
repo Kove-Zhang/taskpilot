@@ -98,6 +98,12 @@ ${finalStr}
     if (newFocus && newFocus !== 'null' && newFocus !== currentFocus) {
       useSettingsStore.getState().setAutoOptimizedFocus(newFocus);
       logger.info("[AutoOptimize] 自动记忆更新成功", { old: currentFocus, new: newFocus });
+      window.dispatchEvent(new CustomEvent('ai-evolution-completed', { 
+        detail: { 
+          title: "🧠 AI 认知已自我演进",
+          message: "系统深度学习了您最近的操作偏好，全局提取规则已更新完毕。" 
+        } 
+      }));
     }
   } catch (err) {
     logger.warn("[AutoOptimize] 自动更新失败", err);
