@@ -24,6 +24,11 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
   const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
   const { historySelectedDate, setHistorySelectedDate } = useUIStore();
   const [selectedDate, setSelectedDate] = useState<string | null>(historySelectedDate);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    message: string;
+    onConfirm: () => void;
+  }>({ isOpen: false, message: '', onConfirm: () => {} });
 
   useEffect(() => {
     setHistorySelectedDate(selectedDate);
@@ -82,22 +87,36 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
   }
 
   const clearHistory = async () => {
-    try {
-      await invoke("save_history", { data: "[]" });
-      setHistory([]);
-    } catch (e) {
-      console.error("清空历史记录失败", e);
-    }
+    setConfirmDialog({
+      isOpen: true,
+      message: '确定要清空所有手动提取记录吗？此操作不可恢复。',
+      onConfirm: async () => {
+        try {
+          await invoke("save_history", { data: "[]" });
+          setHistory([]);
+        } catch (e) {
+          console.error("清空历史记录失败", e);
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+    });
   }
 
   const deleteHistoryItem = async (indexToDelete: number) => {
-    try {
-      const newHistory = history.filter((_, idx) => idx !== indexToDelete);
-      await invoke("save_history", { data: JSON.stringify(newHistory) });
-      setHistory(newHistory);
-    } catch (e) {
-      console.error("删除单个历史记录失败", e);
-    }
+    setConfirmDialog({
+      isOpen: true,
+      message: '确定要删除这条记录吗？此操作不可恢复。',
+      onConfirm: async () => {
+        try {
+          const newHistory = history.filter((_, idx) => idx !== indexToDelete);
+          await invoke("save_history", { data: JSON.stringify(newHistory) });
+          setHistory(newHistory);
+        } catch (e) {
+          console.error("删除单个历史记录失败", e);
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+    });
   }
 
   return (
@@ -280,6 +299,28 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                   className="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-500 text-white rounded transition-colors"
                 >
                   确认恢复
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {confirmDialog.isOpen && (
+          <div className="absolute inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}>
+            <div className="bg-slate-900 border border-slate-700/50 rounded-xl p-6 max-w-sm w-full shadow-2xl space-y-4" onClick={e => e.stopPropagation()}>
+              <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">{confirmDialog.message}</p>
+              <div className="flex justify-end gap-3 pt-2">
+                <button 
+                  onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                >
+                  取消
+                </button>
+                <button 
+                  onClick={confirmDialog.onConfirm}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-white shadow-lg transition active:scale-95 bg-red-600/90 hover:bg-red-500 shadow-red-500/20"
+                >
+                  确定删除
                 </button>
               </div>
             </div>

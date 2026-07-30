@@ -110,6 +110,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [testingNotion, setTestingNotion] = useState(false);
   const [notionTestResult, setNotionTestResult] = useState<'none' | 'success' | 'error'>('none');
   const [notionTestErrorMsg, setNotionTestErrorMsg] = useState('');
+  const [copiedFocus, setCopiedFocus] = useState(false);
 
   const handleSave = () => {
     setLLMProviders(formProviders);
@@ -906,11 +907,13 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                       <button
                         onClick={() => {
                           navigator.clipboard.writeText(formAutoFocus);
+                          setCopiedFocus(true);
+                          setTimeout(() => setCopiedFocus(false), 2000);
                         }}
                         className="text-xs flex items-center gap-1 bg-slate-700/80 text-white px-2 py-1 rounded hover:bg-slate-600 transition shadow-sm backdrop-blur-sm"
                         title="复制提示词"
                       >
-                        一键复制
+                        {copiedFocus ? '✅ 已复制' : '一键复制'}
                       </button>
                     </div>
                     <textarea 

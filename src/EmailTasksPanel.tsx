@@ -279,9 +279,10 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
       await historyStore.save();
       
       // 触发后台静默分析 (fire-and-forget)
-      if (entry.aiResult?.originalTodos) {
+      const baseTodosForSync = entry.aiResult?.originalTodos || entry.aiResult?.todos || [];
+      if (baseTodosForSync.length > 0) {
         import('./lib/autoOptimize').then(m => {
-          m.backgroundReviewAndUpdateFocus(entry.aiResult!.originalTodos!, selectedTodos).catch(console.error);
+          m.backgroundReviewAndUpdateFocus(baseTodosForSync, selectedTodos).catch(console.error);
         });
       }
       
@@ -299,7 +300,8 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
 
   const handleExplicitFeedback = async (idx: number) => {
     const entry = history[idx];
-    if (!entry.aiResult?.originalTodos) return;
+    if (!entry.aiResult) return;
+    const originalTodosToUse = entry.aiResult.originalTodos || entry.aiResult.todos || [];
     
     // 1. Immediately set UI and Store to 'processing'
     try {
@@ -319,7 +321,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     try {
       // 2. Call AI
       const m = await import('./lib/autoOptimize');
-      await m.backgroundReviewAndUpdateFocus(entry.aiResult.originalTodos, [], feedbackText);
+      await m.backgroundReviewAndUpdateFocus(originalTodosToUse, [], feedbackText);
       
       // 3. Update store to 'completed'
       try {

@@ -153,7 +153,8 @@ export default function App() {
   };
 
   const handleExplicitFeedback = async () => {
-    if (!result || !result.originalTodos) return;
+    if (!result) return;
+    const originalTodosToUse = result.originalTodos || result.todos || [];
     const currentId = result.id;
     if (!currentId) return;
 
@@ -178,7 +179,7 @@ export default function App() {
     // 3. Call AI
     try {
       const m = await import('./lib/autoOptimize');
-      await m.backgroundReviewAndUpdateFocus(result.originalTodos, [], feedbackText);
+      await m.backgroundReviewAndUpdateFocus(originalTodosToUse, [], feedbackText);
       
       // 4. Update history to 'completed' & 'isRejected'
       try {
@@ -292,7 +293,7 @@ export default function App() {
     if (!result || result.todos.length === 0) return;
     const selectedTodos = result.todos.filter(t => t.selected !== false && !t.synced);
     if (selectedTodos.length === 0) {
-      console.warn("当前没有可同步的待办事项：您选中的条目可能已全部同步至 Notion，或未勾选任何有效事项。");
+      setError("当前没有可同步的待办事项：您选中的条目可能已全部分步至 Notion，或未勾选任何有效事项。");
       return;
     }
     
@@ -326,9 +327,10 @@ export default function App() {
       });
 
       // 触发后台静默分析 (fire-and-forget)
-      if (result.originalTodos) {
+      const baseTodosForSync = result.originalTodos || result.todos || [];
+      if (baseTodosForSync.length > 0) {
         import('./lib/autoOptimize').then(m => {
-          m.backgroundReviewAndUpdateFocus(result.originalTodos!, selectedTodos).catch(console.error);
+          m.backgroundReviewAndUpdateFocus(baseTodosForSync, selectedTodos).catch(console.error);
         });
       }
       
@@ -432,8 +434,12 @@ export default function App() {
   const handleCopyWriting = async () => {
     try {
       await navigator.clipboard.writeText(writingResult);
+      setToast({ title: '✅ 复制成功', message: '内容已复制到剪贴板' });
+      setTimeout(() => setToast(null), 3000);
     } catch (e) {
       console.error(e);
+      setToast({ title: '❌ 复制失败', message: '无法写入剪贴板，请重试' });
+      setTimeout(() => setToast(null), 3000);
     }
   }
 
