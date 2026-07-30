@@ -7,6 +7,7 @@ import { useSettingsStore, useScannerStore } from './store'
 import { syncToNotion } from './lib/notion'
 import { decodeIMAPFolder } from './lib/parser'
 import { parseEmailThread } from './lib/emailThreadParser'
+import { AutoResizeTextarea } from './components/AutoResizeTextarea'
 
 interface EmailTasksPanelProps {
   onClose: () => void;
@@ -648,14 +649,13 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                             );
                           } else {
                             return (
-                              <input 
-                                key={field.id} 
-                                type="text" 
-                                value={todo[field.name] || ''} 
-                                onChange={e => updateTodo(todo.id, field.name, e.target.value, entryIndex)} 
-                                disabled={entry.syncedToNotion} 
-                                placeholder={field.name} 
-                                className="w-[120px] shrink-0 bg-transparent text-xs border-b border-white/10 focus:border-purple-500/50 outline-none text-slate-300 px-1" 
+                              <AutoResizeTextarea
+                                key={field.id}
+                                value={todo[field.name] || ''}
+                                onChange={e => updateTodo(todo.id, field.name, e.target.value, entryIndex)}
+                                disabled={entry.syncedToNotion}
+                                placeholder={field.name}
+                                className="flex-1 min-w-[120px] bg-transparent text-xs border-b border-white/10 focus:border-purple-500/50 outline-none text-slate-300 px-1"
                               />
                             );
                           }

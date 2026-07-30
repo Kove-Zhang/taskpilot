@@ -14,6 +14,7 @@ import { parseFile } from './lib/parser'
 import { logger } from './lib/logger'
 import { useSettingsStore } from './store'
 import { compressImage } from './lib/imageUtils'
+import { AutoResizeTextarea } from './components/AutoResizeTextarea'
 
 export default function App() {
   const [input, setInput] = useState('')
@@ -527,9 +528,8 @@ export default function App() {
                   {displayFields.map(field => {
                     if (field.type === 'title' || field.type === 'rich_text') {
                       return (
-                        <input 
+                        <AutoResizeTextarea
                           key={field.id}
-                          type="text" 
                           value={todo[field.name] || ''}
                           onChange={(e) => updateTodo(todo.id, field.name, e.target.value)}
                           disabled={result.syncedToNotion}
@@ -578,14 +578,13 @@ export default function App() {
                       );
                     } else {
                       return (
-                        <input 
-                          key={field.id} 
-                          type="text" 
-                          value={todo[field.name] || ''} 
-                          onChange={e => updateTodo(todo.id, field.name, e.target.value)} 
-                          disabled={result.syncedToNotion} 
-                          placeholder={field.name} 
-                          className="w-16 bg-transparent text-xs border-b border-white/10 focus:border-purple-500/50 outline-none text-slate-300 px-1" 
+                        <AutoResizeTextarea
+                          key={field.id}
+                          value={todo[field.name] || ''}
+                          onChange={e => updateTodo(todo.id, field.name, e.target.value)}
+                          disabled={result.syncedToNotion}
+                          placeholder={field.name}
+                          className="flex-1 min-w-[120px] bg-transparent text-xs border-b border-white/10 focus:border-purple-500/50 outline-none text-slate-300 px-1"
                         />
                       );
                     }

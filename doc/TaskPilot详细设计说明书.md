@@ -287,9 +287,49 @@ const handleSyncNotion = async () => {
 
 ---
 
-## 5. Rust 底舱驱动层详细设计 (`src-tauri/src`)
+### 4.3 全局窗口化双模态与失焦拦截策略 (`src/App.tsx`)
+在 `App.tsx` 的全局生命周期与窗口事件监听中，加入了基于 `isWindowMode` 偏好的保活判断逻辑。传统的 Spotlight 应用会在失去焦点时直接隐匿，而这里引入了条件阻断：
+```typescript
+listen('tauri://blur', () => {
+  const { isWindowMode } = useSettingsStore.getState();
+  // 若当前处于全局常驻窗口模式，则强行阻断隐匿逻辑，将其作为普通桌面看板保留
+  if (isWindowMode) {
+    return;
+  }
+  // 否则执行原生的聚光灯隐匿逻辑
+  appWindow.hide();
+});
+```
 
-### 5.1 IMAP 通信与内联图像 Base64 解构引擎 (`imap_cmds.rs`)
+---
+
+## 5. 自动持续演化算法与双向数据合并策略 (`src/lib/autoOptimize.ts`)
+
+为了让系统能够根据用户长期的隐性工作习惯自动调整其《个人关注方向》，系统独立封装了 `autoOptimize.ts`：
+
+### 5.1 双数据源降序拉取与精细化清洗
+系统不仅读取前端用户手动提取的历史 (`history.enc`)，还拉取后台轮询的邮件日志 (`email_history.enc`)。为了确保只学习那些真正具备极高价值的任务，邮件数据还需经过 `isSynced: true`（已成功同步至 Notion）这一严苛的过滤漏斗，随后双表以时间戳进行 `Array.prototype.sort()` 降序合并，并 `slice(0, 30)` 提取最核心的 30 条样本。
+
+### 5.2 大模型逆向推演提示词构建
+在拿到样本集后，系统会剔除敏感凭据与原件明文，仅保留其最终生成的“待办标题与描述”，拼接为大模型推演上下文：
+```typescript
+const analysisPrompt = `
+你是一个极其敏锐的职场行为心理学家及效率工程专家。
+请深度审阅以下用户最近成功提取的 ${mergedRecords.length} 条高价值历史待办：
+【近期核心任务记录】
+${recordContext}
+
+请运用归纳演绎法，逆向推导出该用户当前最核心的几个“工作焦点（Personal Focus）”。
+你的输出将被直接写入系统的自动过滤准则中。
+`;
+// 调用大模型推理接口，并回填给 useSettingsStore 的 personalFocus
+```
+
+---
+
+## 6. Rust 底舱驱动层详细设计 (`src-tauri/src`)
+
+### 6.1 IMAP 通信与内联图像 Base64 解构引擎 (`imap_cmds.rs`)
 
 Rust 底舱使用 `imap` 与 `native_tls` 库实现 993 安全端口通信。针对包含图文附件交织的复杂邮件，底舱在 `fetch_emails_imap` 命令中执行递归的 MIME 语法树解析与内联转换：
 
@@ -354,7 +394,7 @@ pub async fn mark_email_read(
 
 ---
 
-### 5.2 多模态文件本地沙箱解析引擎 (`fs_cmds.rs` 逻辑)
+### 6.2 多模态文件沙箱解析 (`fs_cmds.rs` 逻辑)
 
 当用户向工作台拖拽文档文件时，Rust 底舱通过专门的扩展解析引擎无缝提取文本：
 1. **Word 文档 (`.docx`)**：利用 `zip` 库解压文档结构，读取内存中的 `word/document.xml`，利用 XML 标签遍历抽离出所有 `<w:t>` 文本子节点并按 `<w:p>` 段落换行组装为 UTF-8 字符串。
@@ -363,7 +403,7 @@ pub async fn mark_email_read(
 
 ---
 
-## 6. 验证与单元测试用例设计 (Verification & Unit Testing Plan)
+## 7. 系统验证与单元测试策略 (Verification & Unit Testing Plan)
 
 为确立本文档中所有类与函数的精确定位，核心模块必须关联完善的 Vitest 自动化单元测试断言设计：
 

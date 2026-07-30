@@ -41,6 +41,7 @@ graph TB
         LOGIC_AI[AI 智能路由与故障转移引擎 lib/ai.ts]
         LOGIC_SCHED[IMAP 后台轮询与防风暴中心 lib/emailScheduler.ts]
         LOGIC_PARSE[MIME 邮件切片与多模态文本解析 lib/emailThreadParser.ts & parser.ts]
+        LOGIC_OPT[自动持续演化引擎 lib/autoOptimize.ts]
     end
 
     subgraph "Tauri IPC 异步通信桥接层 (Tauri IPC Bridge Layer)"
@@ -63,13 +64,14 @@ graph TB
 
 ### 2.2 模块职责划分
 1. **表现层 (Presentation Layer)**：
-   - `App.tsx`：统筹左侧快速输入区、中间多模态文件上传响应与右侧待办结果生成与 Notion 同步面板。
+   - `App.tsx`：统筹左侧快速输入区、中间多模态文件上传响应与右侧待办结果生成与 Notion 同步面板；负责执行全局失焦侦听机制（在启用窗口化模式时自动阻断隐藏动作）。
    - `EmailTasksPanel.tsx`：承担“全景历史聚合列表”与“逐条深度审核模式”的双重视图渲染，支持查看邮件原文、局部手风琴折叠与已审核状态写回。
    - `SettingsPanel.tsx`：集中配置 API 矩阵、Notion 数据库 Schema 动态映射、《个人关注方向》等业务偏好。
    - `ZenEditorModal.tsx`：提供 900x640 沉浸式大窗编辑器，内置字数统计、AI 智能润色及防丢失变更检测拦截。
 2. **状态与逻辑层 (Logic Layer)**：
    - 采用 `Zustand` 构建支持异步数据持久化挂钩的单向数据流状态机。
    - 封装网络重试逻辑、文本清洗切片逻辑及与第三方 RESTful 接口的会话装填。
+   - 封装自动持续演化逻辑，负责合并 UI 历史与已推送邮件历史双数据源，驱动大模型进行行为学推演与偏好重塑。
 3. **Rust 底舱驱动层 (Rust Core)**：
    - 基于 Tokio 异步多线程执行器，实现非阻塞式的网络套接字连接与高密级本地计算。
 
