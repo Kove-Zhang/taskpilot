@@ -64,6 +64,8 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const [expandedTodos, setExpandedTodos] = useState<Record<string, boolean>>({});
   const [editingEntryIndex, setEditingEntryIndex] = useState<number | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [feedbackEntryIdx, setFeedbackEntryIdx] = useState<number | null>(null);
+  const [feedbackText, setFeedbackText] = useState('');
   const [activeTab, setActiveTab] = useState<'todos' | 'original'>('todos');
   const [previewDrawerOpen, setPreviewDrawerOpen] = useState(false);
   const [selectedText, setSelectedText] = useState('');
@@ -294,6 +296,25 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
       setSyncing(false);
     }
   }
+
+  const handleExplicitFeedback = async (idx: number) => {
+    const entry = history[idx];
+    if (!entry.aiResult?.originalTodos) return;
+    try {
+      const m = await import('./lib/autoOptimize');
+      await m.backgroundReviewAndUpdateFocus(entry.aiResult.originalTodos, [], feedbackText);
+      setFeedbackEntryIdx(null);
+      setFeedbackText('');
+      
+      const newHistory = [...history];
+      newHistory[idx].syncedToNotion = true; // Mark as "handled" to collapse it
+      setHistory(newHistory);
+      await historyStore.set('history', newHistory);
+      await historyStore.save();
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const toggleExpand = (key: string) => {
     setExpandedTodos(prev => ({ ...prev, [key]: !prev[key] }));
@@ -674,15 +695,45 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                   </div>
 
                   {result.todos.length > 0 && (
-                    <div className="flex justify-end mt-4">
-                       <button 
-                         onClick={() => handleSyncNotion(entryIndex)}
-                         disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || entry.syncedToNotion}
-                         className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${entry.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
-                       >
-                         {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                         <span>{syncing ? '同步中...' : entry.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
-                       </button>
+                    <div className="flex flex-col gap-3 mt-4">
+                      <div className="flex justify-end items-center gap-2">
+                        {!entry.syncedToNotion && (
+                          <button 
+                            onClick={() => setFeedbackEntryIdx(feedbackEntryIdx === entryIndex ? null : entryIndex)}
+                            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-400 bg-transparent hover:bg-white/5 hover:text-slate-300 rounded-md transition-colors"
+                          >
+                            👎 提取太差？教教 AI
+                          </button>
+                        )}
+                        <button 
+                          onClick={() => handleSyncNotion(entryIndex)}
+                          disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || entry.syncedToNotion}
+                          className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${entry.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
+                        >
+                          {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                          <span>{syncing ? '同步中...' : entry.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
+                        </button>
+                      </div>
+                      
+                      {feedbackEntryIdx === entryIndex && !entry.syncedToNotion && (
+                        <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
+                          <p className="text-xs text-slate-400">请简单说明原因，系统会将本次所有提取结果作为<span className="text-red-400">反面教材</span>发给 AI 深度学习，并废弃当前结果。</p>
+                          <textarea 
+                            value={feedbackText}
+                            onChange={e => setFeedbackText(e.target.value)}
+                            placeholder="（可选）吐槽一下，例如：不要提取没有明确动作的废话"
+                            className="w-full bg-black/50 border border-white/10 rounded-md p-2 text-sm text-slate-300 focus:outline-none focus:border-red-500/50 min-h-[60px]"
+                          />
+                          <div className="flex justify-end">
+                            <button
+                              onClick={() => handleExplicitFeedback(entryIndex)}
+                              className="flex items-center gap-2 px-4 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-500 rounded-md transition-colors"
+                            >
+                              发送纠正并废弃本次结果
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

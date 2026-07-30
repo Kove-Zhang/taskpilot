@@ -29,7 +29,8 @@ export default function App() {
   const [syncing, setSyncing] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   const [toast, setToast] = useState<{title: string, message: string} | null>(null)
-  
+  const [showFeedback, setShowFeedback] = useState(false)
+  const [feedbackText, setFeedbackText] = useState('')
   const { notionProperties, fieldMappings, isWindowMode } = useSettingsStore()
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled).sort((a, b) => {
     const orderA = fieldMappings[a.id]?.order ?? 999;
@@ -149,7 +150,21 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }
+  };
+
+  const handleExplicitFeedback = async () => {
+    if (!result || !result.originalTodos) return;
+    try {
+      const m = await import('./lib/autoOptimize');
+      // Pass Accepted = [], Rejected = ALL, Explicit Feedback = text
+      await m.backgroundReviewAndUpdateFocus(result.originalTodos, [], feedbackText);
+      setShowFeedback(false);
+      setFeedbackText('');
+      setResult(null); // Clear the result as it's discarded
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -617,15 +632,45 @@ export default function App() {
             </div>
             
             {result.todos.length > 0 && (
-              <div className="flex justify-end">
-                 <button 
-                   onClick={handleSyncNotion}
-                   disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || result.syncedToNotion}
-                   className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${result.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
-                 >
-                   {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                   <span>{syncing ? '同步中...' : result.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
-                 </button>
+              <div className="flex flex-col gap-3 mt-4">
+                <div className="flex justify-end items-center gap-2">
+                  {!result.syncedToNotion && (
+                    <button 
+                      onClick={() => setShowFeedback(!showFeedback)}
+                      className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-400 bg-transparent hover:bg-white/5 hover:text-slate-300 rounded-md transition-colors"
+                    >
+                      👎 提取太差？教教 AI
+                    </button>
+                  )}
+                  <button 
+                    onClick={handleSyncNotion}
+                    disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || result.syncedToNotion}
+                    className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${result.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
+                  >
+                    {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                    <span>{syncing ? '同步中...' : result.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
+                  </button>
+                </div>
+                
+                {showFeedback && !result.syncedToNotion && (
+                  <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
+                    <p className="text-xs text-slate-400">请简单说明原因，系统会将本次所有提取结果作为<span className="text-red-400">反面教材</span>发给 AI 深度学习，并清空当前结果。</p>
+                    <textarea 
+                      value={feedbackText}
+                      onChange={e => setFeedbackText(e.target.value)}
+                      placeholder="（可选）吐槽一下，例如：不要提取没有明确动作的废话，不要包含节假日祝福"
+                      className="w-full bg-black/50 border border-white/10 rounded-md p-2 text-sm text-slate-300 focus:outline-none focus:border-red-500/50 min-h-[60px]"
+                    />
+                    <div className="flex justify-end">
+                      <button
+                        onClick={handleExplicitFeedback}
+                        className="flex items-center gap-2 px-4 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-500 rounded-md transition-colors"
+                      >
+                        发送纠正并废弃本次结果
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

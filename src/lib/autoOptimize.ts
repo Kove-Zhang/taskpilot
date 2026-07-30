@@ -29,8 +29,9 @@ function buildNotionSchemaDescription(): string {
 }
 
 export async function backgroundReviewAndUpdateFocus(
-  aiResult: TodoItem[], 
-  finalResult: TodoItem[]
+  originalResult: TodoItem[], 
+  acceptedResult: TodoItem[],
+  explicitFeedback?: string
 ) {
   try {
     const state = useSettingsStore.getState();
@@ -38,9 +39,9 @@ export async function backgroundReviewAndUpdateFocus(
       return;
     }
 
-    const aiStr = JSON.stringify(aiResult);
-    const finalStr = JSON.stringify(finalResult);
-    if (aiStr === finalStr) {
+    const aiStr = JSON.stringify(originalResult);
+    const finalStr = JSON.stringify(acceptedResult);
+    if (aiStr === finalStr && !explicitFeedback) {
       logger.info("[AutoOptimize] 无修改，跳过更新记忆。");
       return;
     }
@@ -48,8 +49,12 @@ export async function backgroundReviewAndUpdateFocus(
     const notionSchema = buildNotionSchemaDescription();
     const currentFocus = getEffectiveFocus();
 
+    const rejectedResult = originalResult.filter(
+      orig => !acceptedResult.find(acc => acc.id === orig.id)
+    );
+
     const systemPrompt = `你是一个后台自我迭代与 Prompt 工程师助手。
-您的任务是分析用户对历史提取任务的修改痕迹，进而自动演进和更新全局的【任务提取关注点提示词】。
+您的任务是分析用户对历史提取任务的修改痕迹（特别是负向反馈），进而自动演进和更新全局的【任务提取关注点提示词】。
 
 【当前已配置的 Notion 数据结构】
 ${notionSchema}
@@ -57,16 +62,17 @@ ${notionSchema}
 【当前系统的任务提取提示词】
 ${currentFocus}
 
-【AI 初次提取结果】
-${aiStr}
+【用户认可并最终勾选同步的待办】
+${JSON.stringify(acceptedResult)}
 
-【用户最终修改后的结果】
-${finalStr}
+【被用户明确拒绝/取消勾选的待办 (反面教材)】
+${JSON.stringify(rejectedResult)}
 
+${explicitFeedback ? `【来自用户的强显式纠正指令】\n${explicitFeedback}\n` : ''}
 【约束与护栏规则】
-1. 请分析用户的修改行为。如果发现了持久且强烈的规则偏好（例如：用户总是删除某种特定类型的待办、总是修改默认优先级、总是补全某个特定字段），请归纳并输出一段**改进后的纯文本提示词**。
-2. 切勿因用户单次的特殊修改（如某一次性的网络环境错误导致的数据缺失，或临时增加的某个随机待办）而颠覆全局规则。只有在你有把握这是用户的工作流偏好时，才输出新的提示词。
-3. 如果你认为用户的修改只是偶发事件，不构成长期偏好，或者当前的提示词已经足够好，请只输出保留原样的提示词，或输出 null。
+1. 请分析用户的正向和负向修改行为。特别是被拒绝的反面教材，请总结为何它们不该被提取。如果有用户的显式指令，必须将其视为最高优先级的核心规则。
+2. 归纳并输出一段**改进后的纯文本提示词**。如果发现了持久且强烈的规则偏好（例如：用户总是删除某种特定类型的待办、用户明确指示不提取某类信息），请务必在新的提示词中添加明确的禁止性约束（如“绝对不要提取...”）。
+3. 切勿因用户单次的特殊修改而颠覆全局基本规则，但用户的显式指令必须服从。
 4. 绝对不可输出任何关于 JSON 格式、Markdown 标记的内容，只需输出纯文本规则和偏好。不要任何开场白或解释。`;
 
     const rawContent = await callAIWithFailover((provider) => {
