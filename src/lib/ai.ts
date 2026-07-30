@@ -9,6 +9,9 @@ export interface AIResult {
   todos: TodoItem[];
   originalTodos?: TodoItem[]; // For auto memory optimization diff
   syncedToNotion?: boolean;
+  feedbackStatus?: 'processing' | 'completed';
+  explicitFeedback?: string;
+  isRejected?: boolean;
 }
 
 export interface TodoItem {

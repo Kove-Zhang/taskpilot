@@ -101,13 +101,26 @@ ${explicitFeedback ? `【来自用户的强显式纠正指令】\n${explicitFeed
     }, "后台记忆更新");
 
     const newFocus = rawContent.trim();
-    if (newFocus && newFocus !== 'null' && newFocus !== currentFocus) {
+    
+    // Always dispatch if we have explicit feedback, to confirm it was processed
+    const isUpdated = newFocus && newFocus !== 'null' && newFocus !== currentFocus;
+    
+    if (isUpdated) {
       useSettingsStore.getState().setAutoOptimizedFocus(newFocus);
       logger.info("[AutoOptimize] 自动记忆更新成功", { old: currentFocus, new: newFocus });
       window.dispatchEvent(new CustomEvent('ai-evolution-completed', { 
         detail: { 
           title: "🧠 AI 认知已自我演进",
-          message: "系统深度学习了您最近的操作偏好，全局提取规则已更新完毕。" 
+          message: explicitFeedback ? "系统已根据您的纠正指令，深度学习并更新了全局提取规则。" : "系统深度学习了您最近的操作偏好，全局提取规则已更新完毕。" 
+        } 
+      }));
+    } else if (explicitFeedback) {
+      // If user explicitly provided feedback but AI decided not to change the prompt
+      logger.info("[AutoOptimize] 自动记忆未更新 (已有规则覆盖或无效纠正)", { newFocus });
+      window.dispatchEvent(new CustomEvent('ai-evolution-completed', { 
+        detail: { 
+          title: "🧠 AI 深度反思完毕",
+          message: "系统认为当前核心规则已能完全覆盖您的诉求，本次未对底层规则做大改。" 
         } 
       }));
     }

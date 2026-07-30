@@ -300,19 +300,62 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const handleExplicitFeedback = async (idx: number) => {
     const entry = history[idx];
     if (!entry.aiResult?.originalTodos) return;
+    
+    // 1. Immediately set UI and Store to 'processing'
     try {
-      const m = await import('./lib/autoOptimize');
-      await m.backgroundReviewAndUpdateFocus(entry.aiResult.originalTodos, [], feedbackText);
-      setFeedbackEntryIdx(null);
-      setFeedbackText('');
-      
       const newHistory = [...history];
-      newHistory[idx].syncedToNotion = true; // Mark as "handled" to collapse it
+      newHistory[idx].aiResult = {
+        ...newHistory[idx].aiResult!,
+        feedbackStatus: 'processing',
+        explicitFeedback: feedbackText,
+      };
       setHistory(newHistory);
       await historyStore.set('history', newHistory);
       await historyStore.save();
     } catch (e) {
+      console.error("Failed to update processing status in history", e);
+    }
+
+    try {
+      // 2. Call AI
+      const m = await import('./lib/autoOptimize');
+      await m.backgroundReviewAndUpdateFocus(entry.aiResult.originalTodos, [], feedbackText);
+      
+      // 3. Update store to 'completed'
+      try {
+        const latestHistory = await historyStore.get<EmailHistoryItem[]>('history') || [];
+        const updatedIdx = latestHistory.findIndex(h => h.timestamp === entry.timestamp && h.emailUid === entry.emailUid);
+        if (updatedIdx !== -1 && latestHistory[updatedIdx].aiResult) {
+            latestHistory[updatedIdx].aiResult!.feedbackStatus = 'completed';
+            latestHistory[updatedIdx].aiResult!.isRejected = true;
+            setHistory(latestHistory);
+            await historyStore.set('history', latestHistory);
+            await historyStore.save();
+        }
+      } catch (e) {
+        console.error("Failed to update completed status in history", e);
+      }
+
+      // 4. Update local UI to hide form after a brief delay
+      setTimeout(() => {
+        setHistory(prev => {
+           const newH = [...prev];
+           const curIdx = newH.findIndex(h => h.timestamp === entry.timestamp && h.emailUid === entry.emailUid);
+           if (curIdx !== -1) {
+             // mark syncedToNotion so it collapses the section as "handled"
+             newH[curIdx].syncedToNotion = true;
+           }
+           return newH;
+        });
+        if (feedbackEntryIdx === idx) {
+          setFeedbackEntryIdx(null);
+          setFeedbackText('');
+        }
+      }, 1500);
+      
+    } catch (e) {
       console.error(e);
+      // Fallback: remove processing status
     }
   };
 
@@ -697,7 +740,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                   {result.todos.length > 0 && (
                     <div className="flex flex-col gap-3 mt-4">
                       <div className="flex justify-end items-center gap-2">
-                        {!entry.syncedToNotion && (
+                        {!entry.syncedToNotion && result.feedbackStatus !== 'processing' && result.feedbackStatus !== 'completed' && (
                           <button 
                             onClick={() => setFeedbackEntryIdx(feedbackEntryIdx === entryIndex ? null : entryIndex)}
                             className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-400 bg-transparent hover:bg-white/5 hover:text-slate-300 rounded-md transition-colors"
@@ -707,7 +750,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                         )}
                         <button 
                           onClick={() => handleSyncNotion(entryIndex)}
-                          disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || entry.syncedToNotion}
+                          disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || entry.syncedToNotion || result.feedbackStatus === 'processing' || result.feedbackStatus === 'completed'}
                           className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${entry.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
                         >
                           {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
@@ -715,7 +758,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                         </button>
                       </div>
                       
-                      {feedbackEntryIdx === entryIndex && !entry.syncedToNotion && (
+                      {feedbackEntryIdx === entryIndex && !entry.syncedToNotion && !result.feedbackStatus && (
                         <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
                           <p className="text-xs text-slate-400">请简单说明原因，系统会将本次所有提取结果作为<span className="text-red-400">反面教材</span>发给 AI 深度学习，并废弃当前结果。</p>
                           <textarea 
@@ -732,6 +775,20 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                               发送纠正并废弃本次结果
                             </button>
                           </div>
+                        </div>
+                      )}
+
+                      {result.feedbackStatus === 'processing' && (
+                        <div className="animate-in fade-in bg-slate-800/80 border border-yellow-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
+                          <Loader2 className="w-5 h-5 text-yellow-500 animate-spin" />
+                          <span className="text-sm text-yellow-100">⏳ 正在让大模型深度反思中 (后台干活中，您可以继续处理其他事务)</span>
+                        </div>
+                      )}
+
+                      {result.feedbackStatus === 'completed' && (
+                        <div className="animate-in fade-in zoom-in bg-green-900/30 border border-green-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
+                          <Check className="w-5 h-5 text-green-400" />
+                          <span className="text-sm text-green-100">✅ 感谢调教！AI 已深刻吸取教训，相关规则已更新。</span>
                         </div>
                       )}
                     </div>

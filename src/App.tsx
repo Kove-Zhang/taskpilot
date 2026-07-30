@@ -154,15 +154,59 @@ export default function App() {
 
   const handleExplicitFeedback = async () => {
     if (!result || !result.originalTodos) return;
+    const currentId = result.id;
+    if (!currentId) return;
+
+    // 1. Immediately set the UI to 'processing'
+    setResult({ ...result, feedbackStatus: 'processing', explicitFeedback: feedbackText });
+    
+    // 2. Persist to history immediately (so it's not lost on reload)
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const historyJson = await invoke<string>("load_history").catch(() => "[]");
+      const historyArr = JSON.parse(historyJson || "[]");
+      const hIdx = historyArr.findIndex((h: any) => h.result?.id === currentId);
+      if (hIdx !== -1) {
+        historyArr[hIdx].result.feedbackStatus = 'processing';
+        historyArr[hIdx].result.explicitFeedback = feedbackText;
+        await invoke("save_history", { data: JSON.stringify(historyArr) });
+      }
+    } catch (e) {
+      console.error("Failed to update processing status in history", e);
+    }
+
+    // 3. Call AI
     try {
       const m = await import('./lib/autoOptimize');
-      // Pass Accepted = [], Rejected = ALL, Explicit Feedback = text
       await m.backgroundReviewAndUpdateFocus(result.originalTodos, [], feedbackText);
-      setShowFeedback(false);
-      setFeedbackText('');
-      setResult(null); // Clear the result as it's discarded
+      
+      // 4. Update history to 'completed' & 'isRejected'
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const historyJson = await invoke<string>("load_history").catch(() => "[]");
+        const historyArr = JSON.parse(historyJson || "[]");
+        const hIdx2 = historyArr.findIndex((h: any) => h.result?.id === currentId);
+        if (hIdx2 !== -1) {
+          historyArr[hIdx2].result.feedbackStatus = 'completed';
+          historyArr[hIdx2].result.isRejected = true;
+          await invoke("save_history", { data: JSON.stringify(historyArr) });
+        }
+      } catch (e) {
+        console.error("Failed to update completed status in history", e);
+      }
+      
+      // 5. Update local UI to show success briefly, then close
+      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: 'completed', isRejected: true } : prev);
+      setTimeout(() => {
+        setResult(prev => prev && prev.id === currentId ? null : prev);
+        setShowFeedback(false);
+        setFeedbackText('');
+      }, 1500);
+
     } catch (e) {
       console.error(e);
+      // Revert if it failed
+      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: undefined } : prev);
     }
   };
 
@@ -634,7 +678,7 @@ export default function App() {
             {result.todos.length > 0 && (
               <div className="flex flex-col gap-3 mt-4">
                 <div className="flex justify-end items-center gap-2">
-                  {!result.syncedToNotion && (
+                  {!result.syncedToNotion && result.feedbackStatus !== 'processing' && result.feedbackStatus !== 'completed' && (
                     <button 
                       onClick={() => setShowFeedback(!showFeedback)}
                       className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-400 bg-transparent hover:bg-white/5 hover:text-slate-300 rounded-md transition-colors"
@@ -644,7 +688,7 @@ export default function App() {
                   )}
                   <button 
                     onClick={handleSyncNotion}
-                    disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || result.syncedToNotion}
+                    disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || result.syncedToNotion || result.feedbackStatus === 'processing' || result.feedbackStatus === 'completed'}
                     className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${result.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
                   >
                     {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
@@ -652,7 +696,7 @@ export default function App() {
                   </button>
                 </div>
                 
-                {showFeedback && !result.syncedToNotion && (
+                {showFeedback && !result.syncedToNotion && !result.feedbackStatus && (
                   <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
                     <p className="text-xs text-slate-400">请简单说明原因，系统会将本次所有提取结果作为<span className="text-red-400">反面教材</span>发给 AI 深度学习，并清空当前结果。</p>
                     <textarea 
@@ -669,6 +713,20 @@ export default function App() {
                         发送纠正并废弃本次结果
                       </button>
                     </div>
+                  </div>
+                )}
+                
+                {result.feedbackStatus === 'processing' && (
+                  <div className="animate-in fade-in bg-slate-800/80 border border-yellow-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
+                    <Loader2 className="w-5 h-5 text-yellow-500 animate-spin" />
+                    <span className="text-sm text-yellow-100">⏳ 正在让大模型深度反思中 (后台干活中，您可以继续处理其他事务)</span>
+                  </div>
+                )}
+
+                {result.feedbackStatus === 'completed' && (
+                  <div className="animate-in fade-in zoom-in bg-green-900/30 border border-green-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
+                    <Check className="w-5 h-5 text-green-400" />
+                    <span className="text-sm text-green-100">✅ 感谢调教！AI 已深刻吸取教训，相关规则已更新。</span>
                   </div>
                 )}
               </div>
