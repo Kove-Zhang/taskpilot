@@ -1,13 +1,13 @@
 import { useSettingsStore, getSortedLLMProviders, getEffectiveFocus, type LLMProvider } from '../store'
-import { fetch } from '@tauri-apps/plugin-http';
-import { logger } from './logger';
+import { HttpRequestError, fetchWithTimeout, isRetryableHttpStatus, isRetryableTransportError } from './http'
+import { logger } from './logger'
 
 export interface AIResult {
   id?: string;
   summary: string;
   key_points?: string[];
   todos: TodoItem[];
-  originalTodos?: TodoItem[]; // For auto memory optimization diff
+  originalTodos?: TodoItem[];
   syncedToNotion?: boolean;
   feedbackStatus?: 'processing' | 'completed';
   explicitFeedback?: string;
@@ -23,36 +23,82 @@ export interface TodoItem {
   [key: string]: any;
 }
 
-/**
- * 清洗并压缩长文本，节约 Token
- * @param text 原始文本
- * @param maxLength 安全截断阈值
- */
-function compressTextForAI(text: string, maxLength: number = 8000): string {
-  if (!text) return "";
-  // 替换多个连续空行/换行为单换行，替换连续空格为单空格，去除首尾空白
-  let optimized = text.replace(/\n\s*\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
-  // 超过阈值则截断
-  if (optimized.length > maxLength) {
-    optimized = optimized.substring(0, maxLength) + '\n\n...(注：为防止 Token 溢出与历史旧任务干扰，超出阈值的尾部历史转发记录已自动精简。提炼待办和要点时请将 100% 重心放在顶部的【最新核心正文】中！)';
+type ChatMessageContent = string | Array<Record<string, unknown>>
+
+interface ChatCompletionPayload {
+  model: string
+  messages: Array<{ role: string; content: ChatMessageContent }>
+  [key: string]: unknown
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function getCompletionContent(data: unknown, providerName: string): string {
+  if (!isRecord(data) || !Array.isArray(data.choices) || data.choices.length === 0 || !isRecord(data.choices[0])) {
+    throw new Error(`服务商 [${providerName}] 返回数据结构异常：缺少 choices[0]`)
   }
-  return optimized;
+
+  const message = data.choices[0].message
+  if (!isRecord(message) || typeof message.content !== 'string' || !message.content.trim()) {
+    throw new Error(`服务商 [${providerName}] 返回数据结构异常：缺少有效 message.content`)
+  }
+
+  return message.content
+}
+
+function sanitizePayloadForLog(payload: ChatCompletionPayload): Record<string, unknown> {
+  return {
+    ...payload,
+    messages: payload.messages.map((message) => ({
+      role: message.role,
+      content: Array.isArray(message.content)
+        ? message.content.map((item) => ({
+            type: item.type,
+            text: item.type === 'text' ? `[Text length: ${String(item.text ?? '').length}]` : undefined,
+            image_url: item.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined,
+          }))
+        : `[Text length: ${message.content.length}]`,
+    })),
+  }
+}
+
+function formatProviderError(providerName: string, status: number, body: string): HttpRequestError {
+  const compactBody = body.replace(/\s+/g, ' ').slice(0, 1_000)
+  return new HttpRequestError(`API 请求失败 [${providerName}] (${status}): ${compactBody}`, { status })
+}
+
+function waitBeforeRetry(attempt: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 1_000 * attempt))
 }
 
 /**
- * 带多供应商轮换与重试机制的 AI 调用核心引擎
+ * 清洗并压缩长文本，节约 Token。
+ */
+function compressTextForAI(text: string, maxLength: number = 8000): string {
+  if (!text) return ''
+  let optimized = text.replace(/\n\s*\n/g, '\n').replace(/[ \t]+/g, ' ').trim()
+  if (optimized.length > maxLength) {
+    optimized = optimized.substring(0, maxLength) + '\n\n...(注：为防止 Token 溢出与历史旧任务干扰，超出阈值的尾部历史转发记录已自动精简。提炼待办和要点时请将 100% 重心放在顶部的【最新核心正文】中！)'
+  }
+  return optimized
+}
+
+/**
+ * 带超时、重试与多供应商轮换的 AI 调用核心引擎。
+ * 仅网络错误、超时、408、429 与 5xx 会重试或切换服务商，避免将同一内容发送给多个服务商处理配置类 4xx 错误。
  */
 export async function callAIWithFailover(
-  buildPayload: (provider: LLMProvider) => any,
-  logContextName: string
+  buildPayload: (provider: LLMProvider) => ChatCompletionPayload,
+  logContextName: string,
 ): Promise<string> {
-  const { enableFailover, failoverRetryCount, apiBaseUrl, apiKey, modelName } = useSettingsStore.getState();
-  let providers = getSortedLLMProviders().filter(p => p.enabled);
+  const { enableFailover, failoverRetryCount, apiBaseUrl, apiKey, modelName } = useSettingsStore.getState()
+  let providers = getSortedLLMProviders().filter((provider) => provider.enabled)
 
-  // 若提供商列表为空或均无可用的 API Key，尝试回退到传统的单节点设置
-  if (providers.length === 0 || providers.every(p => !p.apiKey || !p.apiKey.trim())) {
-    if (!apiKey || !apiKey.trim()) {
-      throw new Error("请先在设置中配置 API Key");
+  if (providers.length === 0 || providers.every((provider) => !provider.apiKey.trim())) {
+    if (!apiKey.trim()) {
+      throw new Error('请先在设置中配置 API Key')
     }
     providers = [{
       id: 'legacy',
@@ -61,100 +107,113 @@ export async function callAIWithFailover(
       apiKey,
       modelName,
       enabled: true,
-      priority: 1
-    }];
+      priority: 1,
+    }]
   }
 
-  const maxRetriesPerProvider = Math.max(1, failoverRetryCount || 1);
-  let lastError: Error | null = null;
+  const maxRetriesPerProvider = Math.max(1, failoverRetryCount || 1)
+  let lastRetryableError: Error | null = null
 
-  for (let pIndex = 0; pIndex < providers.length; pIndex++) {
-    const provider = providers[pIndex];
-    if (!provider.apiKey) {
-      logger.warn(`服务商 [${provider.name}] 未配置 API Key，跳过。`);
-      continue;
+  for (let providerIndex = 0; providerIndex < providers.length; providerIndex += 1) {
+    const provider = providers[providerIndex]
+    if (!provider.apiKey.trim()) {
+      logger.warn(`服务商 [${provider.name}] 未配置 API Key，跳过。`)
+      continue
     }
 
-    const payload = buildPayload(provider);
-    const normalizedUrl = provider.apiBaseUrl.endsWith('/') ? provider.apiBaseUrl.slice(0, -1) : provider.apiBaseUrl;
-    const endpoint = `${normalizedUrl}/chat/completions`;
+    const normalizedUrl = provider.apiBaseUrl.trim().replace(/\/$/, '')
+    if (!normalizedUrl) {
+      throw new Error(`服务商 [${provider.name}] 未配置 API Base URL`)
+    }
 
-    // 对当前服务商进行最大 maxRetriesPerProvider 次尝试
-    for (let attempt = 1; attempt <= maxRetriesPerProvider; attempt++) {
+    const endpoint = `${normalizedUrl}/chat/completions`
+    const payload = buildPayload(provider)
+
+    for (let attempt = 1; attempt <= maxRetriesPerProvider; attempt += 1) {
       try {
-        const logPayload = { ...payload };
-        if (logPayload.messages) {
-          logPayload.messages = logPayload.messages.map((m: any) => {
-            if (m.role === 'user' && Array.isArray(m.content)) {
-              return {
-                role: m.role,
-                content: m.content.map((c: any) => ({
-                  type: c.type,
-                  text: c.type === 'text' ? `[Text length: ${c.text?.length}]` : undefined,
-                  image_url: c.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined
-                }))
-              };
-            }
-            return m;
-          });
-        }
+        logger.info(
+          `[${logContextName}] 发起调用 -> 服务商: [${provider.name}] (模型: ${provider.modelName}, 尝试 ${attempt}/${maxRetriesPerProvider})`,
+          { payload: sanitizePayloadForLog(payload) },
+        )
 
-        logger.info(`[${logContextName}] 发起调用 -> 服务商: [${provider.name}] (模型: ${provider.modelName}, 尝试 ${attempt}/${maxRetriesPerProvider})`, { payload: logPayload });
-        
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${provider.apiKey}`
+            Authorization: `Bearer ${provider.apiKey}`,
           },
-          body: JSON.stringify(payload)
-        });
+          body: JSON.stringify(payload),
+        })
 
         if (!response.ok) {
-          const errText = await response.text();
-          const status = response.status;
-          // 判断是否为限流或服务端异常（429, 500+），或者是未达到单个供应商最大重试次数
-          const isRateLimitOrServerErr = status === 429 || status >= 500;
-          const errMsg = `API 请求失败 [${provider.name}] (${status}): ${errText}`;
-          if (isRateLimitOrServerErr || attempt < maxRetriesPerProvider) {
-            logger.warn(errMsg);
-            lastError = new Error(errMsg);
-            if (attempt < maxRetriesPerProvider) {
-              await new Promise(r => setTimeout(r, 1000 * attempt)); // 指数退避重试
-              continue; // 继续重试当前供应商
-            }
-          } else {
-            lastError = new Error(errMsg);
-            break; // 中断当前供应商重试，转入下一个供应商
+          const error = formatProviderError(provider.name, response.status, await response.text())
+          if (!isRetryableHttpStatus(response.status)) {
+            throw error
           }
+          lastRetryableError = error
+          logger.warn(error.message)
         } else {
-          const data = await response.json();
-          logger.info(`[${logContextName}] 成功收到回复 <- 服务商: [${provider.name}]`, { response: data });
-          if (!data.choices || !data.choices[0] || !data.choices[0].message) {
-            throw new Error(`服务商 [${provider.name}] 返回数据结构异常: ${JSON.stringify(data)}`);
-          }
-          return data.choices[0].message.content;
+          const content = getCompletionContent(await response.json(), provider.name)
+          logger.info(`[${logContextName}] 成功收到回复 <- 服务商: [${provider.name}]`, { contentLength: content.length })
+          return content
         }
-      } catch (err: any) {
-        logger.warn(`[${logContextName}] 呼叫异常 -> 服务商: [${provider.name}] (尝试 ${attempt}/${maxRetriesPerProvider}): ${err.message || err}`);
-        lastError = err instanceof Error ? err : new Error(String(err));
-        if (attempt < maxRetriesPerProvider) {
-          await new Promise(r => setTimeout(r, 1000 * attempt));
+      } catch (error) {
+        if (error instanceof HttpRequestError && error.status !== undefined && !isRetryableHttpStatus(error.status)) {
+          throw error
         }
+        if (!isRetryableTransportError(error) && !(error instanceof HttpRequestError && error.status !== undefined)) {
+          throw error instanceof Error ? error : new Error(String(error))
+        }
+        lastRetryableError = error instanceof Error ? error : new Error(String(error))
+        logger.warn(`[${logContextName}] 可重试调用失败 -> 服务商: [${provider.name}] (尝试 ${attempt}/${maxRetriesPerProvider}): ${lastRetryableError.message}`)
+      }
+
+      if (attempt < maxRetriesPerProvider) {
+        await waitBeforeRetry(attempt)
       }
     }
 
-    // 若当前供应商所有重试均失败，检查是否允许轮换
     if (!enableFailover) {
-      logger.warn(`未开启异常自动轮换，终止调用。`);
-      break;
+      break
     }
-    if (pIndex < providers.length - 1) {
-      logger.info(`触发大模型自动故障转移，顺位轮换至下一服务商: [${providers[pIndex + 1].name}]...`);
+    if (providerIndex < providers.length - 1) {
+      logger.info(`触发大模型自动故障转移，顺位轮换至下一服务商: [${providers[providerIndex + 1].name}]...`)
     }
   }
 
-  throw lastError || new Error("所有大模型服务商均调用失败，请检查网络或 API 配置。");
+  throw lastRetryableError || new Error('所有大模型服务商均调用失败，请检查网络或 API 配置。')
+}
+
+function normalizeExtractionResult(rawContent: string): AIResult {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawContent)
+  } catch (error) {
+    logger.error('Failed to parse AI response', { rawLength: rawContent.length, error })
+    throw new Error('AI 返回的格式无法解析为 JSON')
+  }
+
+  if (!isRecord(parsed) || typeof parsed.summary !== 'string' || !Array.isArray(parsed.todos)) {
+    throw new Error('AI 返回的 JSON 缺少 summary 或 todos 字段')
+  }
+
+  const todos = parsed.todos.map((todo, index) => {
+    if (!isRecord(todo) || typeof todo.id !== 'string' || !todo.id.trim() || typeof todo.title !== 'string' || !todo.title.trim()) {
+      throw new Error(`AI 返回的第 ${index + 1} 条待办缺少有效 id 或 title`)
+    }
+    return { ...todo, selected: true } as TodoItem
+  })
+
+  const keyPoints = Array.isArray(parsed.key_points)
+    ? parsed.key_points.filter((item): item is string => typeof item === 'string')
+    : undefined
+
+  return {
+    summary: parsed.summary,
+    key_points: keyPoints,
+    todos,
+    originalTodos: structuredClone(todos),
+  }
 }
 
 export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
@@ -276,28 +335,7 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
     return payload;
   }, "提取待办");
   
-  try {
-    const parsedResult = JSON.parse(rawContent) as AIResult;
-    if (!parsedResult.todos || !Array.isArray(parsedResult.todos)) {
-      parsedResult.todos = [];
-    }
-    if (!parsedResult.key_points || !Array.isArray(parsedResult.key_points)) {
-      parsedResult.key_points = undefined;
-    }
-    parsedResult.todos = parsedResult.todos.map(t => ({ 
-      ...t, 
-      selected: true
-    }));
-    return {
-      summary: parsedResult.summary,
-      key_points: parsedResult.key_points,
-      todos: parsedResult.todos,
-      originalTodos: JSON.parse(JSON.stringify(parsedResult.todos))
-    };
-  } catch (err) {
-    logger.error('Failed to parse AI response', { rawContent, error: err });
-    throw new Error('AI 返回的格式无法解析为 JSON');
-  }
+  return normalizeExtractionResult(rawContent)
 }
 
 export async function generateWriting(

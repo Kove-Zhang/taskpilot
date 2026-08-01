@@ -9,9 +9,8 @@ export const config: WebdriverIO.Config = {
   maxInstances: 1,
   capabilities: [
     {
-      maxInstances: 1,
       'tauri:options': {
-        application: '../../src-tauri/target/release/app.exe',
+        application: './src-tauri/target/debug/app.exe',
       },
     },
   ],
@@ -23,7 +22,7 @@ export const config: WebdriverIO.Config = {
   },
   
   // ensure the rust project is built since we expect this binary to exist for the webdriver sessions
-  onPrepare: () => spawnSync('cargo', ['build', '--release'], { cwd: './src-tauri' }),
+  onPrepare: () => spawnSync('cargo', ['build'], { cwd: './src-tauri', stdio: 'inherit' }),
 
   // ensure we are running `tauri-driver` before the session starts so that webdriverio can connect to it
   beforeSession: () => {

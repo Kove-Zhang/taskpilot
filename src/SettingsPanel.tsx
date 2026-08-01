@@ -2,13 +2,14 @@ import { useEffect, useState } from 'react'
 import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown, Mail, Plus, Trash2, ShieldCheck, ChevronDown, ChevronUp, Lock, Maximize2 } from 'lucide-react'
 import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from './store'
 import { logger } from './lib/logger'
-import { fetch } from '@tauri-apps/plugin-http'
+import { fetchWithTimeout } from './lib/http'
+import { notionDatabaseEndpoint, notionHeaders } from './lib/notionApi'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ZenEditorModal } from './components/ZenEditorModal'
 
 
-import { decodeIMAPFolder } from './lib/parser'
+import { decodeIMAPFolder } from './lib/imapFolder'
 interface SettingsPanelProps {
 
   onClose: () => void;
@@ -151,30 +152,46 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   };
 
   useEffect(() => {
-    import('@tauri-apps/api/core').then(m => {
-      if (isRecordingShortcut) {
-        m.invoke('unregister_shortcut').catch(console.error);
-      } else {
-        m.invoke('update_shortcut', { shortcut: formGlobalShortcut }).catch(console.error);
-      }
-    });
+    let disposed = false
 
-    const blockSystemMenu = (e: KeyboardEvent) => {
-      if (isRecordingShortcut) {
-        e.preventDefault();
-        // Allow the React synthetic event to still process it, or we can just let React handle it.
-        // preventDefault at window level often stops OS defaults like Alt+Space menu in Chromium.
+    const syncShortcutRecordingState = async () => {
+      try {
+        const api = await import('@tauri-apps/api/core')
+        if (disposed) return
+
+        await api.invoke('set_recording_mode', { isRecording: isRecordingShortcut })
+        if (isRecordingShortcut) {
+          await api.invoke('unregister_shortcut')
+        } else {
+          // Editing a shortcut is only a draft operation. Restore the persisted shortcut until the user saves.
+          await api.invoke('update_shortcut', { shortcut: globalShortcut })
+        }
+      } catch (error) {
+        console.error('Failed to synchronize shortcut recording state', error)
       }
-    };
-    
-    if (isRecordingShortcut) {
-      window.addEventListener('keydown', blockSystemMenu, { capture: true });
     }
-    
+
+    void syncShortcutRecordingState()
+
+    const blockSystemMenu = (event: KeyboardEvent) => {
+      if (isRecordingShortcut) {
+        event.preventDefault()
+      }
+    }
+
+    if (isRecordingShortcut) {
+      window.addEventListener('keydown', blockSystemMenu, { capture: true })
+    }
+
     return () => {
-      window.removeEventListener('keydown', blockSystemMenu, { capture: true });
-    };
-  }, [isRecordingShortcut, formGlobalShortcut]);
+      disposed = true
+      window.removeEventListener('keydown', blockSystemMenu, { capture: true })
+    }
+  }, [isRecordingShortcut, globalShortcut])
+
+  useEffect(() => () => {
+    void import('@tauri-apps/api/core').then((api) => api.invoke('set_recording_mode', { isRecording: false })).catch(console.error)
+  }, [])
 
   const buildShortcutString = (e: React.KeyboardEvent) => {
     const parts = [];
@@ -266,7 +283,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       const normalizedUrl = provider.apiBaseUrl.trim().endsWith('/') ? provider.apiBaseUrl.trim().slice(0, -1) : provider.apiBaseUrl.trim();
       logger.info('Testing provider API connection...', { baseUrl: normalizedUrl, model: provider.modelName });
 
-      const response = await fetch(`${normalizedUrl}/chat/completions`, {
+      const response = await fetchWithTimeout(`${normalizedUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -309,12 +326,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     
     try {
       logger.info('Testing Notion connection...');
-      const response = await fetch(`https://api.notion.com/v1/databases/${formNotionDb}`, {
+      const response = await fetchWithTimeout(notionDatabaseEndpoint(formNotionDb), {
         method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${formNotionKey}`,
-          'Notion-Version': '2022-06-28'
-        }
+        headers: notionHeaders(formNotionKey),
       });
 
       if (!response.ok) {
@@ -330,6 +344,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           let options = undefined;
           if (val.type === 'select' && val.select?.options) {
             options = val.select.options.map((o: any) => o.name);
+          } else if (val.type === 'status' && val.status?.options) {
+            options = val.status.options.map((o: any) => o.name);
           } else if (val.type === 'multi_select' && val.multi_select?.options) {
             options = val.multi_select.options.map((o: any) => o.name);
           }
@@ -420,7 +436,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         }
       }
 
-      const response = await fetch(`${normalizedUrl}/chat/completions`, {
+      const response = await fetchWithTimeout(`${normalizedUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -723,6 +739,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                           <label className="text-xs text-slate-400 mb-1 block font-mono">API Base URL</label>
                           <input
                             type="text"
+                            data-testid={index === 0 ? 'settings-api-base-url' : undefined}
                             value={provider.apiBaseUrl}
                             onChange={(e) => {
                               const updated = [...formProviders];
@@ -741,6 +758,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                           </label>
                           <input
                             type="password"
+                            data-testid={index === 0 ? 'settings-api-key' : undefined}
                             value={provider.apiKey}
                             onChange={(e) => {
                               const updated = [...formProviders];
@@ -1544,7 +1562,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                         const m = await import('@tauri-apps/api/core');
                         await m.invoke('clear_log');
                         btn.innerText = '已清空！';
-                      } catch (err) {
+                      } catch {
                         btn.innerText = '清空失败';
                       }
                       setTimeout(() => { btn.innerText = originalText; }, 2000);
@@ -1567,6 +1585,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             所有文件（PDF/Word/Excel 等）的解析读取 100% 在本地沙箱执行。提取和润色过程会调用您配置的 API Base URL 发送请求，请勿向不受信任的服务端发送机密信息。
           </p>
           <button 
+            data-testid="save-settings"
             onClick={handleSave}
             className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md shadow-lg shadow-purple-500/20 transition-all active:scale-95 shrink-0 whitespace-nowrap self-end sm:self-auto"
           >

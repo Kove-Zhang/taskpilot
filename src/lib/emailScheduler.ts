@@ -1,6 +1,6 @@
 import { useSettingsStore, useScannerStore } from '../store';
 import { invoke } from '@tauri-apps/api/core';
-import { decodeIMAPFolder } from './parser';
+import { decodeIMAPFolder } from './imapFolder';
 import { extractTodosFromContent, type AIResult } from './ai';
 import { parseEmailThread } from './emailThreadParser';
 import { syncToNotion } from './notion';
@@ -12,6 +12,7 @@ export interface EmailHistoryItem {
     batchId: string;
     timestamp: number;
     emailUid: number;
+    emailUidValidity?: number;
     subject: string;
     sender: string;
     status: 'success' | 'failed';
@@ -27,6 +28,22 @@ export interface EmailHistoryItem {
 }
 
 const historyStore = new LazyStore('email_history.enc');
+
+interface FetchedEmail {
+    uid: number;
+    uid_validity?: number;
+    sender: string;
+    subject: string;
+    date: string;
+    body_text: string;
+    html_body?: string | null;
+    inline_images?: string[];
+    parse_error?: string | null;
+}
+
+function getEmailFingerprint(folder: string, email: Pick<FetchedEmail, 'uid' | 'uid_validity'>): string {
+    return `${folder}_${email.uid_validity ?? 'legacy'}_${email.uid}`;
+}
 
 // In-memory flag to prevent overlapping runs
 let lastRunTimestamp = 0;
@@ -64,9 +81,9 @@ function shouldRunNow(): boolean {
     }
 }
 
-async function processSingleEmail(email: any, batchId: string, folder: string, processedUids: string[]): Promise<EmailHistoryItem> {
+async function processSingleEmail(email: FetchedEmail, batchId: string, folder: string, processedUids: string[]): Promise<EmailHistoryItem> {
     const { emailConfig } = useSettingsStore.getState();
-    const fingerprint = `${folder}_${email.uid}`;
+    const fingerprint = getEmailFingerprint(folder, email);
     
     if (processedUids.includes(fingerprint)) {
         logger.info(`Email UID ${email.uid} in ${folder} already processed, skipping.`);
@@ -74,6 +91,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
             batchId,
             timestamp: Date.now(),
             emailUid: email.uid,
+            emailUidValidity: email.uid_validity,
             subject: email.subject,
             sender: email.sender,
             emailDate: email.date,
@@ -81,7 +99,28 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
             syncedToNotion: false, // or undefined, as it was skipped
             folder,
             rawBodyText: email.body_text,
-            htmlBody: email.html_body,
+            htmlBody: email.html_body || undefined,
+            inlineImages: email.inline_images || []
+        };
+    }
+
+    if (email.parse_error) {
+        const parseError = `邮件 UID ${email.uid} 无法解析：${email.parse_error}`;
+        logger.error(parseError);
+        processedUids.push(fingerprint);
+        return {
+            batchId,
+            timestamp: Date.now(),
+            emailUid: email.uid,
+            emailUidValidity: email.uid_validity,
+            subject: email.subject,
+            sender: email.sender,
+            emailDate: email.date,
+            status: 'failed',
+            error: parseError,
+            folder,
+            rawBodyText: email.body_text,
+            htmlBody: email.html_body || undefined,
             inlineImages: email.inline_images || []
         };
     }
@@ -176,6 +215,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                 batchId,
                 timestamp: Date.now(),
                 emailUid: email.uid,
+                emailUidValidity: email.uid_validity,
                 subject: email.subject,
                 sender: email.sender,
                 emailDate: email.date,
@@ -184,7 +224,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                 syncedToNotion: synced,
                 folder,
                 rawBodyText: email.body_text,
-                htmlBody: email.html_body,
+                htmlBody: email.html_body || undefined,
                 inlineImages: compressedImages
             };
 
@@ -203,6 +243,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
         batchId,
         timestamp: Date.now(),
         emailUid: email.uid,
+        emailUidValidity: email.uid_validity,
         subject: email.subject,
         sender: email.sender,
         emailDate: email.date,
@@ -211,7 +252,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
         aiResult,
         folder,
         rawBodyText: email.body_text,
-        htmlBody: email.html_body,
+        htmlBody: email.html_body || undefined,
         inlineImages: compressedImages
     };
 }
@@ -258,17 +299,19 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                 scannerStore.setProgressMsg(`拉取目录 ${decodeIMAPFolder(folder)}...`);
                 const sinceDays = isManual ? (emailConfig.manualReadDays || 7) : (emailConfig.autoReadDays || 3);
                 const emails = await invoke('fetch_emails', {
-                    host: emailConfig.host,
-                    port: emailConfig.port,
-                    user: emailConfig.user,
-                    pass: emailConfig.pass,
-                    ssl: emailConfig.ssl,
-                    folder: folder,
-                    unreadOnly: true,
-                    sinceDays: sinceDays
-                }) as any[];
+                    request: {
+                        host: emailConfig.host,
+                        port: emailConfig.port,
+                        user: emailConfig.user,
+                        pass: emailConfig.pass,
+                        ssl: emailConfig.ssl,
+                        folder,
+                        unreadOnly: !isManual,
+                        sinceDays
+                    }
+                }) as FetchedEmail[];
 
-                logger.info(`Fetched ${emails.length} unread emails from ${folder}.`);
+                logger.info(`Fetched ${emails.length} ${isManual ? 'recent' : 'unread'} emails from ${folder}.`);
 
                 let processedCount = 0;
                 for (const email of emails) {
@@ -288,14 +331,10 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                     const shortSub = email.subject ? (email.subject.length > 18 ? email.subject.slice(0, 18) + '...' : email.subject) : '无主题';
                     scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${shortSub}`);
                     const result = await processSingleEmail(email, batchId, folder, processedUids);
-                    if (!processedUids.includes(`${folder}_${email.uid}`)) {
-                        // If it wasn't added inside processSingleEmail, it means it skipped or failed
-                    }
-                    
                     // Immediately save to history for real-time feedback (with deduplication for retried failed items)
                     if (result.aiResult || result.status === 'failed') {
                         let existing: EmailHistoryItem[] = await historyStore.get('history') || [];
-                        const existingIdx = existing.findIndex(item => item.folder === result.folder && item.emailUid === result.emailUid);
+                        const existingIdx = existing.findIndex(item => item.folder === result.folder && item.emailUidValidity === result.emailUidValidity && item.emailUid === result.emailUid);
                         if (existingIdx >= 0) {
                             existing[existingIdx] = result;
                         } else {

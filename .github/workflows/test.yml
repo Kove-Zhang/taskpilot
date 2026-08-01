@@ -9,43 +9,49 @@ on:
 jobs:
   test:
     runs-on: windows-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '20'
         cache: 'npm'
-        
+
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: x86_64-pc-windows-msvc
-        
+
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
-        
+
     - name: Install Frontend Dependencies
       run: npm ci
-      
-    - name: Lint and Type Check
+
+    - name: Lint
+      run: npm run lint
+
+    - name: Type Check
       run: |
-        npm run lint || true
         npx tsc -b
-        
+        npm run test:e2e:types
+
     - name: Frontend Unit Tests
       run: npm run test
-      
-    - name: Backend Unit Tests
+
+    - name: Backend Quality Checks
       working-directory: ./src-tauri
-      run: cargo test
-      
+      run: |
+        cargo fmt -- --check
+        cargo clippy --all-targets -- -D warnings
+        cargo test
+
     - name: E2E Tests
       run: |
-        cargo install tauri-driver
+        cargo install tauri-driver --locked
         npm run test:e2e
-        
+
     - name: Tauri Build Check
       run: npm run tauri build

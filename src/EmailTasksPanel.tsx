@@ -1,11 +1,11 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2, Trash2, Play, Pause, Square, Rocket, ScrollText, ArrowRight, Clock, UploadCloud, Terminal } from 'lucide-react'
 import { LazyStore } from '@tauri-apps/plugin-store'
 import type { EmailHistoryItem } from './lib/emailScheduler'
 import { forceRunEmailScanner } from './lib/emailScheduler'
 import { useSettingsStore, useScannerStore } from './store'
 import { syncToNotion } from './lib/notion'
-import { decodeIMAPFolder } from './lib/parser'
+import { decodeIMAPFolder } from './lib/imapFolder'
 import { parseEmailThread } from './lib/emailThreadParser'
 import { AutoResizeTextarea } from './components/AutoResizeTextarea'
 
@@ -41,7 +41,7 @@ const getDarkModeHtml = (html: string) => {
       }
     }
     return doc.body.innerHTML;
-  } catch (e) {
+  } catch {
     return html;
   }
 };
@@ -105,7 +105,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     });
   }, [history, reviewFilterUnreviewed, reviewFilterReviewed]);
 
-  const toggleReviewed = async (originalIndex: number, targetStatus?: boolean) => {
+  const toggleReviewed = useCallback(async (originalIndex: number, targetStatus?: boolean) => {
     const newHistory = [...history];
     const current = newHistory[originalIndex];
     if (!current) return;
@@ -114,7 +114,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     setHistory(newHistory);
     await historyStore.set('history', newHistory);
     await historyStore.save();
-  };
+  }, [history]);
 
   useEffect(() => {
     if (!inReviewMode) return;
@@ -153,7 +153,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [inReviewMode, reviewList, reviewIndex]);
+  }, [inReviewMode, reviewFilterReviewed, reviewIndex, reviewList, toggleReviewed]);
 
   useEffect(() => {
     setActiveTab('todos');

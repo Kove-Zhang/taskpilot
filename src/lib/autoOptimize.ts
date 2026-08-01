@@ -2,7 +2,7 @@ import { useSettingsStore, getEffectiveFocus } from '../store';
 import type { TodoItem } from './ai';
 import { callAIWithFailover } from './ai';
 import { logger } from './logger';
-import { invoke } from '@tauri-apps/api/core';
+import { loadHistory } from './history';
 import { LazyStore } from '@tauri-apps/plugin-store';
 
 function buildNotionSchemaDescription(): string {
@@ -130,9 +130,9 @@ ${explicitFeedback ? `【来自用户的强显式纠正指令】\n${explicitFeed
 }
 
 export async function analyzeHistoryAndUpdateFocus() {
-  let dataJson;
+  let data;
   try {
-    dataJson = await invoke<string>("load_history");
+    data = await loadHistory();
   } catch (err: any) {
     const errorStr = typeof err === 'string' ? err : (err.message || String(err));
     if (errorStr.includes("aead::Error")) {
@@ -140,7 +140,6 @@ export async function analyzeHistoryAndUpdateFocus() {
     }
     throw new Error(errorStr);
   }
-  const data = JSON.parse(dataJson || "[]");
   
   const emailHistoryStore = new LazyStore('email_history.enc');
   const emailData: any[] = await emailHistoryStore.get('history') || [];

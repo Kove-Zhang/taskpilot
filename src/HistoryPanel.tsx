@@ -1,15 +1,8 @@
 import { useState, useEffect, useMemo } from 'react'
 import { X, Clock, Trash2, ChevronDown, ChevronUp, Loader2 } from 'lucide-react'
-import { invoke } from '@tauri-apps/api/core'
 import type { AIResult } from './lib/ai'
+import { loadHistory, updateHistory, type HistoryEntry } from './lib/history'
 import { useSettingsStore, useUIStore } from './store'
-
-interface HistoryEntry {
-  timestamp: string;
-  result: AIResult;
-  input?: string;
-  images?: string[];
-}
 
 interface HistoryPanelProps {
   onClose: () => void;
@@ -64,23 +57,21 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
       return;
     }
     setSelectedDate(dates[0]);
-  }, [grouped, dates]);
+  }, [grouped, dates, selectedDate]);
 
   const toggleExpand = (key: string) => {
     setExpandedTodos(prev => ({ ...prev, [key]: !prev[key] }));
   };
 
   useEffect(() => {
-    loadHistory();
+    void refreshHistory();
   }, []);
 
-  const loadHistory = async () => {
+  const refreshHistory = async () => {
     try {
-      const dataJson = await invoke<string>("load_history");
-      const data = JSON.parse(dataJson || "[]") as HistoryEntry[];
-      setHistory(data);
-    } catch (e) {
-      console.error("加载历史记录失败", e);
+      setHistory(await loadHistory());
+    } catch (error) {
+      console.error('加载历史记录失败', error);
     } finally {
       setLoading(false);
     }
@@ -92,10 +83,9 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
       message: '确定要清空所有手动提取记录吗？此操作不可恢复。',
       onConfirm: async () => {
         try {
-          await invoke("save_history", { data: "[]" });
-          setHistory([]);
-        } catch (e) {
-          console.error("清空历史记录失败", e);
+          setHistory(await updateHistory(() => []));
+        } catch (error) {
+          console.error('清空历史记录失败', error);
         }
         setConfirmDialog(prev => ({ ...prev, isOpen: false }));
       }
@@ -108,11 +98,9 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
       message: '确定要删除这条记录吗？此操作不可恢复。',
       onConfirm: async () => {
         try {
-          const newHistory = history.filter((_, idx) => idx !== indexToDelete);
-          await invoke("save_history", { data: JSON.stringify(newHistory) });
-          setHistory(newHistory);
-        } catch (e) {
-          console.error("删除单个历史记录失败", e);
+          setHistory(await updateHistory((current) => current.filter((_, index) => index !== indexToDelete)));
+        } catch (error) {
+          console.error('删除单个历史记录失败', error);
         }
         setConfirmDialog(prev => ({ ...prev, isOpen: false }));
       }

@@ -1,20 +1,26 @@
-import { useState, useRef, useEffect } from 'react'
+import { lazy, Suspense, useState, useRef, useEffect } from 'react'
 import type { ClipboardEvent, ChangeEvent, DragEvent } from 'react'
 import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail, Minus, Maximize2 } from 'lucide-react'
-import SettingsPanel from './SettingsPanel'
-import HistoryPanel from './HistoryPanel'
-import EmailTasksPanel from './EmailTasksPanel'
 import { startEmailScheduler, stopEmailScheduler } from './lib/emailScheduler'
 import { extractTodosFromContent, generateWriting } from './lib/ai'
 import type { AIResult } from './lib/ai'
 import { syncToNotion } from './lib/notion'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { parseFile } from './lib/parser'
+import { assertFileBatchWithinLimits } from './lib/fileLimits'
 import { logger } from './lib/logger'
 import { useSettingsStore } from './store'
 import { compressImage } from './lib/imageUtils'
+import { updateHistory } from './lib/history'
 import { AutoResizeTextarea } from './components/AutoResizeTextarea'
+
+const SettingsPanel = lazy(() => import('./SettingsPanel'))
+const HistoryPanel = lazy(() => import('./HistoryPanel'))
+const EmailTasksPanel = lazy(() => import('./EmailTasksPanel'))
+
+function PanelLoading() {
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/70 text-sm text-slate-200">正在加载面板...</div>
+}
 
 export default function App() {
   const [input, setInput] = useState('')
@@ -123,34 +129,47 @@ export default function App() {
   }
 
   const handleFiles = async (files: FileList | File[]) => {
-    setLoading(true);
-    setError('');
-    let appendedText = "";
+    const selectedFiles = Array.from(files)
     try {
-      logger.info(`Processing ${files.length} dropped/selected files`);
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
+      assertFileBatchWithinLimits(selectedFiles)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setError(`解析文件出错: ${message}`)
+      return
+    }
+
+    setLoading(true)
+    setError('')
+    let appendedText = ''
+    try {
+      logger.info(`Processing ${selectedFiles.length} dropped/selected files`)
+      const { parseFile } = await import('./lib/parser')
+      for (const file of selectedFiles) {
         if (file.type.startsWith('image/')) {
           try {
-            const base64 = await compressImage(file);
-            setImages(prev => [...prev, base64]);
-          } catch (err) {
-            logger.error('File image compression failed', err);
+            const base64 = await compressImage(file)
+            setImages(prev => [...prev, base64])
+          } catch (error) {
+            logger.error('File image compression failed', error)
           }
         } else {
-          const text = await parseFile(file);
-          appendedText += `\n[文件 ${file.name}]:\n${text}\n`;
+          const text = await parseFile(file)
+          appendedText += `
+[文件 ${file.name}]:
+${text}
+`
         }
       }
       if (appendedText) {
-        setInput(prev => prev + appendedText);
+        setInput(prev => prev + appendedText)
       }
-    } catch (err: any) {
-      setError(`解析文件出错: ${err.message}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setError(`解析文件出错: ${message}`)
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
-  };
+  }
 
   const handleExplicitFeedback = async () => {
     if (!result) return;
@@ -163,17 +182,11 @@ export default function App() {
     
     // 2. Persist to history immediately (so it's not lost on reload)
     try {
-      const { invoke } = await import('@tauri-apps/api/core');
-      const historyJson = await invoke<string>("load_history").catch(() => "[]");
-      const historyArr = JSON.parse(historyJson || "[]");
-      const hIdx = historyArr.findIndex((h: any) => h.result?.id === currentId);
-      if (hIdx !== -1) {
-        historyArr[hIdx].result.feedbackStatus = 'processing';
-        historyArr[hIdx].result.explicitFeedback = feedbackText;
-        await invoke("save_history", { data: JSON.stringify(historyArr) });
-      }
-    } catch (e) {
-      console.error("Failed to update processing status in history", e);
+      await updateHistory((history) => history.map((entry) => entry.result?.id === currentId
+        ? { ...entry, result: { ...entry.result, feedbackStatus: 'processing', explicitFeedback: feedbackText } }
+        : entry));
+    } catch (error) {
+      console.error('Failed to update processing status in history', error);
     }
 
     // 3. Call AI
@@ -183,17 +196,11 @@ export default function App() {
       
       // 4. Update history to 'completed' & 'isRejected'
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const historyJson = await invoke<string>("load_history").catch(() => "[]");
-        const historyArr = JSON.parse(historyJson || "[]");
-        const hIdx2 = historyArr.findIndex((h: any) => h.result?.id === currentId);
-        if (hIdx2 !== -1) {
-          historyArr[hIdx2].result.feedbackStatus = 'completed';
-          historyArr[hIdx2].result.isRejected = true;
-          await invoke("save_history", { data: JSON.stringify(historyArr) });
-        }
-      } catch (e) {
-        console.error("Failed to update completed status in history", e);
+        await updateHistory((history) => history.map((entry) => entry.result?.id === currentId
+          ? { ...entry, result: { ...entry.result, feedbackStatus: 'completed', isRejected: true } }
+          : entry));
+      } catch (error) {
+        console.error('Failed to update completed status in history', error);
       }
       
       // 5. Update local UI to show success briefly, then close
@@ -260,25 +267,14 @@ export default function App() {
       setResult(res);
       logger.info('AI extraction success', { todosCount: res.todos.length });
       try {
-        let historyJson = "[]";
-        try {
-          historyJson = await invoke<string>("load_history");
-        } catch (loadErr) {
-          logger.warn("Failed to load old history, starting fresh.", loadErr);
-        }
-        let historyArr = JSON.parse(historyJson || "[]");
-        historyArr.unshift({ 
-          timestamp: new Date().toISOString(), 
+        await updateHistory((history) => [{
+          timestamp: new Date().toISOString(),
           result: res,
-          input: input,
-          images: images
-        });
-        if (historyArr.length > 50) {
-          historyArr = historyArr.slice(0, 50);
-        }
-        await invoke("save_history", { data: JSON.stringify(historyArr) });
-      } catch(e) {
-        logger.warn("Failed to save history", e);
+          input,
+          images,
+        }, ...history].slice(0, 50));
+      } catch (error) {
+        logger.warn('Failed to save history', error);
       }
     } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
@@ -334,22 +330,17 @@ export default function App() {
         });
       }
       
-      const dataJson = await invoke<string>("load_history").catch(() => "[]");
-      let history = JSON.parse(dataJson || "[]");
-      history = history.map((h: any) => h.result?.id === result.id ? { 
-        ...h, 
-        result: { 
-          ...result, 
-          syncedToNotion: failed.length === 0,
-          todos: result.todos.map((t: any) => {
-            if (succeeded.find(s => s.id === t.id)) {
-              return { ...t, synced: true };
-            }
-            return t;
-          })
-        } 
-      } : h);
-      await invoke("save_history", { data: JSON.stringify(history) }).catch(() => {});
+      const succeededIds = new Set(succeeded.map((item) => item.id));
+      await updateHistory((history) => history.map((entry) => entry.result?.id === result.id
+        ? {
+            ...entry,
+            result: {
+              ...result,
+              syncedToNotion: failed.length === 0,
+              todos: result.todos.map((todo) => succeededIds.has(todo.id) ? { ...todo, synced: true } : todo),
+            },
+          }
+        : entry));
       if (failed.length === 0) {
         logger.info('Sync to Notion complete (all success)');
       }
@@ -509,6 +500,7 @@ export default function App() {
               onClick={() => setShowSettings(true)}
               className="p-2 hover:bg-white/10 rounded-full transition-colors group"
               title="设置"
+              data-testid="open-settings"
             >
               <Settings className="w-5 h-5 text-slate-400 group-hover:text-white" />
             </button>
@@ -801,9 +793,9 @@ export default function App() {
         </div>
       )}
 
-      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
-      {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} />}
-      {showEmailHistory && <EmailTasksPanel onClose={() => setShowEmailHistory(false)} />}
+      {showSettings && <Suspense fallback={<PanelLoading />}><SettingsPanel onClose={() => setShowSettings(false)} /></Suspense>}
+      {showHistory && <Suspense fallback={<PanelLoading />}><HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} /></Suspense>}
+      {showEmailHistory && <Suspense fallback={<PanelLoading />}><EmailTasksPanel onClose={() => setShowEmailHistory(false)} /></Suspense>}
 
       {toast && (
         <div className="fixed bottom-6 right-6 z-[100] animate-in slide-in-from-bottom-8 slide-in-from-right-8 fade-in duration-500">

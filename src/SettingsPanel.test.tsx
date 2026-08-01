@@ -1,5 +1,6 @@
-import { render, screen, fireEvent } from '@testing-library/react'
-import { describe, it, expect, beforeEach } from 'vitest'
+import { invoke } from '@tauri-apps/api/core'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import SettingsPanel from './SettingsPanel'
 import { useSettingsStore } from './store'
 import '@testing-library/jest-dom'
@@ -33,3 +34,25 @@ describe('SettingsPanel', () => {
     expect(input).toHaveValue('https://newapi.com/v1')
   })
 })
+
+  it('unregisters the persisted global shortcut while recording and restores it after blur', async () => {
+    vi.mocked(invoke).mockClear()
+    render(<SettingsPanel onClose={() => {}} />)
+
+    await waitFor(() => expect(invoke).toHaveBeenCalled())
+    vi.mocked(invoke).mockClear()
+
+    const recorder = screen.getByTitle('点击此处后直接按下您想使用的组合键（如 Ctrl+Shift+S）')
+    fireEvent.focus(recorder)
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('set_recording_mode', { isRecording: true })
+      expect(invoke).toHaveBeenCalledWith('unregister_shortcut')
+    })
+
+    fireEvent.blur(recorder)
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('set_recording_mode', { isRecording: false })
+      expect(invoke).toHaveBeenCalledWith('update_shortcut', { shortcut: 'Alt+Space' })
+    })
+  })

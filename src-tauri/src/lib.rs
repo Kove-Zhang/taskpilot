@@ -1,39 +1,49 @@
-use tauri::Manager;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-use aes_gcm::{aead::{Aead, AeadCore, KeyInit, OsRng}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use keyring::Entry;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
-use sha2::{Sha256, Digest};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use keyring::Entry;
-use std::io::Write;
+use tauri::Manager;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 mod imap_cmds;
-use imap_cmds::{get_email_folders, fetch_emails, mark_email_read};
+use imap_cmds::{fetch_emails, get_email_folders, mark_email_read};
 
 struct AppState {
     is_recording: AtomicBool,
 }
 
-fn get_storage_path(app_handle: &tauri::AppHandle) -> PathBuf {
-    let mut path = app_handle.path().app_data_dir().unwrap();
-    fs::create_dir_all(&path).unwrap();
-    path.push("history.enc");
-    path
+fn app_data_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let path = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取应用数据目录: {error}"))?;
+    fs::create_dir_all(&path).map_err(|error| format!("无法创建应用数据目录: {error}"))?;
+    Ok(path)
 }
 
-fn get_key_path(app_handle: &tauri::AppHandle) -> PathBuf {
-    let mut path = app_handle.path().app_data_dir().unwrap();
-    fs::create_dir_all(&path).unwrap();
+fn get_storage_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut path = app_data_dir(app_handle)?;
+    path.push("history.enc");
+    Ok(path)
+}
+
+fn get_key_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut path = app_data_dir(app_handle)?;
     path.push("secret.key");
-    path
+    Ok(path)
 }
 
 fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, String> {
     let entry = Entry::new("task-pilot", "history-key").map_err(|e| e.to_string())?;
-    
+
     // Check if secure key exists
     if let Ok(password) = entry.get_password() {
         if let Ok(key) = STANDARD.decode(&password) {
@@ -42,9 +52,9 @@ fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, 
             }
         }
     }
-    
+
     // Check legacy file
-    let key_path = get_key_path(app_handle);
+    let key_path = get_key_path(app_handle)?;
     if key_path.exists() {
         if let Ok(key_bytes) = fs::read(&key_path) {
             if key_bytes.len() == 32 {
@@ -55,24 +65,26 @@ fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, 
             }
         }
     }
-    
+
     // Generate new key
     let key = Aes256Gcm::generate_key(OsRng);
     let key_vec = key.to_vec();
-    
+
     // Always write to local file as a reliable fallback
     let _ = fs::write(&key_path, &key_vec);
     let _ = entry.set_password(&STANDARD.encode(&key_vec));
-    
+
     Ok(key_vec)
 }
 
 fn encrypt_history(data: &str, key_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(key_bytes).map_err(|e| e.to_string())?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
-    
-    let ciphertext = cipher.encrypt(&nonce, data.as_bytes().as_ref()).map_err(|e| e.to_string())?;
-    
+
+    let ciphertext = cipher
+        .encrypt(&nonce, data.as_bytes().as_ref())
+        .map_err(|e| e.to_string())?;
+
     let mut final_data = nonce.to_vec();
     final_data.extend_from_slice(&ciphertext);
     Ok(final_data)
@@ -86,8 +98,10 @@ fn decrypt_history(encrypted_data: &[u8], key_bytes: &[u8]) -> Result<String, St
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
     let cipher = Aes256Gcm::new_from_slice(key_bytes).map_err(|e| e.to_string())?;
-    
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())?;
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| e.to_string())?;
     String::from_utf8(plaintext).map_err(|e| e.to_string())
 }
 
@@ -95,51 +109,51 @@ fn decrypt_history(encrypted_data: &[u8], key_bytes: &[u8]) -> Result<String, St
 fn save_history(app_handle: tauri::AppHandle, data: String) -> Result<(), String> {
     let key_bytes = get_or_migrate_history_key(&app_handle)?;
     let final_data = encrypt_history(&data, &key_bytes)?;
-    
-    let path = get_storage_path(&app_handle);
+
+    let path = get_storage_path(&app_handle)?;
     let mut tmp_path = path.clone();
     tmp_path.set_extension("enc.tmp");
-    
+
     // Atomic write
     {
         let mut file = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
         file.write_all(&final_data).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
     }
-    
+
     fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 fn load_history(app_handle: tauri::AppHandle) -> Result<String, String> {
-    let path = get_storage_path(&app_handle);
+    let path = get_storage_path(&app_handle)?;
     if !path.exists() {
         return Ok("[]".to_string());
     }
 
     let key_bytes = get_or_migrate_history_key(&app_handle)?;
     let encrypted_data = fs::read(&path).map_err(|e| e.to_string())?;
-    
+
     decrypt_history(&encrypted_data, &key_bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_encryption_decryption() {
         let key = Aes256Gcm::generate_key(OsRng);
         let data = "test history data";
-        
+
         let encrypted = encrypt_history(data, key.as_slice()).unwrap();
         assert_ne!(encrypted, data.as_bytes()); // Ensure it is changed
-        
+
         let decrypted = decrypt_history(&encrypted, key.as_slice()).unwrap();
         assert_eq!(decrypted, data);
     }
-    
+
     #[test]
     fn test_invalid_decryption_too_short() {
         let key = Aes256Gcm::generate_key(OsRng);
@@ -168,26 +182,24 @@ fn trigger_screenshot() -> Result<(), String> {
 
 #[tauri::command]
 fn write_log(app_handle: tauri::AppHandle, message: String) -> Result<(), String> {
-    use std::io::Write;
-    let mut log_path = app_handle.path().app_data_dir().unwrap();
-    fs::create_dir_all(&log_path).unwrap();
+    let mut log_path = app_data_dir(&app_handle)?;
     log_path.push("task-pilot.log");
-    
+
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .map_err(|e| e.to_string())?;
-        
+
     writeln!(file, "{}", message).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 fn open_log_file(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let mut log_path = app_handle.path().app_data_dir().unwrap();
+    let mut log_path = app_data_dir(&app_handle)?;
     log_path.push("task-pilot.log");
-    
+
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("notepad")
@@ -204,7 +216,7 @@ fn open_log_file(app_handle: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn clear_log(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let mut log_path = app_handle.path().app_data_dir().unwrap();
+    let mut log_path = app_data_dir(&app_handle)?;
     log_path.push("task-pilot.log");
     if log_path.exists() {
         fs::write(&log_path, "").map_err(|e| e.to_string())?;
@@ -213,11 +225,25 @@ fn clear_log(app_handle: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn unregister_shortcut(app_handle: tauri::AppHandle) -> Result<(), String> {
+    app_handle
+        .global_shortcut()
+        .unregister_all()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn update_shortcut(app_handle: tauri::AppHandle, shortcut: String) -> Result<(), String> {
     use std::str::FromStr;
-    app_handle.global_shortcut().unregister_all().map_err(|e| e.to_string())?;
-    let new_shortcut = Shortcut::from_str(&shortcut).map_err(|e| e.to_string())?;
-    app_handle.global_shortcut().register(new_shortcut).map_err(|e| e.to_string())?;
+    let new_shortcut = Shortcut::from_str(&shortcut).map_err(|error| error.to_string())?;
+    app_handle
+        .global_shortcut()
+        .unregister_all()
+        .map_err(|error| error.to_string())?;
+    app_handle
+        .global_shortcut()
+        .register(new_shortcut)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -245,8 +271,10 @@ fn encrypt_secret(value: String) -> Result<String, String> {
     let key = get_or_create_secret_key()?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
-    
-    let ciphertext = cipher.encrypt(&nonce, value.as_bytes().as_ref()).map_err(|e| e.to_string())?;
+
+    let ciphertext = cipher
+        .encrypt(&nonce, value.as_bytes().as_ref())
+        .map_err(|e| e.to_string())?;
     let mut final_data = nonce.to_vec();
     final_data.extend_from_slice(&ciphertext);
     Ok(STANDARD.encode(final_data))
@@ -254,7 +282,7 @@ fn encrypt_secret(value: String) -> Result<String, String> {
 
 fn get_or_create_secret_key() -> Result<Vec<u8>, String> {
     let entry = Entry::new("task-pilot", "secrets-key").map_err(|e| e.to_string())?;
-    
+
     if let Ok(password) = entry.get_password() {
         if let Ok(key) = STANDARD.decode(&password) {
             if key.len() == 32 {
@@ -262,14 +290,14 @@ fn get_or_create_secret_key() -> Result<Vec<u8>, String> {
             }
         }
     }
-    
+
     // If keyring fails to retrieve, use the deterministic machine key
     // instead of generating a random key, because keyring might fail to persist it.
     let machine_key = get_machine_key()?.to_vec();
-    
+
     // Try to save it to keyring anyway
     let _ = entry.set_password(&STANDARD.encode(&machine_key));
-    
+
     Ok(machine_key)
 }
 
@@ -283,14 +311,14 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
         Ok(data) => data,
         Err(_) => return Ok(cipher_text),
     };
-    
+
     if encrypted_data.len() < 12 {
         return Ok(cipher_text); // Probably plain text that happens to be valid base64
     }
-    
+
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    
+
     // Try new Keyring key first
     if let Ok(key) = get_or_create_secret_key() {
         if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
@@ -301,7 +329,7 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
             }
         }
     }
-    
+
     // Fallback to legacy machine_uid key
     if let Ok(key) = get_machine_key() {
         if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
@@ -312,12 +340,35 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
             }
         }
     }
-    
+
     // If we reach here, it IS a valid base64 string of correct length, but we CANNOT decrypt it.
     // It's highly likely it is a corrupted/orphaned encrypted string.
     // Returning the raw ciphertext causes double-encryption bugs and UI confusion.
     // We MUST return an empty string to clear the corrupted state so the user can re-enter it.
     Ok("".to_string())
+}
+
+fn toggle_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    match window.is_visible() {
+        Ok(true) => {
+            if let Err(error) = window.hide() {
+                eprintln!("无法隐藏主窗口: {error}");
+            }
+        }
+        Ok(false) => {
+            for operation in [window.unminimize(), window.show(), window.set_focus()] {
+                if let Err(error) = operation {
+                    eprintln!("无法显示主窗口: {error}");
+                    break;
+                }
+            }
+        }
+        Err(error) => eprintln!("无法读取主窗口可见状态: {error}"),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -332,7 +383,22 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, clear_log, update_shortcut, set_recording_mode, encrypt_secret, decrypt_secret, get_email_folders, fetch_emails, mark_email_read])
+        .invoke_handler(tauri::generate_handler![
+            save_history,
+            load_history,
+            trigger_screenshot,
+            write_log,
+            open_log_file,
+            clear_log,
+            unregister_shortcut,
+            update_shortcut,
+            set_recording_mode,
+            encrypt_secret,
+            decrypt_secret,
+            get_email_folders,
+            fetch_emails,
+            mark_email_read
+        ])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -343,16 +409,8 @@ pub fn run() {
                             return;
                         }
 
-                        // Since we dynamically register the shortcut, any triggered shortcut for this app toggles the main window
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                window.hide().unwrap();
-                            } else {
-                                window.unminimize().unwrap();
-                                window.show().unwrap();
-                                window.set_focus().unwrap();
-                            }
-                        }
+                        // Since we dynamically register the shortcut, any triggered shortcut for this app toggles the main window.
+                        toggle_main_window(app);
                     }
                 })
                 .build(),
@@ -368,8 +426,12 @@ pub fn run() {
             let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&quit_i])?;
 
+            let default_icon = app.default_window_icon().cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "默认窗口图标不可用")
+            })?;
+
             tauri::tray::TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(default_icon)
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     if event.id.as_ref() == "quit" {
@@ -381,17 +443,9 @@ pub fn run() {
                         button: tauri::tray::MouseButton::Left,
                         button_state: tauri::tray::MouseButtonState::Up,
                         ..
-                    } = event {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                window.hide().unwrap();
-                            } else {
-                                window.unminimize().unwrap();
-                                window.show().unwrap();
-                                window.set_focus().unwrap();
-                            }
-                        }
+                    } = event
+                    {
+                        toggle_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
