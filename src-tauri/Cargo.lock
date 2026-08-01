@@ -130,6 +130,7 @@ dependencies = [
  "mailparse",
  "native-tls",
  "rand 0.9.5",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
@@ -141,6 +142,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-sql",
  "tauri-plugin-store",
+ "url",
 ]
 
 [[package]]

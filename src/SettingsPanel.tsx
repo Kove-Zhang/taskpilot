@@ -4,6 +4,7 @@ import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from './sto
 import { logger } from './lib/logger'
 import { fetchWithTimeout } from './lib/http'
 import { notionDatabaseEndpoint, notionHeaders } from './lib/notionApi'
+import { requestProviderChatCompletion } from './lib/providerTransport'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ZenEditorModal } from './components/ZenEditorModal'
@@ -280,27 +281,23 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         }
       }
 
-      const normalizedUrl = provider.apiBaseUrl.trim().endsWith('/') ? provider.apiBaseUrl.trim().slice(0, -1) : provider.apiBaseUrl.trim();
-      logger.info('Testing provider API connection...', { baseUrl: normalizedUrl, model: provider.modelName });
+      logger.info('Testing provider API connection...', { baseUrl: provider.apiBaseUrl, model: provider.modelName });
 
-      const response = await fetchWithTimeout(`${normalizedUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${provider.apiKey}`
-        },
-        body: JSON.stringify(payload)
+      const response = await requestProviderChatCompletion({
+        baseUrl: provider.apiBaseUrl,
+        apiKey: provider.apiKey,
+        payload,
       });
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+        const errData = await response.json().catch(() => ({})) as { error?: { message?: string } };
         throw new Error(errData.error?.message || `HTTP Error ${response.status}`);
       }
 
-      const data = await response.json();
-      if (data.choices && data.choices.length > 0) {
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      if (data.choices?.some(choice => typeof choice.message?.content === 'string')) {
         setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'success' } }));
-        logger.info('Provider API connection test successful', data);
+        logger.info('Provider API connection test successful', { choiceCount: data.choices.length });
       } else {
         throw new Error('Invalid response format');
       }
@@ -396,7 +393,6 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
     setOptimizingPrompt(true);
     try {
-      const normalizedUrl = topProvider.apiBaseUrl.trim().endsWith('/') ? topProvider.apiBaseUrl.trim().slice(0, -1) : topProvider.apiBaseUrl.trim();
       const isOSeries = /^o\d+/.test(topProvider.modelName.toLowerCase());
       const isClaude = topProvider.modelName.toLowerCase().includes('claude');
       const isDeepSeek = topProvider.modelName.toLowerCase().includes('deepseek') || topProvider.modelName.toLowerCase().includes('reasoner') || topProvider.modelName.toLowerCase().includes('thinking');
@@ -436,30 +432,30 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         }
       }
 
-      const response = await fetchWithTimeout(`${normalizedUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${topProvider.apiKey}`
-        },
-        body: JSON.stringify(payload)
+      const response = await requestProviderChatCompletion({
+        baseUrl: topProvider.apiBaseUrl,
+        apiKey: topProvider.apiKey,
+        payload,
       });
 
       if (!response.ok) {
         throw new Error(`HTTP Error ${response.status}`);
       }
 
-      const data = await response.json();
-      logger.info('Received raw prompt optimization response from AI', { response: data });
-      if (data.choices && data.choices.length > 0) {
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      logger.info('Received prompt optimization response from AI', { choiceCount: data.choices?.length ?? 0 });
+      const optimizedContent = data.choices?.[0]?.message?.content;
+      if (typeof optimizedContent === 'string' && optimizedContent.trim()) {
         if (formPromptMode === 'static') {
           setPreviousFocus(formStaticFocus);
-          setFormStaticFocus(data.choices[0].message.content.trim());
+          setFormStaticFocus(optimizedContent.trim());
         } else {
           setPreviousFocus(formAutoFocus);
-          setFormAutoFocus(data.choices[0].message.content.trim());
+          setFormAutoFocus(optimizedContent.trim());
         }
         logger.info('Prompt optimization successful');
+      } else {
+        throw new Error('Invalid response format');
       }
     } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);

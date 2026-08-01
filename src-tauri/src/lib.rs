@@ -4,9 +4,11 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use keyring::Entry;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
@@ -155,6 +157,18 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_provider_url_validation() {
+        assert!(
+            validate_custom_provider_url("https://provider.example/v1/chat/completions").is_ok()
+        );
+        assert!(
+            validate_custom_provider_url("http://provider.example/v1/chat/completions").is_err()
+        );
+        assert!(validate_custom_provider_url("https://127.0.0.1/v1/chat/completions").is_err());
+        assert!(validate_custom_provider_url("https://user:pass@provider.example/v1").is_err());
+    }
+
+    #[test]
     fn test_invalid_decryption_too_short() {
         let key = Aes256Gcm::generate_key(OsRng);
         let invalid_data = vec![0u8; 10]; // Too short (needs at least 12 bytes nonce)
@@ -162,6 +176,161 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Invalid data format");
     }
+}
+
+const MAX_CUSTOM_LLM_REQUEST_BYTES: usize = 5 * 1024 * 1024;
+const MAX_CUSTOM_LLM_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct CustomLlmRequest {
+    url: String,
+    #[serde(rename = "apiKey")]
+    api_key: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct CustomLlmResponse {
+    status: u16,
+    body: String,
+}
+
+fn is_non_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            let first = octets[0];
+            let second = octets[1];
+            address.is_loopback()
+                || address.is_unspecified()
+                || address.is_link_local()
+                || first == 10
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 168)
+                || (first == 192 && second == 0)
+                || (first == 192 && second == 2)
+                || (first == 198 && (second == 18 || second == 19))
+                || (first == 198 && second == 51 && octets[2] == 100)
+                || (first == 203 && second == 0 && octets[2] == 113)
+                || first >= 224
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            let first = segments[0];
+            address.is_loopback()
+                || address.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xff00) == 0xff00
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| is_non_public_ip(IpAddr::V4(mapped)))
+        }
+    }
+}
+
+fn validate_custom_provider_url(raw_url: &str) -> Result<url::Url, String> {
+    let url =
+        url::Url::parse(raw_url).map_err(|error| format!("自定义供应商 URL 无效: {error}"))?;
+    if url.scheme() != "https" {
+        return Err("自定义供应商只允许使用 HTTPS URL".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("自定义供应商 URL 不允许包含用户名或密码".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "自定义供应商 URL 缺少主机名".to_string())?;
+    let normalized_host = host.to_ascii_lowercase();
+    if normalized_host == "localhost" || normalized_host.ends_with(".localhost") {
+        return Err("自定义供应商不允许访问 localhost".to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_non_public_ip(ip) {
+            return Err("自定义供应商不允许访问本地或内网 IP 地址".to_string());
+        }
+    }
+
+    Ok(url)
+}
+
+fn resolve_public_socket(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("无法解析自定义供应商域名: {error}"))?;
+    addresses
+        .filter(|address| !is_non_public_ip(address.ip()))
+        .find(|address| !is_non_public_ip(address.ip()))
+        .ok_or_else(|| "自定义供应商域名解析到了本地或内网地址，已阻止请求".to_string())
+}
+
+#[tauri::command]
+async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmResponse, String> {
+    let url = validate_custom_provider_url(&request.url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "自定义供应商 URL 缺少主机名".to_string())?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "自定义供应商 URL 缺少有效端口".to_string())?;
+    let payload_bytes = serde_json::to_vec(&request.payload)
+        .map_err(|error| format!("请求数据序列化失败: {error}"))?;
+    if payload_bytes.len() > MAX_CUSTOM_LLM_REQUEST_BYTES {
+        return Err("自定义供应商请求体超过 5 MB 限制".to_string());
+    }
+
+    let socket = tauri::async_runtime::spawn_blocking({
+        let host = host.clone();
+        move || resolve_public_socket(&host, port)
+    })
+    .await
+    .map_err(|error| format!("域名解析任务失败: {error}"))??;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(&host, socket)
+        .build()
+        .map_err(|error| format!("创建自定义供应商 HTTP 客户端失败: {error}"))?;
+
+    let response = client
+        .post(url)
+        .bearer_auth(request.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(payload_bytes)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "自定义供应商请求超时（30 秒）".to_string()
+            } else {
+                format!("自定义供应商网络请求失败: {error}")
+            }
+        })?;
+
+    if response
+        .content_length()
+        .is_some_and(|length| length as usize > MAX_CUSTOM_LLM_RESPONSE_BYTES)
+    {
+        return Err("自定义供应商响应超过 10 MB 限制".to_string());
+    }
+
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取自定义供应商响应失败: {error}"))?;
+    if body.len() > MAX_CUSTOM_LLM_RESPONSE_BYTES {
+        return Err("自定义供应商响应超过 10 MB 限制".to_string());
+    }
+
+    let body = String::from_utf8(body.to_vec())
+        .map_err(|_| "自定义供应商响应不是有效 UTF-8 文本".to_string())?;
+    Ok(CustomLlmResponse { status, body })
 }
 
 #[tauri::command]
@@ -397,7 +566,8 @@ pub fn run() {
             decrypt_secret,
             get_email_folders,
             fetch_emails,
-            mark_email_read
+            mark_email_read,
+            request_custom_llm
         ])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()

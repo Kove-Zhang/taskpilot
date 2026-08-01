@@ -39,6 +39,6 @@ export function isRetryableHttpStatus(status: number): boolean {
 }
 
 export function isRetryableTransportError(error: unknown): boolean {
-  if (error instanceof HttpRequestError) return error.isTimeout
+  if (error instanceof HttpRequestError) return error.isTimeout || /network|fetch|socket|connection|网络请求|网络连接/i.test(error.message)
   return error instanceof TypeError || (error instanceof Error && /network|fetch|socket|connection/i.test(error.message))
 }

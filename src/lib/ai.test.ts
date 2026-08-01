@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { callAIWithFailover, generateWriting } from './ai'
 import { useSettingsStore, type LLMProvider } from '../store'
 import { fetch } from '@tauri-apps/plugin-http'
+import { invoke } from '@tauri-apps/api/core'
 
 const providers: LLMProvider[] = [
   { id: 'first', name: 'First', apiBaseUrl: 'https://first.example/v1', apiKey: 'first-key', modelName: 'gpt-4o', enabled: true, priority: 1 },
@@ -11,6 +12,7 @@ const providers: LLMProvider[] = [
 describe('AI Helper Methods', () => {
   beforeEach(() => {
     vi.mocked(fetch).mockReset()
+    vi.mocked(invoke).mockReset()
     useSettingsStore.setState({
       apiBaseUrl: 'https://api.openai.com/v1',
       apiKey: 'test-key',
@@ -50,33 +52,43 @@ describe('AI Helper Methods', () => {
 
   it('does not retry or fail over on a non-retryable 400 response', async () => {
     useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 3 })
-    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 400, text: async () => 'invalid request' } as Response)
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'request_custom_llm') return { status: 400, body: 'invalid request' }
+      return undefined
+    })
 
     await expect(callAIWithFailover(
       (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
       'test',
     )).rejects.toThrow('(400)')
 
-    expect(fetch).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(fetch).mock.calls[0][0]).toBe('https://first.example/v1/chat/completions')
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(1)
+    expect(vi.mocked(invoke).mock.calls.find(([command]) => command === 'request_custom_llm')?.[0]).toBe('request_custom_llm')
+    expect(vi.mocked(invoke).mock.calls.find(([command]) => command === 'request_custom_llm')?.[1]).toMatchObject({
+      request: { url: 'https://first.example/v1/chat/completions' },
+    })
   })
 
   it('fails over to the next provider after a retryable transport error', async () => {
     useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 1 })
-    vi.mocked(fetch)
-      .mockRejectedValueOnce(new TypeError('network connection reset'))
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ choices: [{ message: { content: 'fallback answer' } }] }),
-      } as Response)
+    let customRequestCount = 0
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command !== 'request_custom_llm') return undefined
+      customRequestCount += 1
+      if (customRequestCount === 1) throw new TypeError('network connection reset')
+      return {
+        status: 200,
+        body: JSON.stringify({ choices: [{ message: { content: 'fallback answer' } }] }),
+      }
+    })
 
     await expect(callAIWithFailover(
       (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
       'failover-test',
     )).resolves.toBe('fallback answer')
 
-    expect(fetch).toHaveBeenCalledTimes(2)
-    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual([
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(2)
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm').map(([, args]) => (args as { request: { url: string } }).request.url)).toEqual([
       'https://first.example/v1/chat/completions',
       'https://second.example/v1/chat/completions',
     ])
@@ -84,16 +96,18 @@ describe('AI Helper Methods', () => {
 
   it('does not retry malformed successful responses or forward them to another provider', async () => {
     useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 3 })
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ choices: [{}] }),
-    } as Response)
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'request_custom_llm') {
+        return { status: 200, body: JSON.stringify({ choices: [{}] }) }
+      }
+      return undefined
+    })
 
     await expect(callAIWithFailover(
       (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
       'invalid-schema-test',
     )).rejects.toThrow('缺少有效 message.content')
 
-    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(1)
   })
 })

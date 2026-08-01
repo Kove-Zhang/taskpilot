@@ -1,6 +1,7 @@
 import { useSettingsStore, getSortedLLMProviders, getEffectiveFocus, type LLMProvider } from '../store'
-import { HttpRequestError, fetchWithTimeout, isRetryableHttpStatus, isRetryableTransportError } from './http'
+import { HttpRequestError, isRetryableHttpStatus, isRetryableTransportError } from './http'
 import { logger } from './logger'
+import { requestProviderChatCompletion } from './providerTransport'
 
 export interface AIResult {
   id?: string;
@@ -121,12 +122,9 @@ export async function callAIWithFailover(
       continue
     }
 
-    const normalizedUrl = provider.apiBaseUrl.trim().replace(/\/$/, '')
-    if (!normalizedUrl) {
+    if (!provider.apiBaseUrl.trim()) {
       throw new Error(`服务商 [${provider.name}] 未配置 API Base URL`)
     }
-
-    const endpoint = `${normalizedUrl}/chat/completions`
     const payload = buildPayload(provider)
 
     for (let attempt = 1; attempt <= maxRetriesPerProvider; attempt += 1) {
@@ -136,13 +134,10 @@ export async function callAIWithFailover(
           { payload: sanitizePayloadForLog(payload) },
         )
 
-        const response = await fetchWithTimeout(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${provider.apiKey}`,
-          },
-          body: JSON.stringify(payload),
+        const response = await requestProviderChatCompletion({
+          baseUrl: provider.apiBaseUrl,
+          apiKey: provider.apiKey,
+          payload,
         })
 
         if (!response.ok) {
