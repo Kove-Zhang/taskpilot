@@ -1,4 +1,4 @@
-import { fetchWithTimeout, HttpRequestError } from './http'
+import { fetchWithTimeout, HttpRequestError, isRetryableRequestError } from './http'
 import { LazyStore } from '@tauri-apps/plugin-store'
 import { useSettingsStore, type NotionProperty } from '../store'
 import type { TodoItem } from './ai'
@@ -10,6 +10,7 @@ export interface SyncResult {
   error?: string
   pageId?: string
   skipped?: boolean
+  retryable?: boolean
 }
 
 type NotionPropertyValue = Record<string, unknown>
@@ -241,6 +242,7 @@ export async function syncToNotion(todos: TodoItem[]): Promise<SyncResult[]> {
           id: todo.id,
           success: false,
           error: error instanceof Error ? error.message : String(error),
+          retryable: isRetryableRequestError(error),
         })
       }
     }

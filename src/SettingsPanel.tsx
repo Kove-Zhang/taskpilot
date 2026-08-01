@@ -19,7 +19,7 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount, isWindowMode,
+    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount, failoverOnAuthError, isWindowMode,
     promptMode, staticPersonalFocus, autoOptimizedFocus, staticFocusUpdatedAt, autoOptimizedUpdatedAt,
     setPromptMode, setStaticFocus, setAutoOptimizedFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig, setLLMProviders, setFailoverConfig, setWindowMode
   } = useSettingsStore();
@@ -41,6 +41,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   });
   const [formEnableFailover, setFormEnableFailover] = useState<boolean>(enableFailover !== undefined ? enableFailover : true);
   const [formRetryCount, setFormRetryCount] = useState<number>(failoverRetryCount || 1);
+  const [formFailoverOnAuthError, setFormFailoverOnAuthError] = useState<boolean>(failoverOnAuthError ?? false);
   const [showFailoverGuide, setShowFailoverGuide] = useState<boolean>(false);
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [providerTestResults, setProviderTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string }>>({});
@@ -116,7 +117,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const handleSave = () => {
     setLLMProviders(formProviders);
-    setFailoverConfig(formEnableFailover, formRetryCount);
+    setFailoverConfig(formEnableFailover, formRetryCount, formFailoverOnAuthError);
     setPromptMode(formPromptMode);
     setStaticFocus(formStaticFocus);
     setAutoOptimizedFocus(formAutoFocus);
@@ -814,6 +815,25 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                     />
                     <span>次</span>
                   </div>
+                </div>
+
+                <div className="border-t border-white/5 pt-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="failoverOnAuthError"
+                      checked={formFailoverOnAuthError}
+                      disabled={!formEnableFailover}
+                      onChange={(e) => setFormFailoverOnAuthError(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded border-white/20 bg-black/20 text-amber-500 focus:ring-amber-500/50 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                    <label htmlFor="failoverOnAuthError" className={`text-xs select-none ${formEnableFailover ? 'text-slate-300 cursor-pointer' : 'text-slate-500 cursor-not-allowed'}`}>
+                      认证失败（401）时也尝试备用服务商
+                    </label>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-amber-300/80">
+                    关闭时会立即提示当前 API Key 配置错误；开启后会直接轮换到下一服务商，不会用同一失效 Key 重试。请求内容会发送给备用服务商。
+                  </p>
                 </div>
 
                 <div className="border-t border-white/5 pt-3 flex items-center justify-between gap-3">

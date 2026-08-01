@@ -5,6 +5,7 @@ import { startEmailScheduler, stopEmailScheduler } from './lib/emailScheduler'
 import { extractTodosFromContent, generateWriting } from './lib/ai'
 import type { AIResult } from './lib/ai'
 import { syncToNotion } from './lib/notion'
+import { canProvideExplicitFeedback, getFeedbackType, isMissedExtractionFeedback } from './lib/feedbackAvailability'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { assertFileBatchWithinLimits } from './lib/fileLimits'
@@ -52,20 +53,20 @@ export default function App() {
   const [writeIntent, setWriteIntent] = useState('')
   const [writingResult, setWritingResult] = useState('')
   const [writing, setWriting] = useState(false)
-  
+
   const fileInputRef = useRef<HTMLInputElement>(null)
   const isFileDialogOpen = useRef(false)
   const isScreenshotting = useRef(false)
 
   const isDraggingRef = useRef(isDragging);
   useEffect(() => { isDraggingRef.current = isDragging; }, [isDragging]);
-  
+
   const isWindowModeRef = useRef(isWindowMode);
   useEffect(() => { isWindowModeRef.current = isWindowMode; }, [isWindowMode]);
 
   useEffect(() => {
     let unlisten: () => void;
-    
+
     getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       if (!focused && !isDraggingRef.current && !isWindowModeRef.current && !isFileDialogOpen.current && !isScreenshotting.current) {
         getCurrentWindow().hide();
@@ -93,7 +94,7 @@ export default function App() {
 
   useEffect(() => {
     startEmailScheduler();
-    
+
     return () => {
       stopEmailScheduler();
     }
@@ -175,15 +176,16 @@ ${text}
     if (!result) return;
     const originalTodosToUse = result.originalTodos || result.todos || [];
     const currentId = result.id;
+    const feedbackType = getFeedbackType(originalTodosToUse.length);
     if (!currentId) return;
 
     // 1. Immediately set the UI to 'processing'
-    setResult({ ...result, feedbackStatus: 'processing', explicitFeedback: feedbackText });
-    
+    setResult({ ...result, feedbackStatus: 'processing', explicitFeedback: feedbackText, feedbackType });
+
     // 2. Persist to history immediately (so it's not lost on reload)
     try {
       await updateHistory((history) => history.map((entry) => entry.result?.id === currentId
-        ? { ...entry, result: { ...entry.result, feedbackStatus: 'processing', explicitFeedback: feedbackText } }
+        ? { ...entry, result: { ...entry.result, feedbackStatus: 'processing', explicitFeedback: feedbackText, feedbackType } }
         : entry));
     } catch (error) {
       console.error('Failed to update processing status in history', error);
@@ -192,19 +194,19 @@ ${text}
     // 3. Call AI
     try {
       const m = await import('./lib/autoOptimize');
-      await m.backgroundReviewAndUpdateFocus(originalTodosToUse, [], feedbackText);
-      
+      await m.backgroundReviewAndUpdateFocus(originalTodosToUse, [], feedbackText, feedbackType);
+
       // 4. Update history to 'completed' & 'isRejected'
       try {
         await updateHistory((history) => history.map((entry) => entry.result?.id === currentId
-          ? { ...entry, result: { ...entry.result, feedbackStatus: 'completed', isRejected: true } }
+          ? { ...entry, result: { ...entry.result, feedbackStatus: 'completed', feedbackType, isRejected: feedbackType === 'over_extraction' } }
           : entry));
       } catch (error) {
         console.error('Failed to update completed status in history', error);
       }
-      
+
       // 5. Update local UI to show success briefly, then close
-      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: 'completed', isRejected: true } : prev);
+      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: 'completed', feedbackType, isRejected: feedbackType === 'over_extraction' } : prev);
       setTimeout(() => {
         setResult(prev => prev && prev.id === currentId ? null : prev);
         setShowFeedback(false);
@@ -292,13 +294,13 @@ ${text}
       setError("当前没有可同步的待办事项：您选中的条目可能已全部分步至 Notion，或未勾选任何有效事项。");
       return;
     }
-    
+
     setSyncing(true);
     setError('');
     logger.info('Syncing to Notion...', { count: selectedTodos.length });
     try {
       const syncResults = await syncToNotion(selectedTodos);
-      
+
       const failed = syncResults.filter(r => !r.success);
       const succeeded = syncResults.filter(r => r.success);
 
@@ -329,7 +331,7 @@ ${text}
           m.backgroundReviewAndUpdateFocus(baseTodosForSync, selectedTodos).catch(console.error);
         });
       }
-      
+
       const succeededIds = new Set(succeeded.map((item) => item.id));
       await updateHistory((history) => history.map((entry) => entry.result?.id === result.id
         ? {
@@ -435,13 +437,13 @@ ${text}
   }
 
   return (
-    <div 
+    <div
       className="w-full h-full overflow-y-auto block relative"
       onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
       onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
       onDrop={handleDrop}
     >
-      <div 
+      <div
         className="min-h-[100vh] w-full overflow-y-auto custom-scrollbar flex flex-col items-center justify-center p-4 sm:p-8"
         onClick={async () => { if (!isWindowMode) await getCurrentWindow().hide() }}
       >
@@ -463,40 +465,40 @@ ${text}
             </div>
           </>
         )}
-        <div 
+        <div
           className={`glass-panel w-full mx-auto flex flex-col shadow-2xl transition-all duration-300 ${isWindowMode ? 'max-w-5xl p-8 gap-6 rounded-2xl' : 'max-w-3xl p-6 gap-4 rounded-xl'} ${isDragging ? 'border-purple-500 bg-purple-500/10' : ''}`}
           onClick={(e) => e.stopPropagation()}
         >
           <div className="contents">
-        
+
         <div className="flex items-center justify-between border-b border-white/10 pb-4">
           <div className="flex items-center gap-2">
             <Sparkles className="w-5 h-5 text-purple-400" />
             <h1 className="text-lg font-semibold text-white tracking-wide">Task Pilot</h1>
           </div>
           <div className="flex items-center gap-2 relative z-10">
-            <button 
+            <button
               onClick={startNewSession}
               className="p-2 hover:bg-white/10 rounded-full transition-colors group"
               title="新会话"
             >
               <PlusSquare className="w-5 h-5 text-slate-400 group-hover:text-green-400" />
             </button>
-            <button 
+            <button
               onClick={() => setShowHistory(true)}
               className="p-2 hover:bg-white/10 rounded-full transition-colors group"
               title="历史记录"
             >
               <Clock className="w-5 h-5 text-slate-400 group-hover:text-blue-400" />
             </button>
-            <button 
+            <button
               onClick={() => setShowEmailHistory(true)}
               className="p-2 hover:bg-white/10 rounded-full transition-colors group"
               title="邮件监听历史"
             >
               <Mail className="w-5 h-5 text-slate-400 group-hover:text-pink-400" />
             </button>
-            <button 
+            <button
               onClick={() => setShowSettings(true)}
               className="p-2 hover:bg-white/10 rounded-full transition-colors group"
               title="设置"
@@ -508,7 +510,7 @@ ${text}
         </div>
 
         <div className="relative">
-          <textarea 
+          <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onPaste={handlePaste}
@@ -533,22 +535,22 @@ ${text}
 
         <div className="flex items-center justify-between pt-2">
           <div className="flex items-center gap-3">
-            <button 
+            <button
               onClick={triggerScreenshot}
               className="flex items-center gap-2 px-3 py-1.5 text-sm bg-white/5 hover:bg-white/10 text-slate-300 rounded-md border border-white/5 transition-colors cursor-pointer"
             >
               <ImageIcon className="w-4 h-4" />
               <span>截屏选区</span>
             </button>
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              style={{ display: 'none' }} 
-              onChange={handleFileSelect} 
-              multiple 
-              accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,image/*" 
+            <input
+              type="file"
+              ref={fileInputRef}
+              style={{ display: 'none' }}
+              onChange={handleFileSelect}
+              multiple
+              accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,image/*"
             />
-            <button 
+            <button
               onClick={() => {
                 isFileDialogOpen.current = true;
                 fileInputRef.current?.click();
@@ -561,9 +563,9 @@ ${text}
             </button>
           </div>
 
-          <button 
+          <button
             onClick={handleExtract}
-            className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md shadow-lg shadow-purple-500/20 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed" 
+            className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md shadow-lg shadow-purple-500/20 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
             disabled={(!input && images.length === 0) || loading}
           >
             {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
@@ -577,7 +579,7 @@ ${text}
             <div className="text-sm text-slate-300 bg-white/5 p-3 rounded-md border border-white/10 mb-4">
               {result.summary}
             </div>
-            
+
             <h3 className="text-sm font-medium text-orange-300 mb-2 flex items-center gap-2">
               待办事项
               {result.syncedToNotion && (
@@ -596,7 +598,7 @@ ${text}
                     disabled={result.syncedToNotion}
                     className="w-4 h-4 rounded border-white/10 bg-slate-800 text-purple-500 focus:ring-purple-500/50 focus:ring-offset-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
                   />
-                  
+
                   {displayFields.map(field => {
                     if (field.type === 'title' || field.type === 'rich_text') {
                       return (
@@ -638,12 +640,12 @@ ${text}
                     } else if (field.type === 'checkbox') {
                       return (
                         <label key={field.id} className="flex items-center gap-1 text-xs text-slate-400 cursor-pointer shrink-0">
-                          <input 
-                            type="checkbox" 
-                            checked={todo[field.name] === true} 
-                            onChange={e => updateTodo(todo.id, field.name, e.target.checked)} 
-                            disabled={result.syncedToNotion} 
-                            className="rounded bg-slate-800 border-slate-600 focus:ring-offset-slate-900" 
+                          <input
+                            type="checkbox"
+                            checked={todo[field.name] === true}
+                            onChange={e => updateTodo(todo.id, field.name, e.target.checked)}
+                            disabled={result.syncedToNotion}
+                            className="rounded bg-slate-800 border-slate-600 focus:ring-offset-slate-900"
                           />
                           {field.name}
                         </label>
@@ -664,7 +666,7 @@ ${text}
                 </div>
               ))}
               {!result.syncedToNotion && (
-                <button 
+                <button
                   onClick={handleAddTodo}
                   className="w-full py-2 flex items-center justify-center gap-1 text-xs text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-md border border-dashed border-white/10 transition-colors"
                 >
@@ -672,19 +674,19 @@ ${text}
                 </button>
               )}
             </div>
-            
-            {result.todos.length > 0 && (
-              <div className="flex flex-col gap-3 mt-4">
-                <div className="flex justify-end items-center gap-2">
-                  {!result.syncedToNotion && result.feedbackStatus !== 'processing' && result.feedbackStatus !== 'completed' && (
-                    <button 
-                      onClick={() => setShowFeedback(!showFeedback)}
-                      className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-400 bg-transparent hover:bg-white/5 hover:text-slate-300 rounded-md transition-colors"
-                    >
-                      👎 提取太差？教教 AI
-                    </button>
-                  )}
-                  <button 
+
+            <div className="flex flex-col gap-3 mt-4">
+              <div className="flex justify-end items-center gap-2">
+                {canProvideExplicitFeedback(result.feedbackStatus) && (
+                  <button
+                    onClick={() => setShowFeedback(!showFeedback)}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-400 bg-transparent hover:bg-white/5 hover:text-slate-300 rounded-md transition-colors"
+                  >
+                    {result.todos.length === 0 ? '⚠️ 没有提取到待办？补充告诉 AI' : '👎 提取太差？教教 AI'}
+                  </button>
+                )}
+                {result.todos.length > 0 && (
+                  <button
                     onClick={handleSyncNotion}
                     disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || result.syncedToNotion || result.feedbackStatus === 'processing' || result.feedbackStatus === 'completed'}
                     className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${result.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
@@ -692,43 +694,49 @@ ${text}
                     {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
                     <span>{syncing ? '同步中...' : result.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
                   </button>
-                </div>
-                
-                {showFeedback && !result.syncedToNotion && !result.feedbackStatus && (
-                  <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
-                    <p className="text-xs text-slate-400">请简单说明原因，系统会将本次所有提取结果作为<span className="text-red-400">反面教材</span>发给 AI 深度学习，并清空当前结果。</p>
-                    <textarea 
-                      value={feedbackText}
-                      onChange={e => setFeedbackText(e.target.value)}
-                      placeholder="（可选）吐槽一下，例如：不要提取没有明确动作的废话，不要包含节假日祝福"
-                      className="w-full bg-black/50 border border-white/10 rounded-md p-2 text-sm text-slate-300 focus:outline-none focus:border-red-500/50 min-h-[60px]"
-                    />
-                    <div className="flex justify-end">
-                      <button
-                        onClick={handleExplicitFeedback}
-                        className="flex items-center gap-2 px-4 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-500 rounded-md transition-colors"
-                      >
-                        发送纠正并废弃本次结果
-                      </button>
-                    </div>
-                  </div>
-                )}
-                
-                {result.feedbackStatus === 'processing' && (
-                  <div className="animate-in fade-in bg-slate-800/80 border border-yellow-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
-                    <Loader2 className="w-5 h-5 text-yellow-500 animate-spin" />
-                    <span className="text-sm text-yellow-100">⏳ 正在让大模型深度反思中 (后台干活中，您可以继续处理其他事务)</span>
-                  </div>
-                )}
-
-                {result.feedbackStatus === 'completed' && (
-                  <div className="animate-in fade-in zoom-in bg-green-900/30 border border-green-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
-                    <Check className="w-5 h-5 text-green-400" />
-                    <span className="text-sm text-green-100">✅ 感谢调教！AI 已深刻吸取教训，相关规则已更新。</span>
-                  </div>
                 )}
               </div>
-            )}
+
+              {showFeedback && canProvideExplicitFeedback(result.feedbackStatus) && (
+                <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
+                  <p className="text-xs text-slate-400">
+                    {result.todos.length === 0
+                      ? <>本次<strong className="text-amber-300">没有提取出待办</strong>。请补充哪些行动项被遗漏、常见表达或截止时间线索，系统会将其作为<strong className="text-amber-300">漏提取样本</strong>交给 AI 学习。</>
+                      : <>请简单说明原因，系统会将本次所有提取结果作为<span className="text-red-400">反面教材</span>发给 AI 深度学习，并清空当前结果。</>}
+                  </p>
+                  <textarea
+                    value={feedbackText}
+                    onChange={e => setFeedbackText(e.target.value)}
+                    placeholder={result.todos.length === 0
+                      ? '例如：邮件中“请周五前确认报价”应识别为待办；看到“请确认 / 跟进 / 提交 / 截止”要提取。'
+                      : '（可选）吐槽一下，例如：不要提取没有明确动作的废话，不要包含节假日祝福'}
+                    className="w-full bg-black/50 border border-white/10 rounded-md p-2 text-sm text-slate-300 focus:outline-none focus:border-red-500/50 min-h-[60px]"
+                  />
+                  <div className="flex justify-end">
+                    <button
+                      onClick={handleExplicitFeedback}
+                      className="flex items-center gap-2 px-4 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-500 rounded-md transition-colors"
+                    >
+                      {result.todos.length === 0 ? '发送漏提取反馈' : '发送纠正并废弃本次结果'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {result.feedbackStatus === 'processing' && (
+                <div className="animate-in fade-in bg-slate-800/80 border border-yellow-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
+                  <Loader2 className="w-5 h-5 text-yellow-500 animate-spin" />
+                  <span className="text-sm text-yellow-100">⏳ 正在让大模型深度反思中 (后台干活中，您可以继续处理其他事务)</span>
+                </div>
+              )}
+
+              {result.feedbackStatus === 'completed' && (
+                <div className="animate-in fade-in zoom-in bg-green-900/30 border border-green-500/30 p-4 rounded-lg flex items-center justify-center gap-3">
+                  <Check className="w-5 h-5 text-green-400" />
+                  <span className="text-sm text-green-100">{isMissedExtractionFeedback(result.feedbackType) ? '✅ 已记录漏提取反馈，AI 会学习识别类似行动线索。' : '✅ 感谢调教！AI 已深刻吸取教训，相关规则已更新。'}</span>
+                </div>
+              )}
+            </div>
 
             {result.todos.length > 0 && (
               <div className="mt-6 border-t border-white/10 pt-4">
@@ -777,13 +785,13 @@ ${text}
       </div>
 
       {previewImage && (
-        <div 
+        <div
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 p-4"
           onClick={() => setPreviewImage(null)}
         >
-          <img 
-            src={previewImage} 
-            className="max-w-full max-h-full object-contain rounded-lg shadow-2xl cursor-zoom-out" 
+          <img
+            src={previewImage}
+            className="max-w-full max-h-full object-contain rounded-lg shadow-2xl cursor-zoom-out"
             alt="Preview"
             onClick={(e) => {
               e.stopPropagation();
@@ -807,7 +815,7 @@ ${text}
               <h4 className="text-sm font-semibold text-purple-300 tracking-wide">{toast.title}</h4>
               <p className="text-xs text-slate-400 leading-relaxed">{toast.message}</p>
             </div>
-            <button 
+            <button
               onClick={() => setToast(null)}
               className="absolute top-2 right-2 text-slate-500 hover:text-slate-300 bg-transparent hover:bg-white/10 p-1 rounded transition-colors"
             >

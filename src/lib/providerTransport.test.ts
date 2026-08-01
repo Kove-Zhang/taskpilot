@@ -54,4 +54,15 @@ describe('provider transport', () => {
       payload: { model: 'test', messages: [] },
     })).rejects.toMatchObject({ name: 'HttpRequestError', isTimeout: true })
   })
+
+  it('classifies Rust proxy DNS failures as retryable transport errors', async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error('无法解析自定义供应商域名: DNS lookup failed'))
+
+    await expect(requestProviderChatCompletion({
+      baseUrl: 'https://provider.example/v1',
+      apiKey: 'test-key',
+      payload: { model: 'test', messages: [] },
+    })).rejects.toMatchObject({ name: 'HttpRequestError', isTimeout: false, isRetryable: true })
+  })
+
 })

@@ -124,6 +124,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "imap",
+ "imap-proto",
  "keyring",
  "log",
  "machine-uid",
@@ -143,6 +144,7 @@ dependencies = [
  "tauri-plugin-sql",
  "tauri-plugin-store",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

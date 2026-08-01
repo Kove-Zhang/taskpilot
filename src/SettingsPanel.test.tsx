@@ -15,6 +15,9 @@ describe('SettingsPanel', () => {
       notionApiKey: '',
       notionDatabaseId: '',
       enableLogging: false,
+      enableFailover: true,
+      failoverRetryCount: 1,
+      failoverOnAuthError: false,
     });
   });
 
@@ -33,6 +36,20 @@ describe('SettingsPanel', () => {
     // The component might hold local state until save.
     expect(input).toHaveValue('https://newapi.com/v1')
   })
+
+  it('persists the optional 401 fallback setting only after saving', () => {
+    render(<SettingsPanel onClose={() => {}} />)
+    const option = screen.getByLabelText('认证失败（401）时也尝试备用服务商') as HTMLInputElement
+
+    expect(option).not.toBeChecked()
+    fireEvent.click(option)
+    expect(option).toBeChecked()
+    expect(useSettingsStore.getState().failoverOnAuthError).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    expect(useSettingsStore.getState().failoverOnAuthError).toBe(true)
+  })
+
 })
 
   it('unregisters the persisted global shortcut while recording and restores it after blur', async () => {

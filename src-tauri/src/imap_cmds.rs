@@ -1,6 +1,9 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use imap::Client;
-use mailparse::{parse_mail, DispositionType, ParsedMail};
+use imap_proto::types::{Address, BodyStructure, ContentEncoding, SectionPath};
+use mailparse::{parse_header, parse_mail};
+#[cfg(test)]
+use mailparse::{DispositionType, ParsedMail};
 use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -11,7 +14,6 @@ const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EMAILS_PER_SCAN: usize = 50;
 const MAX_INLINE_IMAGES: usize = 10;
 const MAX_INLINE_IMAGE_BYTES: usize = 500 * 1024;
-const MAX_RAW_EMAIL_BYTES: u32 = 5 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Email {
@@ -118,6 +120,304 @@ pub async fn get_email_folders(
     .map_err(|error| format!("IMAP folder task failed: {error}"))?
 }
 
+const MAX_SELECTIVE_MAIL_PARTS: usize = 12;
+const MAX_INLINE_IMAGE_TRANSFER_BYTES: u32 = 700 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailPartKind {
+    PlainText,
+    Html,
+    InlineImage,
+}
+
+#[derive(Debug, Clone)]
+struct MailPartSelection {
+    section: Vec<u32>,
+    kind: MailPartKind,
+    mime_type: String,
+    charset: Option<String>,
+    transfer_encoding: String,
+}
+
+fn decode_header_value(name: &str, value: Option<&[u8]>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+
+    let mut raw = Vec::with_capacity(name.len() + value.len() + 4);
+    raw.extend_from_slice(name.as_bytes());
+    raw.extend_from_slice(b": ");
+    raw.extend_from_slice(value);
+    parse_header(&raw)
+        .map(|(header, _)| header.get_value())
+        .unwrap_or_else(|_| String::from_utf8_lossy(value).trim().to_string())
+}
+
+fn format_envelope_addresses(addresses: Option<&Vec<Address<'_>>>) -> String {
+    addresses
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|address| {
+                    let name = decode_header_value("From", address.name);
+                    let mailbox = address
+                        .mailbox
+                        .map(|value| String::from_utf8_lossy(value).trim().to_string())
+                        .unwrap_or_default();
+                    let host = address
+                        .host
+                        .map(|value| String::from_utf8_lossy(value).trim().to_string())
+                        .unwrap_or_default();
+                    let email = if mailbox.is_empty() || host.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{mailbox}@{host}")
+                    };
+
+                    match (name.is_empty(), email.is_empty()) {
+                        (false, false) => Some(format!("{name} <{email}>")),
+                        (false, true) => Some(name),
+                        (true, false) => Some(email),
+                        (true, true) => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+fn has_attachment_disposition(structure: &BodyStructure<'_>) -> bool {
+    let disposition = match structure {
+        BodyStructure::Basic { common, .. }
+        | BodyStructure::Text { common, .. }
+        | BodyStructure::Message { common, .. }
+        | BodyStructure::Multipart { common, .. } => common.disposition.as_ref(),
+    };
+    disposition.is_some_and(|value| value.ty.eq_ignore_ascii_case("attachment"))
+}
+
+fn charset_from_params(params: Option<&Vec<(&str, &str)>>) -> Option<String> {
+    params.and_then(|items| {
+        items
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("charset"))
+            .map(|(_, value)| (*value).to_string())
+    })
+}
+
+fn transfer_encoding_name(encoding: &ContentEncoding<'_>) -> String {
+    match encoding {
+        ContentEncoding::SevenBit => "7bit".to_string(),
+        ContentEncoding::EightBit => "8bit".to_string(),
+        ContentEncoding::Binary => "binary".to_string(),
+        ContentEncoding::Base64 => "base64".to_string(),
+        ContentEncoding::QuotedPrintable => "quoted-printable".to_string(),
+        ContentEncoding::Other(value) => (*value).to_string(),
+    }
+}
+
+fn make_part_selection(
+    section: &[u32],
+    kind: MailPartKind,
+    mime_type: String,
+    charset: Option<String>,
+    transfer_encoding: &ContentEncoding<'_>,
+) -> MailPartSelection {
+    MailPartSelection {
+        section: section.to_vec(),
+        kind,
+        mime_type,
+        charset,
+        transfer_encoding: transfer_encoding_name(transfer_encoding),
+    }
+}
+
+fn collect_selective_mail_parts(
+    structure: &BodyStructure<'_>,
+    section: &mut Vec<u32>,
+    selections: &mut Vec<MailPartSelection>,
+) {
+    if selections.len() >= MAX_SELECTIVE_MAIL_PARTS || has_attachment_disposition(structure) {
+        return;
+    }
+
+    match structure {
+        BodyStructure::Multipart { bodies, .. } => {
+            for (index, body) in bodies.iter().enumerate() {
+                if selections.len() >= MAX_SELECTIVE_MAIL_PARTS {
+                    break;
+                }
+                section.push((index + 1) as u32);
+                collect_selective_mail_parts(body, section, selections);
+                section.pop();
+            }
+        }
+        BodyStructure::Text { common, other, .. } => {
+            let kind = if common.ty.subtype.eq_ignore_ascii_case("plain") {
+                Some(MailPartKind::PlainText)
+            } else if common.ty.subtype.eq_ignore_ascii_case("html") {
+                Some(MailPartKind::Html)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                selections.push(make_part_selection(
+                    section,
+                    kind,
+                    format!("{}/{}", common.ty.ty, common.ty.subtype),
+                    charset_from_params(common.ty.params.as_ref()),
+                    &other.transfer_encoding,
+                ));
+            }
+        }
+        BodyStructure::Basic { common, other, .. }
+            if common.ty.ty.eq_ignore_ascii_case("image")
+                && other.octets <= MAX_INLINE_IMAGE_TRANSFER_BYTES
+                && selections
+                    .iter()
+                    .filter(|part| part.kind == MailPartKind::InlineImage)
+                    .count()
+                    < MAX_INLINE_IMAGES =>
+        {
+            selections.push(make_part_selection(
+                section,
+                MailPartKind::InlineImage,
+                format!("{}/{}", common.ty.ty, common.ty.subtype),
+                None,
+                &other.transfer_encoding,
+            ));
+        }
+        // Embedded message bodies and ordinary attachments are deliberately skipped.
+        // They can contain another complete MIME tree or large binary payloads and are
+        // not required for the primary message task-extraction workflow.
+        BodyStructure::Basic { .. } | BodyStructure::Message { .. } => {}
+    }
+}
+
+fn select_mail_parts(structure: &BodyStructure<'_>) -> Vec<MailPartSelection> {
+    let mut selections = Vec::new();
+    collect_selective_mail_parts(structure, &mut Vec::new(), &mut selections);
+    selections
+}
+
+fn fallback_text_part() -> MailPartSelection {
+    MailPartSelection {
+        section: Vec::new(),
+        kind: MailPartKind::PlainText,
+        mime_type: "text/plain".to_string(),
+        charset: Some("utf-8".to_string()),
+        transfer_encoding: "8bit".to_string(),
+    }
+}
+
+fn part_fetch_query(part: &MailPartSelection) -> String {
+    if part.section.is_empty() {
+        "BODY.PEEK[TEXT]".to_string()
+    } else {
+        let section = part
+            .section
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("BODY.PEEK[{section}]")
+    }
+}
+
+fn part_bytes<'a>(message: &'a imap::types::Fetch, part: &MailPartSelection) -> Option<&'a [u8]> {
+    if part.section.is_empty() {
+        message.text()
+    } else {
+        let path = SectionPath::Part(part.section.clone(), None);
+        message.section(&path)
+    }
+}
+
+fn build_part_message(part: &MailPartSelection, bytes: &[u8]) -> Vec<u8> {
+    let mut headers = format!("Content-Type: {}", part.mime_type);
+    if let Some(charset) = &part.charset {
+        headers.push_str("; charset=");
+        headers.push_str(charset);
+    }
+    headers.push_str("\r\nContent-Transfer-Encoding: ");
+    headers.push_str(&part.transfer_encoding);
+    headers.push_str("\r\n\r\n");
+
+    let mut raw = headers.into_bytes();
+    raw.extend_from_slice(bytes);
+    raw
+}
+
+fn decode_part_as_text(part: &MailPartSelection, bytes: &[u8]) -> Option<String> {
+    parse_mail(&build_part_message(part, bytes))
+        .ok()
+        .and_then(|mail| mail.get_body().ok())
+}
+
+fn decode_part_as_binary(part: &MailPartSelection, bytes: &[u8]) -> Option<Vec<u8>> {
+    parse_mail(&build_part_message(part, bytes))
+        .ok()
+        .and_then(|mail| mail.get_body_raw().ok())
+}
+
+fn extract_selected_mail_content(
+    message: &imap::types::Fetch,
+    selections: &[MailPartSelection],
+) -> (String, Option<String>, Vec<String>) {
+    let mut plain_texts = Vec::new();
+    let mut html_texts = Vec::new();
+    let mut images = Vec::new();
+
+    for part in selections {
+        let Some(bytes) = part_bytes(message, part) else {
+            continue;
+        };
+
+        match part.kind {
+            MailPartKind::PlainText => {
+                if let Some(text) = decode_part_as_text(part, bytes) {
+                    plain_texts.push(text);
+                }
+            }
+            MailPartKind::Html => {
+                if let Some(html) = decode_part_as_text(part, bytes) {
+                    html_texts.push(html);
+                }
+            }
+            MailPartKind::InlineImage => {
+                if images.len() >= MAX_INLINE_IMAGES {
+                    continue;
+                }
+                if let Some(raw) = decode_part_as_binary(part, bytes) {
+                    if raw.len() <= MAX_INLINE_IMAGE_BYTES {
+                        images.push(format!(
+                            "data:{};base64,{}",
+                            part.mime_type,
+                            STANDARD.encode(raw)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let body_text = if !plain_texts.is_empty() {
+        plain_texts.join("\n")
+    } else if !html_texts.is_empty() {
+        html_texts
+            .iter()
+            .map(|html| html.replace("<br>", "\n").replace("<br/>", "\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    let html_body = (!html_texts.is_empty()).then(|| html_texts.join("<hr>"));
+    (body_text, html_body, images)
+}
+
+#[cfg(test)]
 fn extract_mail_content(parsed: &ParsedMail) -> (String, Option<String>, Vec<String>) {
     let mut plain_texts = Vec::new();
     let mut html_texts = Vec::new();
@@ -232,110 +532,82 @@ pub async fn fetch_emails(request: FetchEmailsRequest) -> Result<Vec<Email>, Str
         let mut emails = Vec::new();
         for uid in uids.into_iter().take(MAX_EMAILS_PER_SCAN) {
             let metadata = session
-                .uid_fetch(uid.to_string(), "RFC822.SIZE")
+                .uid_fetch(uid.to_string(), "ENVELOPE BODYSTRUCTURE")
                 .map_err(|error| format!("Metadata fetch error for UID {uid}: {error}"))?;
-            if metadata
-                .iter()
-                .next()
-                .and_then(|message| message.size)
-                .is_some_and(|size| size > MAX_RAW_EMAIL_BYTES)
-            {
+            let Some(metadata) = metadata.iter().next() else {
                 emails.push(Email {
                     uid,
                     uid_validity,
                     sender: String::new(),
-                    subject: "(邮件过大，已跳过正文下载)".to_string(),
+                    subject: "(无法读取邮件元数据)".to_string(),
                     date: String::new(),
                     body_text: String::new(),
                     html_body: None,
                     inline_images: Vec::new(),
-                    parse_error: Some(format!(
-                        "Email size exceeds {} MB limit",
-                        MAX_RAW_EMAIL_BYTES / 1024 / 1024
-                    )),
-                });
-                continue;
-            }
-
-            let messages = session
-                .uid_fetch(uid.to_string(), "BODY.PEEK[]")
-                .map_err(|error| format!("Fetch Error for UID {uid}: {error}"))?;
-
-            let Some(message) = messages.iter().next() else {
-                emails.push(Email {
-                    uid,
-                    uid_validity,
-                    sender: String::new(),
-                    subject: "(无法读取邮件)".to_string(),
-                    date: String::new(),
-                    body_text: String::new(),
-                    html_body: None,
-                    inline_images: Vec::new(),
-                    parse_error: Some("IMAP fetch returned no message body".to_string()),
+                    parse_error: Some("IMAP fetch returned no message metadata".to_string()),
                 });
                 continue;
             };
 
-            let Some(body) = message.body() else {
-                emails.push(Email {
-                    uid,
-                    uid_validity,
-                    sender: String::new(),
-                    subject: "(无法读取邮件)".to_string(),
-                    date: String::new(),
-                    body_text: String::new(),
-                    html_body: None,
-                    inline_images: Vec::new(),
-                    parse_error: Some("IMAP message has no body".to_string()),
-                });
-                continue;
+            let (sender, subject, date, selections) = {
+                let envelope = metadata.envelope();
+                let sender = envelope
+                    .map(|value| format_envelope_addresses(value.from.as_ref()))
+                    .unwrap_or_default();
+                let subject = envelope
+                    .map(|value| decode_header_value("Subject", value.subject))
+                    .unwrap_or_default();
+                let date = envelope
+                    .map(|value| decode_header_value("Date", value.date))
+                    .unwrap_or_default();
+                let selections = metadata
+                    .bodystructure()
+                    .map(select_mail_parts)
+                    // Non-conformant servers occasionally omit BODYSTRUCTURE. In that
+                    // case, fetch only BODY[TEXT] rather than the full MIME message.
+                    .unwrap_or_else(|| vec![fallback_text_part()]);
+                (sender, subject, date, selections)
             };
 
-            match parse_mail(body) {
-                Ok(parsed) => {
-                    let subject = parsed
-                        .headers
-                        .iter()
-                        .find(|header| header.get_key_ref().eq_ignore_ascii_case("subject"))
-                        .map(|header| header.get_value())
-                        .unwrap_or_default();
-                    let sender = parsed
-                        .headers
-                        .iter()
-                        .find(|header| header.get_key_ref().eq_ignore_ascii_case("from"))
-                        .map(|header| header.get_value())
-                        .unwrap_or_default();
-                    let date = parsed
-                        .headers
-                        .iter()
-                        .find(|header| header.get_key_ref().eq_ignore_ascii_case("date"))
-                        .map(|header| header.get_value())
-                        .unwrap_or_default();
-                    let (body_text, html_body, inline_images) = extract_mail_content(&parsed);
+            let (body_text, html_body, inline_images) = if selections.is_empty() {
+                (String::new(), None, Vec::new())
+            } else {
+                let query = selections
+                    .iter()
+                    .map(part_fetch_query)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let messages = session
+                    .uid_fetch(uid.to_string(), &query)
+                    .map_err(|error| format!("Fetch Error for UID {uid}: {error}"))?;
+                let Some(message) = messages.iter().next() else {
                     emails.push(Email {
                         uid,
                         uid_validity,
                         sender,
                         subject,
                         date,
-                        body_text,
-                        html_body,
-                        inline_images,
-                        parse_error: None,
+                        body_text: String::new(),
+                        html_body: None,
+                        inline_images: Vec::new(),
+                        parse_error: Some("IMAP fetch returned no selected MIME parts".to_string()),
                     });
-                }
-                Err(error) => emails.push(Email {
-                    uid,
-                    uid_validity,
-                    sender: String::new(),
-                    subject: "(邮件 MIME 解析失败)".to_string(),
-                    date: String::new(),
-                    body_text: String::new(),
-                    html_body: None,
-                    inline_images: Vec::new(),
-                    parse_error: Some(format!("MIME parse error: {error}")),
-                }),
-            }
+                    continue;
+                };
+                extract_selected_mail_content(message, &selections)
+            };
+
+            emails.push(Email {
+                uid,
+                uid_validity,
+                sender,
+                subject,
+                date,
+                body_text,
+                html_body,
+                inline_images,
+                parse_error: None,
+            });
         }
 
         session
@@ -378,6 +650,59 @@ pub async fn mark_email_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use imap_proto::types::{
+        BodyContentCommon, BodyContentSinglePart, ContentDisposition, ContentType,
+    };
+
+    fn common(
+        ty: &'static str,
+        subtype: &'static str,
+        disposition: Option<&'static str>,
+    ) -> BodyContentCommon<'static> {
+        BodyContentCommon {
+            ty: ContentType {
+                ty,
+                subtype,
+                params: None,
+            },
+            disposition: disposition.map(|ty| ContentDisposition { ty, params: None }),
+            language: None,
+            location: None,
+        }
+    }
+
+    fn single_part(
+        transfer_encoding: ContentEncoding<'static>,
+        octets: u32,
+    ) -> BodyContentSinglePart<'static> {
+        BodyContentSinglePart {
+            id: None,
+            md5: None,
+            description: None,
+            transfer_encoding,
+            octets,
+        }
+    }
+
+    fn text_part(
+        subtype: &'static str,
+        disposition: Option<&'static str>,
+    ) -> BodyStructure<'static> {
+        BodyStructure::Text {
+            common: common("text", subtype, disposition),
+            other: single_part(ContentEncoding::EightBit, 128),
+            lines: 1,
+            extension: None,
+        }
+    }
+
+    fn image_part(disposition: Option<&'static str>) -> BodyStructure<'static> {
+        BodyStructure::Basic {
+            common: common("image", "png", disposition),
+            other: single_part(ContentEncoding::Base64, 128),
+            extension: None,
+        }
+    }
 
     #[test]
     fn extracts_plain_text() {
@@ -413,5 +738,46 @@ mod tests {
         assert_eq!(html, None);
         assert_eq!(images.len(), 1);
         assert!(images[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn selects_only_readable_text_html_and_inline_images() {
+        let structure = BodyStructure::Multipart {
+            common: common("multipart", "mixed", None),
+            bodies: vec![
+                text_part("plain", None),
+                text_part("html", None),
+                image_part(Some("inline")),
+                image_part(Some("attachment")),
+                text_part("plain", Some("attachment")),
+            ],
+            extension: None,
+        };
+
+        let selections = select_mail_parts(&structure);
+        assert_eq!(selections.len(), 3);
+        assert_eq!(selections[0].section, vec![1]);
+        assert_eq!(selections[0].kind, MailPartKind::PlainText);
+        assert_eq!(selections[1].section, vec![2]);
+        assert_eq!(selections[1].kind, MailPartKind::Html);
+        assert_eq!(selections[2].section, vec![3]);
+        assert_eq!(selections[2].kind, MailPartKind::InlineImage);
+        assert_eq!(part_fetch_query(&selections[0]), "BODY.PEEK[1]");
+    }
+
+    #[test]
+    fn decodes_text_larger_than_the_previous_five_megabyte_raw_message_limit() {
+        let part = MailPartSelection {
+            section: vec![1],
+            kind: MailPartKind::PlainText,
+            mime_type: "text/plain".to_string(),
+            charset: Some("utf-8".to_string()),
+            transfer_encoding: "8bit".to_string(),
+        };
+        let body = "a".repeat(5 * 1024 * 1024 + 1);
+
+        let decoded =
+            decode_part_as_text(&part, body.as_bytes()).expect("large text should decode");
+        assert_eq!(decoded.len(), body.len());
     }
 }

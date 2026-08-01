@@ -147,9 +147,10 @@ interface SettingsState {
   llmProviders?: LLMProvider[];
   enableFailover: boolean;
   failoverRetryCount: number;
+  failoverOnAuthError: boolean;
   isWindowMode: boolean;
   setLLMProviders: (providers: LLMProvider[]) => void;
-  setFailoverConfig: (enable: boolean, retryCount: number) => void;
+  setFailoverConfig: (enable: boolean, retryCount: number, failoverOnAuthError: boolean) => void;
   setApiSettings: (baseUrl: string, key: string, model: string) => void;
   setPersonalFocus: (focus: string) => void; // Legacy
   setPromptMode: (mode: 'static' | 'auto') => void;
@@ -204,6 +205,7 @@ export const useSettingsStore = create<SettingsState>()(
       },
       enableFailover: true,
       failoverRetryCount: 1,
+      failoverOnAuthError: false,
       isWindowMode: false,
       setApiSettings: (apiBaseUrl, apiKey, modelName) => set((state) => {
         const providers = state.llmProviders && state.llmProviders.length > 0
@@ -219,7 +221,7 @@ export const useSettingsStore = create<SettingsState>()(
         }
         return { llmProviders };
       }),
-      setFailoverConfig: (enableFailover, failoverRetryCount) => set({ enableFailover, failoverRetryCount }),
+      setFailoverConfig: (enableFailover, failoverRetryCount, failoverOnAuthError) => set({ enableFailover, failoverRetryCount, failoverOnAuthError }),
       setPersonalFocus: (personalFocus) => set({ personalFocus }),
       setPromptMode: (promptMode) => set({ promptMode }),
       setStaticFocus: (staticPersonalFocus) => set({ 

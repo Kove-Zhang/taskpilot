@@ -1,5 +1,6 @@
 import { useSettingsStore, getEffectiveFocus } from '../store';
 import type { TodoItem } from './ai';
+import type { FeedbackType } from './feedbackAvailability';
 import { callAIWithFailover } from './ai';
 import { logger } from './logger';
 import { loadHistory } from './history';
@@ -31,7 +32,8 @@ function buildNotionSchemaDescription(): string {
 export async function backgroundReviewAndUpdateFocus(
   originalResult: TodoItem[], 
   acceptedResult: TodoItem[],
-  explicitFeedback?: string
+  explicitFeedback?: string,
+  feedbackType: FeedbackType = 'over_extraction'
 ) {
   try {
     const state = useSettingsStore.getState();
@@ -53,6 +55,13 @@ export async function backgroundReviewAndUpdateFocus(
       orig => !acceptedResult.find(acc => acc.id === orig.id)
     );
 
+    const feedbackTypeDescription = feedbackType === 'missed_extraction'
+      ? '漏提取：AI 没有识别出用户认为应当出现的待办。'
+      : '误提取：AI 提取了用户认为不应出现的待办。';
+    const feedbackSpecificGuidance = feedbackType === 'missed_extraction'
+      ? '本次 AI 输出为空或缺少关键行动项。请从用户补充中归纳必须识别的行动信号、责任表达、截止时间和上下文；不能因为本次待办数组为空就忽略该负反馈。'
+      : '请从被拒绝的待办和用户补充中归纳不应被识别为行动项的内容、噪音或错误优先级。';
+
     const systemPrompt = `你是一个后台自我迭代与 Prompt 工程师助手。
 您的任务是分析用户对历史提取任务的修改痕迹（特别是负向反馈），进而自动演进和更新全局的【任务提取关注点提示词】。
 
@@ -61,6 +70,12 @@ ${notionSchema}
 
 【当前系统的任务提取提示词】
 ${currentFocus}
+
+【本次负反馈类型】
+${feedbackTypeDescription}
+
+【针对本次反馈的分析重点】
+${feedbackSpecificGuidance}
 
 【用户认可并最终勾选同步的待办】
 ${JSON.stringify(acceptedResult)}

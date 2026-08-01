@@ -11,9 +11,19 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::{ptr, slice};
 use tauri::Emitter;
+
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::LocalFree,
+    Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    },
+};
 
 mod imap_cmds;
 use imap_cmds::{fetch_emails, get_email_folders, mark_email_read};
@@ -43,40 +53,165 @@ fn get_key_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, String> {
-    let entry = Entry::new("task-pilot", "history-key").map_err(|e| e.to_string())?;
+fn get_secret_recovery_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut path = app_data_dir(app_handle)?;
+    path.push("secrets-key.dpapi");
+    Ok(path)
+}
 
-    // Check if secure key exists
-    if let Ok(password) = entry.get_password() {
-        if let Ok(key) = STANDARD.decode(&password) {
-            if key.len() == 32 {
+#[cfg(target_os = "windows")]
+fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.is_empty() || data.len() > u32::MAX as usize {
+        return Err("无效的 DPAPI 加密数据长度".to_string());
+    }
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        CryptProtectData(
+            &input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if success == 0 || output.pbData.is_null() {
+        return Err("Windows DPAPI 无法保护应用密钥".to_string());
+    }
+
+    let protected =
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(protected)
+}
+
+#[cfg(target_os = "windows")]
+fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.is_empty() || data.len() > u32::MAX as usize {
+        return Err("无效的 DPAPI 恢复数据长度".to_string());
+    }
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        CryptUnprotectData(
+            &input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if success == 0 || output.pbData.is_null() {
+        return Err("Windows DPAPI 无法恢复应用密钥".to_string());
+    }
+
+    let plaintext =
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(plaintext)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dpapi_protect(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("当前系统不支持 Windows DPAPI 密钥恢复".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dpapi_unprotect(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("当前系统不支持 Windows DPAPI 密钥恢复".to_string())
+}
+
+fn read_secret_recovery_key(app_handle: &tauri::AppHandle) -> Result<Option<Vec<u8>>, String> {
+    let path = get_secret_recovery_path(app_handle)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let protected =
+        fs::read(&path).map_err(|error| format!("无法读取应用密钥恢复副本: {error}"))?;
+    let key = dpapi_unprotect(&protected)?;
+    if key.len() != 32 {
+        return Err("应用密钥恢复副本格式无效".to_string());
+    }
+    Ok(Some(key))
+}
+
+fn write_secret_recovery_key(app_handle: &tauri::AppHandle, key: &[u8]) -> Result<(), String> {
+    if key.len() != 32 {
+        return Err("应用密钥长度无效".to_string());
+    }
+
+    let path = get_secret_recovery_path(app_handle)?;
+    if path.exists() {
+        let existing = read_secret_recovery_key(app_handle)?;
+        if existing.as_deref() == Some(key) {
+            return Ok(());
+        }
+        return Err(
+            "系统凭据库密钥与 DPAPI 恢复副本不一致；为避免覆盖既有加密设置，已停止操作。"
+                .to_string(),
+        );
+    }
+
+    let protected = dpapi_protect(key)?;
+    fs::write(&path, protected).map_err(|error| format!("无法写入应用密钥恢复副本: {error}"))
+}
+
+fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, String> {
+    let entry = Entry::new("task-pilot", "history-key").map_err(|error| error.to_string())?;
+    let key_path = get_key_path(app_handle)?;
+
+    match entry.get_password() {
+        Ok(password) => {
+            let key = STANDARD.decode(&password).map_err(|_| {
+                "系统凭据库中的历史密钥格式无效。请先备份历史文件后重新配置。".to_string()
+            })?;
+            if key.len() != 32 {
+                return Err(
+                    "系统凭据库中的历史密钥长度无效。请先备份历史文件后重新配置。".to_string(),
+                );
+            }
+            Ok(key)
+        }
+        Err(keyring::Error::NoEntry) => {
+            if key_path.exists() {
+                let key =
+                    fs::read(&key_path).map_err(|error| format!("无法读取旧历史密钥: {error}"))?;
+                if key.len() != 32 {
+                    return Err("旧历史密钥格式无效。请先备份历史文件后重新配置。".to_string());
+                }
+
+                entry
+                    .set_password(&STANDARD.encode(&key))
+                    .map_err(|error| format!("无法将历史密钥迁移至系统凭据库: {error}"))?;
+                // Keep the legacy file for a user-controlled backup/cleanup step.
                 return Ok(key);
             }
+
+            let key = Aes256Gcm::generate_key(OsRng).to_vec();
+            entry
+                .set_password(&STANDARD.encode(&key))
+                .map_err(|error| format!("无法在系统凭据库中创建历史密钥: {error}"))?;
+            Ok(key)
         }
+        Err(error) => Err(format!("无法访问系统凭据库以读取历史密钥: {error}")),
     }
-
-    // Check legacy file
-    let key_path = get_key_path(app_handle)?;
-    if key_path.exists() {
-        if let Ok(key_bytes) = fs::read(&key_path) {
-            if key_bytes.len() == 32 {
-                // Try to migrate to keyring, but do NOT delete the legacy file
-                // because keyring can be volatile/broken on some Windows setups.
-                let _ = entry.set_password(&STANDARD.encode(&key_bytes));
-                return Ok(key_bytes);
-            }
-        }
-    }
-
-    // Generate new key
-    let key = Aes256Gcm::generate_key(OsRng);
-    let key_vec = key.to_vec();
-
-    // Always write to local file as a reliable fallback
-    let _ = fs::write(&key_path, &key_vec);
-    let _ = entry.set_password(&STANDARD.encode(&key_vec));
-
-    Ok(key_vec)
 }
 
 fn encrypt_history(data: &str, key_bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -422,8 +557,9 @@ fn set_recording_mode(app_handle: tauri::AppHandle, is_recording: bool) {
     state.is_recording.store(is_recording, Ordering::SeqCst);
 }
 
-fn get_machine_key() -> Result<[u8; 32], String> {
-    let uid = machine_uid::get().unwrap_or_else(|_| "fallback-uid-task-pilot".to_string());
+// Only used to read settings encrypted by legacy versions. New secrets must use the OS keyring.
+fn get_legacy_machine_key() -> Result<[u8; 32], String> {
+    let uid = machine_uid::get().map_err(|error| format!("无法读取旧版机器标识: {error}"))?;
     let mut hasher = Sha256::new();
     hasher.update(uid.as_bytes());
     let result = hasher.finalize();
@@ -433,11 +569,11 @@ fn get_machine_key() -> Result<[u8; 32], String> {
 }
 
 #[tauri::command]
-fn encrypt_secret(value: String) -> Result<String, String> {
+fn encrypt_secret(app_handle: tauri::AppHandle, value: String) -> Result<String, String> {
     if value.is_empty() {
         return Ok("".to_string());
     }
-    let key = get_or_create_secret_key()?;
+    let key = get_or_create_secret_key(&app_handle)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
 
@@ -449,29 +585,42 @@ fn encrypt_secret(value: String) -> Result<String, String> {
     Ok(STANDARD.encode(final_data))
 }
 
-fn get_or_create_secret_key() -> Result<Vec<u8>, String> {
-    let entry = Entry::new("task-pilot", "secrets-key").map_err(|e| e.to_string())?;
+fn decode_keyring_secret_key(password: &str) -> Option<Vec<u8>> {
+    STANDARD.decode(password).ok().filter(|key| key.len() == 32)
+}
 
-    if let Ok(password) = entry.get_password() {
-        if let Ok(key) = STANDARD.decode(&password) {
-            if key.len() == 32 {
+fn get_or_create_secret_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, String> {
+    let entry = Entry::new("task-pilot", "secrets-key").ok();
+
+    if let Some(entry) = entry.as_ref() {
+        if let Ok(password) = entry.get_password() {
+            if let Some(key) = decode_keyring_secret_key(&password) {
+                write_secret_recovery_key(app_handle, &key)?;
                 return Ok(key);
             }
         }
     }
 
-    // If keyring fails to retrieve, use the deterministic machine key
-    // instead of generating a random key, because keyring might fail to persist it.
-    let machine_key = get_machine_key()?.to_vec();
+    if let Some(key) = read_secret_recovery_key(app_handle)? {
+        if let Some(entry) = entry.as_ref() {
+            let _ = entry.set_password(&STANDARD.encode(&key));
+        }
+        return Ok(key);
+    }
 
-    // Try to save it to keyring anyway
-    let _ = entry.set_password(&STANDARD.encode(&machine_key));
-
-    Ok(machine_key)
+    let key = Aes256Gcm::generate_key(OsRng).to_vec();
+    // Create the DPAPI-protected recovery copy before returning the key. If this
+    // cannot be written, fail the save instead of creating ciphertext that the
+    // next application start cannot decrypt.
+    write_secret_recovery_key(app_handle, &key)?;
+    if let Some(entry) = entry.as_ref() {
+        let _ = entry.set_password(&STANDARD.encode(&key));
+    }
+    Ok(key)
 }
 
 #[tauri::command]
-fn decrypt_secret(cipher_text: String) -> Result<String, String> {
+fn decrypt_secret(app_handle: tauri::AppHandle, cipher_text: String) -> Result<String, String> {
     if cipher_text.is_empty() {
         return Ok("".to_string());
     }
@@ -488,8 +637,8 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    // Try new Keyring key first
-    if let Ok(key) = get_or_create_secret_key() {
+    // Prefer the keyring key and its DPAPI-protected recovery copy.
+    if let Ok(key) = get_or_create_secret_key(&app_handle) {
         if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
             if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
                 if let Ok(s) = String::from_utf8(plaintext) {
@@ -500,7 +649,7 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
     }
 
     // Fallback to legacy machine_uid key
-    if let Ok(key) = get_machine_key() {
+    if let Ok(key) = get_legacy_machine_key() {
         if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
             if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
                 if let Ok(s) = String::from_utf8(plaintext) {
@@ -515,6 +664,31 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
     // Returning the raw ciphertext causes double-encryption bugs and UI confusion.
     // We MUST return an empty string to clear the corrupted state so the user can re-enter it.
     Ok("".to_string())
+}
+
+#[cfg(test)]
+mod secret_key_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_a_valid_256_bit_keyring_key() {
+        let valid = STANDARD.encode([7u8; 32]);
+        assert_eq!(decode_keyring_secret_key(&valid), Some(vec![7u8; 32]));
+        assert_eq!(decode_keyring_secret_key("invalid"), None);
+        assert_eq!(decode_keyring_secret_key(&STANDARD.encode([7u8; 31])), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dpapi_recovery_material_round_trips_for_the_current_windows_user() {
+        let key = [42u8; 32];
+        let protected = dpapi_protect(&key).expect("DPAPI should protect the recovery key");
+        assert_ne!(protected, key);
+        assert_eq!(
+            dpapi_unprotect(&protected).expect("DPAPI should restore the recovery key"),
+            key
+        );
+    }
 }
 
 fn toggle_main_window(app: &tauri::AppHandle) {

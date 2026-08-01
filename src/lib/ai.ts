@@ -2,6 +2,7 @@ import { useSettingsStore, getSortedLLMProviders, getEffectiveFocus, type LLMPro
 import { HttpRequestError, isRetryableHttpStatus, isRetryableTransportError } from './http'
 import { logger } from './logger'
 import { requestProviderChatCompletion } from './providerTransport'
+import type { FeedbackType } from './feedbackAvailability'
 
 export interface AIResult {
   id?: string;
@@ -12,6 +13,7 @@ export interface AIResult {
   syncedToNotion?: boolean;
   feedbackStatus?: 'processing' | 'completed';
   explicitFeedback?: string;
+  feedbackType?: FeedbackType;
   isRejected?: boolean;
 }
 
@@ -94,7 +96,7 @@ export async function callAIWithFailover(
   buildPayload: (provider: LLMProvider) => ChatCompletionPayload,
   logContextName: string,
 ): Promise<string> {
-  const { enableFailover, failoverRetryCount, apiBaseUrl, apiKey, modelName } = useSettingsStore.getState()
+  const { enableFailover, failoverRetryCount, failoverOnAuthError, apiBaseUrl, apiKey, modelName } = useSettingsStore.getState()
   let providers = getSortedLLMProviders().filter((provider) => provider.enabled)
 
   if (providers.length === 0 || providers.every((provider) => !provider.apiKey.trim())) {
@@ -148,18 +150,38 @@ export async function callAIWithFailover(
           lastRetryableError = error
           logger.warn(error.message)
         } else {
-          const content = getCompletionContent(await response.json(), provider.name)
+          let responseData: unknown
+          try {
+            responseData = await response.json()
+          } catch {
+            throw new HttpRequestError(`服务商 [${provider.name}] 返回的成功响应不是有效 JSON`, {
+              isRetryable: true,
+            })
+          }
+          const content = getCompletionContent(responseData, provider.name)
           logger.info(`[${logContextName}] 成功收到回复 <- 服务商: [${provider.name}]`, { contentLength: content.length })
           return content
         }
       } catch (error) {
-        if (error instanceof HttpRequestError && error.status !== undefined && !isRetryableHttpStatus(error.status)) {
+        const isAuthenticationFailure = error instanceof HttpRequestError && error.status === 401
+        const shouldFailoverOnAuthenticationFailure = enableFailover && failoverOnAuthError && isAuthenticationFailure
+
+        if (isAuthenticationFailure && !shouldFailoverOnAuthenticationFailure) {
           throw error
         }
-        if (!isRetryableTransportError(error) && !(error instanceof HttpRequestError && error.status !== undefined)) {
+        if (error instanceof HttpRequestError && error.status !== undefined && !isRetryableHttpStatus(error.status) && !shouldFailoverOnAuthenticationFailure) {
+          throw error
+        }
+        if (!shouldFailoverOnAuthenticationFailure && !isRetryableTransportError(error) && !(error instanceof HttpRequestError && error.status !== undefined)) {
           throw error instanceof Error ? error : new Error(String(error))
         }
         lastRetryableError = error instanceof Error ? error : new Error(String(error))
+
+        if (shouldFailoverOnAuthenticationFailure) {
+          logger.warn(`[${logContextName}] 服务商 [${provider.name}] 认证失败（401），已启用认证失败备用服务商策略，将直接轮换。`)
+          break
+        }
+
         logger.warn(`[${logContextName}] 可重试调用失败 -> 服务商: [${provider.name}] (尝试 ${attempt}/${maxRetriesPerProvider}): ${lastRetryableError.message}`)
       }
 

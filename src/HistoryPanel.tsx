@@ -1,8 +1,9 @@
 import { useState, useEffect, useMemo } from 'react'
-import { X, Clock, Trash2, ChevronDown, ChevronUp, Loader2 } from 'lucide-react'
+import { X, Clock, Trash2, ChevronDown, ChevronUp } from 'lucide-react'
 import type { AIResult } from './lib/ai'
 import { loadHistory, updateHistory, type HistoryEntry } from './lib/history'
 import { useSettingsStore, useUIStore } from './store'
+import { FeedbackHistoryCard, FeedbackStatusBadge } from './components/FeedbackHistoryCard'
 
 interface HistoryPanelProps {
   onClose: () => void;
@@ -174,21 +175,19 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                           className="bg-slate-900/50 p-4 rounded-lg border border-white/5 relative group cursor-pointer hover:border-blue-500/50 transition-colors"
                           title="双击恢复此记录"
                         >
-                          {entry.result.feedbackStatus === 'processing' && (
-                            <div className="absolute top-4 right-12 text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded border border-yellow-500/30 flex items-center gap-1">
-                              <Loader2 className="w-3 h-3 animate-spin" /> 正在教导 AI...
-                            </div>
-                          )}
-                          {entry.result.isRejected && (
-                            <div className="absolute top-4 right-12 text-xs bg-red-500/20 text-red-400 px-2 py-0.5 rounded border border-red-500/30">
-                              ❌ 已发送纠错
-                            </div>
-                          )}
-                          {entry.result.syncedToNotion && !entry.result.isRejected && (
-                            <div className="absolute top-4 right-12 text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30">
-                              已推送
-                            </div>
-                          )}
+                          <div className="absolute top-4 right-12 flex max-w-[calc(100%-6rem)] flex-wrap justify-end gap-1.5">
+                            <FeedbackStatusBadge
+                              feedbackStatus={entry.result.feedbackStatus}
+                              feedbackType={entry.result.feedbackType}
+                              explicitFeedback={entry.result.explicitFeedback}
+                              isRejected={entry.result.isRejected}
+                            />
+                            {entry.result.syncedToNotion && (
+                              <span className="inline-flex h-6 items-center rounded-md border border-green-500/30 bg-green-500/20 px-2.5 py-0.5 text-xs font-medium text-green-400">
+                                已推送
+                              </span>
+                            )}
+                          </div>
                           <button 
                             onClick={(e) => {
                               e.stopPropagation();
@@ -201,12 +200,13 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                           </button>
                           <div className="text-xs text-slate-500 mb-2 pr-8">{new Date(entry.timestamp).toLocaleString()}</div>
                           
-                          {entry.result.isRejected ? (
-                            <div className="mt-3 bg-red-950/30 border border-red-500/20 p-3 rounded-md">
-                              <div className="text-xs text-red-400 mb-1">您当时对 AI 的纠正/吐槽：</div>
-                              <div className="text-sm text-slate-300 italic">"{entry.result.explicitFeedback || '暂无说明'}"</div>
-                            </div>
-                          ) : (
+                          <FeedbackHistoryCard
+                            feedbackStatus={entry.result.feedbackStatus}
+                            feedbackType={entry.result.feedbackType}
+                            explicitFeedback={entry.result.explicitFeedback}
+                            isRejected={entry.result.isRejected}
+                          />
+                          {entry.result.isRejected ? null : (
                             <>
                               <div className="text-sm text-slate-300 mb-3 line-clamp-2">{entry.result.summary}</div>
                               <div className="space-y-1.5">

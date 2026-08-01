@@ -24,6 +24,7 @@ describe('AI Helper Methods', () => {
       llmProviders: [],
       enableFailover: true,
       failoverRetryCount: 1,
+      failoverOnAuthError: false,
     })
   })
 
@@ -110,4 +111,174 @@ describe('AI Helper Methods', () => {
 
     expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(1)
   })
+
+  it('rotates on a retryable 429 response after the current provider attempt', async () => {
+    useSettingsStore.setState({ llmProviders: [...providers].reverse(), enableFailover: true, failoverRetryCount: 1 })
+    let requestCount = 0
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command !== 'request_custom_llm') return undefined
+      requestCount += 1
+      if (requestCount === 1) return { status: 429, body: 'rate limited' }
+      return {
+        status: 200,
+        body: JSON.stringify({ choices: [{ message: { content: '429 fallback answer' } }] }),
+      }
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      '429-failover-test',
+    )).resolves.toBe('429 fallback answer')
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm').map(([, args]) => (
+      args as { request: { url: string } }
+    ).request.url)).toEqual([
+      'https://first.example/v1/chat/completions',
+      'https://second.example/v1/chat/completions',
+    ])
+  })
+
+  it('does not rotate when failover is disabled after a retryable failure', async () => {
+    useSettingsStore.setState({ llmProviders: providers, enableFailover: false, failoverRetryCount: 1 })
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'request_custom_llm') return { status: 503, body: 'unavailable' }
+      return undefined
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      'failover-disabled-test',
+    )).rejects.toThrow('(503)')
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(1)
+  })
+
+
+  it('rotates on a retryable 5xx response', async () => {
+    useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 1 })
+    let requestCount = 0
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command !== 'request_custom_llm') return undefined
+      requestCount += 1
+      if (requestCount === 1) return { status: 503, body: 'service unavailable' }
+      return {
+        status: 200,
+        body: JSON.stringify({ choices: [{ message: { content: '5xx fallback answer' } }] }),
+      }
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      '5xx-failover-test',
+    )).resolves.toBe('5xx fallback answer')
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(2)
+  })
+
+
+  it.each([409, 425])('rotates on retryable HTTP status %i', async (status) => {
+    useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 1 })
+    let requestCount = 0
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command !== 'request_custom_llm') return undefined
+      requestCount += 1
+      if (requestCount === 1) return { status, body: `retryable status ${status}` }
+      return {
+        status: 200,
+        body: JSON.stringify({ choices: [{ message: { content: `${status} fallback answer` } }] }),
+      }
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      `${status}-failover-test`,
+    )).resolves.toBe(`${status} fallback answer`)
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(2)
+  })
+
+  it('rotates when a provider returns an invalid JSON success response', async () => {
+    useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 1 })
+    let requestCount = 0
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command !== 'request_custom_llm') return undefined
+      requestCount += 1
+      if (requestCount === 1) return { status: 200, body: '{invalid-json' }
+      return {
+        status: 200,
+        body: JSON.stringify({ choices: [{ message: { content: 'json fallback answer' } }] }),
+      }
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      'invalid-json-failover-test',
+    )).resolves.toBe('json fallback answer')
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(2)
+  })
+
+  it('rotates after a retryable custom-provider DNS resolution failure', async () => {
+    useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 1 })
+    let requestCount = 0
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command !== 'request_custom_llm') return undefined
+      requestCount += 1
+      if (requestCount === 1) throw new Error('无法解析自定义供应商域名: DNS lookup failed')
+      return {
+        status: 200,
+        body: JSON.stringify({ choices: [{ message: { content: 'dns fallback answer' } }] }),
+      }
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      'dns-failover-test',
+    )).resolves.toBe('dns fallback answer')
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(2)
+  })
+
+
+  it('does not rotate on a 401 authentication failure by default', async () => {
+    useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 1, failoverOnAuthError: false })
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'request_custom_llm') return { status: 401, body: 'invalid api key' }
+      return undefined
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      '401-default-test',
+    )).rejects.toThrow('(401)')
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm')).toHaveLength(1)
+  })
+
+  it('rotates directly to the next provider when 401 fallback is enabled', async () => {
+    useSettingsStore.setState({ llmProviders: providers, enableFailover: true, failoverRetryCount: 3, failoverOnAuthError: true })
+    let requestCount = 0
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command !== 'request_custom_llm') return undefined
+      requestCount += 1
+      if (requestCount === 1) return { status: 401, body: 'invalid api key' }
+      return {
+        status: 200,
+        body: JSON.stringify({ choices: [{ message: { content: 'authenticated fallback answer' } }] }),
+      }
+    })
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      '401-enabled-test',
+    )).resolves.toBe('authenticated fallback answer')
+
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'request_custom_llm').map(([, args]) => (
+      args as { request: { url: string } }
+    ).request.url)).toEqual([
+      'https://first.example/v1/chat/completions',
+      'https://second.example/v1/chat/completions',
+    ])
+  })
+
 })

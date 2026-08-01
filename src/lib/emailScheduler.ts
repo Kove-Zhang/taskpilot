@@ -7,6 +7,8 @@ import { syncToNotion } from './notion';
 import { logger } from './logger';
 import { LazyStore } from '@tauri-apps/plugin-store';
 import { compressBase64Image } from './imageUtils';
+import { limitEmailHistoryHtml, limitEmailHistoryText } from './emailHistoryContent';
+import { isRetryableRequestError } from './http';
 
 export interface EmailHistoryItem {
     batchId: string;
@@ -25,6 +27,8 @@ export interface EmailHistoryItem {
     htmlBody?: string;
     inlineImages?: string[];
     reviewed?: boolean;
+    /** True only when the latest failure was caused by a transient error. */
+    retryable?: boolean;
 }
 
 const historyStore = new LazyStore('email_history.enc');
@@ -41,8 +45,26 @@ interface FetchedEmail {
     parse_error?: string | null;
 }
 
+class EmailProcessingError extends Error {
+    readonly retryable: boolean;
+
+    constructor(message: string, retryable: boolean) {
+        super(message);
+        this.name = 'EmailProcessingError';
+        this.retryable = retryable;
+    }
+}
+
+function isRetryableEmailProcessingError(error: unknown): boolean {
+    return error instanceof EmailProcessingError ? error.retryable : isRetryableRequestError(error);
+}
+
 function getEmailFingerprint(folder: string, email: Pick<FetchedEmail, 'uid' | 'uid_validity'>): string {
     return `${folder}_${email.uid_validity ?? 'legacy'}_${email.uid}`;
+}
+
+function getEmailHistoryFingerprint(item: Pick<EmailHistoryItem, 'folder' | 'emailUid' | 'emailUidValidity'>): string | null {
+    return item.folder ? `${item.folder}_${item.emailUidValidity ?? 'legacy'}_${item.emailUid}` : null;
 }
 
 // In-memory flag to prevent overlapping runs
@@ -98,8 +120,8 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
             status: 'success', // Consider it success so it's not retried as error
             syncedToNotion: false, // or undefined, as it was skipped
             folder,
-            rawBodyText: email.body_text,
-            htmlBody: email.html_body || undefined,
+            rawBodyText: limitEmailHistoryText(email.body_text),
+            htmlBody: limitEmailHistoryHtml(email.html_body),
             inlineImages: email.inline_images || []
         };
     }
@@ -118,9 +140,10 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
             emailDate: email.date,
             status: 'failed',
             error: parseError,
+            retryable: false,
             folder,
-            rawBodyText: email.body_text,
-            htmlBody: email.html_body || undefined,
+            rawBodyText: limitEmailHistoryText(email.body_text),
+            htmlBody: limitEmailHistoryHtml(email.html_body),
             inlineImages: email.inline_images || []
         };
     }
@@ -128,6 +151,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
     let attempt = 0;
     const maxAttempts = emailConfig.retryCount + 1;
     let lastError = '';
+    let lastErrorRetryable = false;
 
     let aiResult: AIResult | undefined = undefined;
     let synced = false;
@@ -191,7 +215,8 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
                     
                     const failed = syncRes.filter(r => !r.success);
                     if (failed.length > 0) {
-                        throw new Error(`Notion sync failed for ${failed.length} items`);
+                        const retryable = failed.some((item) => item.retryable === true);
+                        throw new EmailProcessingError(`Notion sync failed for ${failed.length} items`, retryable);
                     }
                 }
                 synced = true;
@@ -223,18 +248,23 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
                 aiResult,
                 syncedToNotion: synced,
                 folder,
-                rawBodyText: email.body_text,
-                htmlBody: email.html_body || undefined,
+                rawBodyText: limitEmailHistoryText(email.body_text),
+                htmlBody: limitEmailHistoryHtml(email.html_body),
                 inlineImages: compressedImages
             };
 
         } catch (e: any) {
             lastError = typeof e === 'string' ? e : e.message || String(e);
+            lastErrorRetryable = isRetryableEmailProcessingError(e);
             logger.error(`Error processing email ${email.uid}`, e);
+            if (!lastErrorRetryable) {
+                logger.warn(`Email ${email.uid} failed for a non-retryable reason; skip automatic retry and wait for a manual scan after configuration is corrected.`, e);
+                break;
+            }
             if (attempt >= maxAttempts) {
                 break;
             }
-            // Add a small delay before retry
+            // Add a small delay before retrying a transient failure.
             await new Promise(r => setTimeout(r, 2000));
         }
     }
@@ -249,10 +279,11 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
         emailDate: email.date,
         status: 'failed',
         error: lastError,
+        retryable: lastErrorRetryable,
         aiResult,
         folder,
-        rawBodyText: email.body_text,
-        htmlBody: email.html_body || undefined,
+        rawBodyText: limitEmailHistoryText(email.body_text),
+        htmlBody: limitEmailHistoryHtml(email.html_body),
         inlineImages: compressedImages
     };
 }
@@ -279,6 +310,13 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
     try {
         scannerStore.setProgressMsg('连接服务器...');
         let processedUids: string[] = await historyStore.get('processed_uids') || [];
+        const existingHistory: EmailHistoryItem[] = await historyStore.get('history') || [];
+        const terminalFailureFingerprints = new Set(
+            existingHistory
+                .filter((item) => item.status === 'failed' && item.retryable === false)
+                .map(getEmailHistoryFingerprint)
+                .filter((fingerprint): fingerprint is string => fingerprint !== null),
+        );
         const folders = emailConfig.targetFolder ? emailConfig.targetFolder.split(',').map(f => f.trim()).filter(Boolean) : ['INBOX'];
         
         for (const folder of folders) {
@@ -327,10 +365,19 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                         break;
                     }
 
+                    const fingerprint = getEmailFingerprint(folder, email);
+                    if (!isManual && terminalFailureFingerprints.has(fingerprint)) {
+                        logger.info(`Email UID ${email.uid} in ${folder} previously failed due to a non-retryable error; skip automatic reprocessing until a manual scan is started.`);
+                        continue;
+                    }
+
                     processedCount++;
                     const shortSub = email.subject ? (email.subject.length > 18 ? email.subject.slice(0, 18) + '...' : email.subject) : '无主题';
                     scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${shortSub}`);
                     const result = await processSingleEmail(email, batchId, folder, processedUids);
+                    if (result.status === 'failed' && result.retryable === false) {
+                        terminalFailureFingerprints.add(fingerprint);
+                    }
                     // Immediately save to history for real-time feedback (with deduplication for retried failed items)
                     if (result.aiResult || result.status === 'failed') {
                         let existing: EmailHistoryItem[] = await historyStore.get('history') || [];

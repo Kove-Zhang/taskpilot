@@ -1,5 +1,16 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invoke } from '@tauri-apps/api/core'
+import { HttpRequestError } from './http'
+
+const schedulerMocks = vi.hoisted(() => ({
+  extractTodosFromContent: vi.fn(),
+}))
+
+vi.mock('./ai', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./ai')>()
+  return { ...actual, extractTodosFromContent: schedulerMocks.extractTodosFromContent }
+})
+
 import { forceRunEmailScanner } from './emailScheduler'
 import { useScannerStore, useSettingsStore } from '../store'
 
@@ -21,8 +32,13 @@ const baseConfig = {
 }
 
 describe('email scheduler P1 regression cases', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   beforeEach(() => {
     vi.mocked(invoke).mockReset()
+    schedulerMocks.extractTodosFromContent.mockReset()
     useSettingsStore.setState({ emailConfig: baseConfig })
     useScannerStore.setState({
       running: false,
@@ -32,6 +48,63 @@ describe('email scheduler P1 regression cases', () => {
       scanLogs: [],
       historyVersion: 0,
     })
+  })
+
+  it('does not immediately retry or automatically rescan a non-retryable extraction failure, but permits manual recovery', async () => {
+    const uid = 910_003
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'fetch_emails') {
+        return [{
+          uid,
+          uid_validity: 301,
+          sender: 'sender@example.test',
+          subject: 'Configuration failure',
+          date: '2026-08-01T00:00:00Z',
+          body_text: 'Please extract the action items.',
+        }] as never
+      }
+      return undefined as never
+    })
+    schedulerMocks.extractTodosFromContent.mockRejectedValue(new HttpRequestError('invalid request', { status: 400 }))
+    useSettingsStore.setState({ emailConfig: { ...baseConfig, retryCount: 3 } })
+
+    await forceRunEmailScanner(false)
+    expect(schedulerMocks.extractTodosFromContent).toHaveBeenCalledTimes(1)
+
+    await forceRunEmailScanner(false)
+    expect(schedulerMocks.extractTodosFromContent).toHaveBeenCalledTimes(1)
+
+    schedulerMocks.extractTodosFromContent.mockResolvedValue({ summary: 'Recovered', todos: [] })
+    await forceRunEmailScanner(true)
+    expect(schedulerMocks.extractTodosFromContent).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries a transient extraction failure according to retryCount', async () => {
+    vi.useFakeTimers()
+    const uid = 910_004
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'fetch_emails') {
+        return [{
+          uid,
+          uid_validity: 401,
+          sender: 'sender@example.test',
+          subject: 'Transient failure',
+          date: '2026-08-01T00:00:00Z',
+          body_text: 'Please extract the action items.',
+        }] as never
+      }
+      return undefined as never
+    })
+    schedulerMocks.extractTodosFromContent
+      .mockRejectedValueOnce(new HttpRequestError('request timeout', { isTimeout: true }))
+      .mockResolvedValueOnce({ summary: 'Recovered', todos: [] })
+    useSettingsStore.setState({ emailConfig: { ...baseConfig, retryCount: 1 } })
+
+    const pending = forceRunEmailScanner(true)
+    await vi.runAllTimersAsync()
+    await pending
+
+    expect(schedulerMocks.extractTodosFromContent).toHaveBeenCalledTimes(2)
   })
 
   it('uses manual scan scope and stores malformed mail as a terminal failed record', async () => {
@@ -45,7 +118,7 @@ describe('email scheduler P1 regression cases', () => {
           subject: 'Malformed message',
           date: '2026-08-01T00:00:00Z',
           body_text: '',
-          parse_error: '邮件超过允许的大小',
+          parse_error: 'MIME 解析失败',
         }] as never
       }
       return undefined as never

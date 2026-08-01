@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { HttpRequestError, fetchWithTimeout } from './http'
+import { HttpRequestError, fetchWithTimeout, isRetryableTransportError } from './http'
 
 export interface ProviderResponse {
   ok: boolean
@@ -63,8 +63,10 @@ function createResponse(status: number, body: string): ProviderResponse {
 
 function wrapCustomTransportError(error: unknown): HttpRequestError {
   const message = error instanceof Error ? error.message : String(error)
+  const isTimeout = /超时|timeout|timed out/i.test(message)
   return new HttpRequestError(`自定义服务商请求失败: ${message}`, {
-    isTimeout: /超时|timeout|timed out/i.test(message),
+    isTimeout,
+    isRetryable: isTimeout || isRetryableTransportError(error),
   })
 }
 

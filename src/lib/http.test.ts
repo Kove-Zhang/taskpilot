@@ -2,8 +2,10 @@ import { describe, expect, it, vi, afterEach } from 'vitest'
 import { fetch } from '@tauri-apps/plugin-http'
 import {
   DEFAULT_REQUEST_TIMEOUT_MS,
+  HttpRequestError,
   fetchWithTimeout,
   isRetryableHttpStatus,
+  isRetryableRequestError,
   isRetryableTransportError,
 } from './http'
 
@@ -36,10 +38,19 @@ describe('HTTP request helpers', () => {
 
   it('identifies only transient HTTP and transport failures as retryable', () => {
     expect(isRetryableHttpStatus(408)).toBe(true)
+    expect(isRetryableHttpStatus(409)).toBe(true)
+    expect(isRetryableHttpStatus(425)).toBe(true)
     expect(isRetryableHttpStatus(429)).toBe(true)
     expect(isRetryableHttpStatus(503)).toBe(true)
     expect(isRetryableHttpStatus(400)).toBe(false)
     expect(isRetryableTransportError(new TypeError('network unavailable'))).toBe(true)
+    expect(isRetryableTransportError(new DOMException('aborted', 'AbortError'))).toBe(true)
+    expect(isRetryableTransportError(new Error('无法解析自定义供应商域名'))).toBe(true)
+    expect(isRetryableTransportError(new Error('TLS certificate handshake failure'))).toBe(true)
+    expect(isRetryableTransportError(new HttpRequestError('成功响应不是有效 JSON', { isRetryable: true }))).toBe(true)
     expect(isRetryableTransportError(new Error('invalid request payload'))).toBe(false)
+    expect(isRetryableRequestError(new HttpRequestError('provider unavailable', { status: 503 }))).toBe(true)
+    expect(isRetryableRequestError(new HttpRequestError('invalid request', { status: 400 }))).toBe(false)
+    expect(isRetryableRequestError(new HttpRequestError('authentication failed', { status: 401 }))).toBe(false)
   })
 })
