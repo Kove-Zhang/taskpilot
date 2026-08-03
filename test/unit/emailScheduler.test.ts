@@ -15,7 +15,13 @@ describe('Email Config State Tests', () => {
         scheduleTime: 'every_1h',
         markAsRead: false,
         retryCount: 1,
-        enabled: true
+        enabled: true,
+        autoSyncToNotion: false,
+        autoUnreadOnly: true,
+        manualUnreadOnly: false,
+        autoReadDays: 3,
+        manualReadDays: 7,
+        maxEmailsPerFolder: 50
       }
     })
   })

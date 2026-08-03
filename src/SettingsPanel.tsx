@@ -1217,22 +1217,56 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                        </label>
                     </div>
 
-                    <div className="flex gap-4 border-t border-white/5 pt-3">
-                       <label className="flex flex-col gap-1 text-xs text-slate-300 w-1/2">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 border-t border-white/5 pt-3">
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
+                          <span>自动扫描范围</span>
+                          <select
+                            value={formEmailConfig.autoUnreadOnly === false ? 'all' : 'unread'}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, autoUnreadOnly: e.target.value === 'unread'})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                          >
+                            <option value="unread">仅未读邮件</option>
+                            <option value="all">回溯范围内全部邮件</option>
+                          </select>
+                       </label>
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
+                          <span>手动扫描范围</span>
+                          <select
+                            value={formEmailConfig.manualUnreadOnly === true ? 'unread' : 'all'}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, manualUnreadOnly: e.target.value === 'unread'})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                          >
+                            <option value="all">回溯范围内全部邮件</option>
+                            <option value="unread">仅未读邮件</option>
+                          </select>
+                       </label>
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
+                          <span>每个文件夹最多拉取</span>
+                          <input
+                            type="number"
+                            min="1" max="500"
+                            value={formEmailConfig.maxEmailsPerFolder || 50}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, maxEmailsPerFolder: Math.min(Math.max(parseInt(e.target.value) || 50, 1), 500)})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                          />
+                       </label>
+                    </div>
+                    <p className="text-[11px] text-slate-500">自动扫描默认仅处理未读邮件；切换为全部邮件后，系统仍会通过防重复指纹避免重复解析。</p>
+                    <div className="grid grid-cols-2 gap-3 border-t border-white/5 pt-3">
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
                           <span>自动抓取回溯天数 (Auto)</span>
-                          <input 
-                            type="number" 
+                          <input
+                            type="number"
                             min="1" max="365"
                             value={formEmailConfig.autoReadDays || 3}
                             onChange={(e) => setFormEmailConfig({...formEmailConfig, autoReadDays: parseInt(e.target.value) || 3})}
                             className="bg-black/30 border border-white/10 rounded p-1.5 text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none w-full"
                           />
                        </label>
-                       
-                       <label className="flex flex-col gap-1 text-xs text-slate-300 w-1/2">
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
                           <span>手动抓取回溯天数 (Manual)</span>
-                          <input 
-                            type="number" 
+                          <input
+                            type="number"
                             min="1" max="365"
                             value={formEmailConfig.manualReadDays || 7}
                             onChange={(e) => setFormEmailConfig({...formEmailConfig, manualReadDays: parseInt(e.target.value) || 7})}

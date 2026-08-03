@@ -11,7 +11,8 @@ use std::time::Duration;
 
 const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_EMAILS_PER_SCAN: usize = 50;
+const DEFAULT_MAX_EMAILS_PER_SCAN: usize = 50;
+const MAX_EMAILS_PER_SCAN_HARD_LIMIT: usize = 500;
 const MAX_INLINE_IMAGES: usize = 10;
 const MAX_INLINE_IMAGE_BYTES: usize = 500 * 1024;
 
@@ -484,6 +485,7 @@ pub struct FetchEmailsRequest {
     folder: String,
     unread_only: bool,
     since_days: Option<u32>,
+    max_emails: Option<usize>,
 }
 
 #[tauri::command]
@@ -497,6 +499,7 @@ pub async fn fetch_emails(request: FetchEmailsRequest) -> Result<Vec<Email>, Str
         folder,
         unread_only,
         since_days,
+        max_emails,
     } = request;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -508,9 +511,12 @@ pub async fn fetch_emails(request: FetchEmailsRequest) -> Result<Vec<Email>, Str
         let uid_validity = mailbox.uid_validity;
 
         let query = if let Some(days) = since_days {
-            let since_date = (chrono::Local::now() - chrono::Duration::days(days as i64))
-                .format("%d-%b-%Y")
-                .to_string();
+            // IMAP SINCE is date-granular and server internal dates may differ by timezone.
+            // Include one extra day; processed UID fingerprints keep the result idempotent.
+            let since_date = (chrono::Local::now()
+                - chrono::Duration::days(days.saturating_add(1) as i64))
+            .format("%d-%b-%Y")
+            .to_string();
             if unread_only {
                 format!("UNSEEN SINCE {since_date}")
             } else {
@@ -529,8 +535,11 @@ pub async fn fetch_emails(request: FetchEmailsRequest) -> Result<Vec<Email>, Str
             .collect();
         uids.sort_unstable_by(|left, right| right.cmp(left));
 
+        let max_emails = max_emails
+            .unwrap_or(DEFAULT_MAX_EMAILS_PER_SCAN)
+            .clamp(1, MAX_EMAILS_PER_SCAN_HARD_LIMIT);
         let mut emails = Vec::new();
-        for uid in uids.into_iter().take(MAX_EMAILS_PER_SCAN) {
+        for uid in uids.into_iter().take(max_emails) {
             let metadata = session
                 .uid_fetch(uid.to_string(), "ENVELOPE BODYSTRUCTURE")
                 .map_err(|error| format!("Metadata fetch error for UID {uid}: {error}"))?;

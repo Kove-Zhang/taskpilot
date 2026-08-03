@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { HttpRequestError, fetchWithTimeout, isRetryableTransportError } from './http'
+import { HttpRequestError, fetchWithTimeout, isRetryableTransportError, LLM_REQUEST_TIMEOUT_MS } from './http'
 
 export interface ProviderResponse {
   ok: boolean
@@ -83,7 +83,7 @@ export async function requestProviderChatCompletion(options: ProviderRequestOpti
       method: 'POST',
       headers,
       body,
-    })
+    }, LLM_REQUEST_TIMEOUT_MS)
   }
 
   try {

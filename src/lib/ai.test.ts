@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { callAIWithFailover, generateWriting } from './ai'
+import { callAIWithFailover, extractTodosFromContent, generateWriting } from './ai'
 import { useSettingsStore, type LLMProvider } from '../store'
 import { fetch } from '@tauri-apps/plugin-http'
 import { invoke } from '@tauri-apps/api/core'
@@ -25,6 +25,10 @@ describe('AI Helper Methods', () => {
       enableFailover: true,
       failoverRetryCount: 1,
       failoverOnAuthError: false,
+      notionProperties: [],
+      fieldMappings: {},
+      tokenLimit: 8000,
+      enableReasoning: false,
     })
   })
 
@@ -279,6 +283,75 @@ describe('AI Helper Methods', () => {
       'https://first.example/v1/chat/completions',
       'https://second.example/v1/chat/completions',
     ])
+  })
+
+
+  it('fails over after Tauri HTTP reports an error sending the request', async () => {
+    const builtinProviders: LLMProvider[] = [
+      { id: 'tower', name: 'AI中台', apiBaseUrl: 'https://ai.chinatowercom.cn:30080/v1', apiKey: 'tower-key', modelName: 'qwen3.7-plus', enabled: true, priority: 1 },
+      { id: 'openai', name: 'Fallback', apiBaseUrl: 'https://api.openai.com/v1', apiKey: 'fallback-key', modelName: 'gpt-4o-mini', enabled: true, priority: 2 },
+    ]
+    useSettingsStore.setState({ llmProviders: builtinProviders, enableFailover: true, failoverRetryCount: 1 })
+    vi.mocked(fetch)
+      .mockRejectedValueOnce(new Error('error sending request for url (https://ai.chinatowercom.cn:30080/v1/chat/completions)'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'fallback after request-send error' } }] }),
+      } as Response)
+
+    await expect(callAIWithFailover(
+      (provider) => ({ model: provider.modelName, messages: [{ role: 'user', content: 'test' }] }),
+      'request-send-failover-test',
+    )).resolves.toBe('fallback after request-send error')
+
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual([
+      'https://ai.chinatowercom.cn:30080/v1/chat/completions',
+      'https://api.openai.com/v1/chat/completions',
+    ])
+  })
+
+  it('keeps required title in the prompt and normalizes a configured Notion title field', async () => {
+    useSettingsStore.setState({
+      notionProperties: [
+        { id: 'notion-title', name: '事项名称', type: 'title' },
+        { id: 'notion-owner', name: '负责人', type: 'rich_text' },
+      ],
+      fieldMappings: {
+        'notion-title': { notionPropId: 'notion-title', enabled: true, aiHint: '', order: 1 },
+        'notion-owner': { notionPropId: 'notion-owner', enabled: true, aiHint: '', order: 2 },
+      },
+    })
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              summary: '需要完成报告。',
+              todos: [{ '事项名称': '整理并提交周报', '负责人': '张三', priority: 'High', planned_date: null }],
+            }),
+          },
+        }],
+      }),
+    } as Response)
+
+    const result = await extractTodosFromContent('请在本周内整理并提交周报。', [])
+
+    expect(result.todos).toHaveLength(1)
+    expect(result.todos[0]).toMatchObject({
+      title: '整理并提交周报',
+      '事项名称': '整理并提交周报',
+      selected: true,
+    })
+    expect(result.todos[0].id).toMatch(/^generated-1-/)
+
+    const [, init] = vi.mocked(fetch).mock.calls[0]
+    const payload = JSON.parse(String(init?.body))
+    const systemPrompt = payload.messages[0].content as string
+    expect(systemPrompt).toContain('"title": "待办事项标题（非空字符串）"')
+    expect(systemPrompt).toContain('"事项名称": "字符串"')
+    expect(systemPrompt).toContain('每一项都必须同时包含字面量字段 "id" 和 "title"')
   })
 
 })

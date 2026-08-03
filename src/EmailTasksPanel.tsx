@@ -24,7 +24,13 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const { notionProperties, fieldMappings, isWindowMode } = useSettingsStore();
   const [history, setHistory] = useState<EmailHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const { running, paused, progressMsg, scanLogs, historyVersion, setPaused, requestStop } = useScannerStore();
+  const { running, paused, status, stopRequested, progressMsg, scanLogs, historyVersion, setPaused, requestStop } = useScannerStore();
+  const isStopping = status === 'stopping' || stopRequested;
+  const scanStatusText = status === 'stopping'
+    ? '正在停止，等待当前邮件处理完成...'
+    : status === 'paused'
+      ? '扫描已暂停，等待继续...'
+      : progressMsg || (running ? '正在同步拉取与解析邮件...' : status === 'stopped' ? '扫描已停止' : '当前无正在执行的扫描任务');
   const [hideStatusBar, setHideStatusBar] = useState(false);
 
   useEffect(() => {
@@ -352,7 +358,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const clearAllHistory = async () => {
     setConfirmDialog({
       isOpen: true,
-      message: '确定要清空所有邮箱监听历史记录并重置底层的防重复指纹吗？清空后，之前的未读邮件将被重新抓取。',
+      message: '确定要清空所有邮箱监听历史记录并重置底层的防重复指纹吗？清空后，之前时间范围内的邮件将被重新抓取。',
       onConfirm: async () => {
         try {
           await historyStore.set('history', []);
@@ -1194,26 +1200,32 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div className="flex items-center gap-2 shrink-0">
                 {running ? (
-                  <>
-                    <button
-                      onClick={() => setPaused(!paused)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm ${
-                        paused
-                          ? 'bg-blue-500 text-white hover:bg-blue-600 shadow-blue-500/20 animate-pulse'
-                          : 'bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:bg-amber-500/30'
-                      }`}
-                    >
-                      {paused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-                      {paused ? '继续扫描' : '暂停扫描'}
-                    </button>
+                  isStopping ? (
+                    <span className="text-xs text-amber-300 font-medium flex items-center gap-1.5">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" /> 正在停止，等待当前邮件处理完成...
+                    </span>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => setPaused(!paused)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm ${
+                          paused
+                            ? 'bg-blue-500 text-white hover:bg-blue-600 shadow-blue-500/20 animate-pulse'
+                            : 'bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:bg-amber-500/30'
+                        }`}
+                      >
+                        {paused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                        {paused ? '继续扫描' : '暂停扫描'}
+                      </button>
 
-                    <button
-                      onClick={() => requestStop()}
-                      className="px-3 py-1.5 rounded-lg bg-red-500/20 text-red-300 border border-red-500/30 hover:bg-red-500/30 text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm"
-                    >
-                      <Square className="w-3.5 h-3.5 fill-current" /> 停止扫描
-                    </button>
-                  </>
+                      <button
+                        onClick={() => requestStop()}
+                        className="px-3 py-1.5 rounded-lg bg-red-500/20 text-red-300 border border-red-500/30 hover:bg-red-500/30 text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm"
+                      >
+                        <Square className="w-3.5 h-3.5 fill-current" /> 停止扫描
+                      </button>
+                    </>
+                  )
                 ) : (
                   <span className="text-xs text-slate-400 font-medium flex items-center gap-1.5">
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> 扫描队列就绪
@@ -1223,14 +1235,14 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
 
               <div className="flex items-center gap-2 flex-1 min-w-0 justify-end w-full sm:w-auto bg-black/30 px-3 py-1.5 rounded-lg border border-white/5">
                 <span className={`w-2 h-2 rounded-full shrink-0 ${
-                  running ? (paused ? 'bg-amber-400 animate-ping' : 'bg-blue-400 animate-pulse') : 'bg-slate-600'
+                  isStopping ? 'bg-amber-400 animate-ping' : running ? (paused ? 'bg-amber-400 animate-ping' : 'bg-blue-400 animate-pulse') : 'bg-slate-600'
                 }`} />
 
                 <span
                   className="flex-1 min-w-0 font-mono text-xs text-slate-300 truncate text-left sm:text-right cursor-help"
-                  title={progressMsg || (running ? '正在扫描邮件...' : '扫信空闲')}
+                  title={scanStatusText}
                 >
-                  {progressMsg || (running ? (paused ? '扫描已暂停等待中...' : '正在同步拉取与解析邮件...') : '当前无正在执行的扫描任务')}
+                  {scanStatusText}
                 </span>
 
                 {scanLogs.length > 0 && (
@@ -1265,7 +1277,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                   </button>
                 </div>
                 {scanLogs.map((log, idx) => (
-                  <div key={idx} className="truncate hover:text-slate-200 transition-colors" title={log}>
+                  <div key={idx} className="whitespace-pre-wrap break-words hover:text-slate-200 transition-colors" title={log}>
                     {log}
                   </div>
                 ))}

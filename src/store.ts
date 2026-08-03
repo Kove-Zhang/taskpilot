@@ -121,8 +121,11 @@ export interface EmailConfig {
   retryCount: number;
   enabled: boolean;
   autoSyncToNotion: boolean;
+  autoUnreadOnly: boolean;
+  manualUnreadOnly: boolean;
   autoReadDays: number;
   manualReadDays: number;
+  maxEmailsPerFolder: number;
 }
 
 interface SettingsState {
@@ -200,8 +203,11 @@ export const useSettingsStore = create<SettingsState>()(
         retryCount: 1,
         enabled: false,
         autoSyncToNotion: false,
+        autoUnreadOnly: true,
+        manualUnreadOnly: false,
         autoReadDays: 3,
-        manualReadDays: 7
+        manualReadDays: 7,
+        maxEmailsPerFolder: 50
       },
       enableFailover: true,
       failoverRetryCount: 1,
@@ -256,16 +262,21 @@ export const useSettingsStore = create<SettingsState>()(
   )
 )
 
+export type ScannerStatus = 'idle' | 'fetching' | 'processing' | 'paused' | 'stopping' | 'completed' | 'stopped' | 'failed';
+
 export interface ScannerState {
   running: boolean;
   paused: boolean;
+  status: ScannerStatus;
   stopRequested: boolean;
   progressMsg: string;
   scanLogs: string[];
   historyVersion: number;
   setRunning: (running: boolean) => void;
   setPaused: (paused: boolean) => void;
+  setStatus: (status: ScannerStatus) => void;
   requestStop: () => void;
+  clearStopRequest: () => void;
   setProgressMsg: (progressMsg: string) => void;
   addScanLog: (log: string) => void;
   clearScanLogs: () => void;
@@ -286,13 +297,29 @@ export const useUIStore = create<UIState>((set) => ({
 export const useScannerStore = create<ScannerState>((set) => ({
   running: false,
   paused: false,
+  status: 'idle',
   stopRequested: false,
   progressMsg: '',
   scanLogs: [],
   historyVersion: 0,
   setRunning: (running) => set({ running }),
-  setPaused: (paused) => set({ paused }),
-  requestStop: () => set({ stopRequested: true, paused: false }),
+  setPaused: (paused) => set((state) => {
+    if (state.stopRequested) {
+      return { paused: false, status: 'stopping' };
+    }
+    return {
+      paused,
+      status: paused ? 'paused' : (state.status === 'paused' ? 'processing' : state.status),
+    };
+  }),
+  setStatus: (status) => set({ status }),
+  requestStop: () => set({
+    stopRequested: true,
+    paused: false,
+    status: 'stopping',
+    progressMsg: '正在停止，等待当前邮件处理完成...',
+  }),
+  clearStopRequest: () => set({ stopRequested: false }),
   setProgressMsg: (progressMsg) => set((state) => {
     const timeStr = new Date().toLocaleTimeString();
     const formattedLog = `[${timeStr}] ${progressMsg}`;
@@ -306,7 +333,7 @@ export const useScannerStore = create<ScannerState>((set) => ({
     return { scanLogs: newLogs };
   }),
   clearScanLogs: () => set({ scanLogs: [] }),
-  resetScanControl: () => set({ running: false, paused: false, stopRequested: false, progressMsg: '', scanLogs: [] }),
+  resetScanControl: () => set({ running: false, paused: false, status: 'idle', stopRequested: false, progressMsg: '', scanLogs: [] }),
   incrementHistoryVersion: () => set((state) => ({ historyVersion: state.historyVersion + 1 }))
 }))
 

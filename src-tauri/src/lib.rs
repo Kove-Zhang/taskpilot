@@ -315,6 +315,7 @@ mod tests {
 
 const MAX_CUSTOM_LLM_REQUEST_BYTES: usize = 5 * 1024 * 1024;
 const MAX_CUSTOM_LLM_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const CUSTOM_LLM_REQUEST_TIMEOUT_SECS: u64 = 3 * 60;
 
 #[derive(Debug, Deserialize)]
 struct CustomLlmRequest {
@@ -426,7 +427,9 @@ async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmRespon
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(
+            CUSTOM_LLM_REQUEST_TIMEOUT_SECS,
+        ))
         .redirect(reqwest::redirect::Policy::none())
         .resolve(&host, socket)
         .build()
@@ -441,7 +444,10 @@ async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmRespon
         .await
         .map_err(|error| {
             if error.is_timeout() {
-                "自定义供应商请求超时（30 秒）".to_string()
+                format!(
+                    "自定义供应商请求超时（{} 秒）",
+                    CUSTOM_LLM_REQUEST_TIMEOUT_SECS
+                )
             } else {
                 format!("自定义供应商网络请求失败: {error}")
             }

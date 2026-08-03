@@ -51,6 +51,49 @@ function getCompletionContent(data: unknown, providerName: string): string {
   return message.content
 }
 
+const TODO_TITLE_FIELD_ALIASES = ['title', 'task', 'content', 'name', 'text', 'description']
+const TODO_ID_FIELD_ALIASES = ['id', 'task_id', 'todo_id', 'uuid']
+
+function getNonEmptyText(value: unknown, allowNumber = false): string | null {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (allowNumber && typeof value === 'number' && Number.isFinite(value)) return String(value)
+  return null
+}
+
+function findTextField(
+  value: Record<string, unknown>,
+  fieldNames: readonly string[],
+  allowNumber = false,
+): { fieldName: string; value: string } | null {
+  for (const fieldName of fieldNames) {
+    const text = getNonEmptyText(value[fieldName], allowNumber)
+    if (text) return { fieldName, value: text }
+  }
+  return null
+}
+
+function getConfiguredTodoTitleFields(): string[] {
+  const { notionProperties, fieldMappings } = useSettingsStore.getState()
+  return notionProperties
+    .filter((property) => property.type === 'title' && fieldMappings[property.id]?.enabled)
+    .map((property) => property.name)
+}
+
+/** Creates a stable local ID when a compatible provider omits its optional model-generated ID. */
+function createFallbackTodoId(rawContent: string, index: number, title: string): string {
+  const input = `${rawContent}\u0000${index}\u0000${title}`
+  let hash = 2_166_136_261
+  for (let position = 0; position < input.length; position += 1) {
+    hash ^= input.charCodeAt(position)
+    hash = Math.imul(hash, 16_777_619)
+  }
+  return `generated-${index + 1}-${(hash >>> 0).toString(36)}`
+}
+
+function getSafeFieldNames(value: unknown): string[] {
+  return isRecord(value) ? Object.keys(value).sort().slice(0, 30) : []
+}
+
 function sanitizePayloadForLog(payload: ChatCompletionPayload): Record<string, unknown> {
   return {
     ...payload,
@@ -211,14 +254,42 @@ function normalizeExtractionResult(rawContent: string): AIResult {
   }
 
   if (!isRecord(parsed) || typeof parsed.summary !== 'string' || !Array.isArray(parsed.todos)) {
+    logger.warn('AI 返回提取结果字段不兼容', {
+      topLevelFields: getSafeFieldNames(parsed),
+      hasStringSummary: isRecord(parsed) && typeof parsed.summary === 'string',
+      hasTodosArray: isRecord(parsed) && Array.isArray(parsed.todos),
+    })
     throw new Error('AI 返回的 JSON 缺少 summary 或 todos 字段')
   }
 
+  const titleFieldNames = [...new Set([...TODO_TITLE_FIELD_ALIASES, ...getConfiguredTodoTitleFields()])]
   const todos = parsed.todos.map((todo, index) => {
-    if (!isRecord(todo) || typeof todo.id !== 'string' || !todo.id.trim() || typeof todo.title !== 'string' || !todo.title.trim()) {
-      throw new Error(`AI 返回的第 ${index + 1} 条待办缺少有效 id 或 title`)
+    if (!isRecord(todo)) {
+      logger.warn('AI 返回的待办无法规范化', { index: index + 1, receivedType: Array.isArray(todo) ? 'array' : typeof todo })
+      throw new Error(`AI 返回的第 ${index + 1} 条待办不是对象`)
     }
-    return { ...todo, selected: true } as TodoItem
+
+    const title = findTextField(todo, titleFieldNames)
+    if (!title) {
+      logger.warn('AI 返回的待办缺少可识别标题字段', {
+        index: index + 1,
+        fieldNames: getSafeFieldNames(todo),
+      })
+      throw new Error(`AI 返回的第 ${index + 1} 条待办缺少有效 title`)
+    }
+
+    const modelId = findTextField(todo, TODO_ID_FIELD_ALIASES, true)
+    const id = modelId?.value || createFallbackTodoId(rawContent, index, title.value)
+    if (title.fieldName !== 'title' || !modelId || modelId.fieldName !== 'id') {
+      logger.warn('AI 返回的待办已按兼容规则规范化', {
+        index: index + 1,
+        originalFieldNames: getSafeFieldNames(todo),
+        titleSource: title.fieldName,
+        idSource: modelId?.fieldName || 'generated',
+      })
+    }
+
+    return { ...todo, id, title: title.value, selected: true } as TodoItem
   })
 
   const keyPoints = Array.isArray(parsed.key_points)
@@ -239,29 +310,34 @@ export async function extractTodosFromContent(textContent: string, base64Images:
 
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
   
-  let jsonSchemaDesc = `{\n      "id": "唯一随机ID",\n`;
+  const todoSchemaLines = [
+    '"id": "待办唯一 ID（非空字符串，同一次输出内不可重复）"',
+    '"title": "待办事项标题（非空字符串）"',
+    '"priority": "★ 或者 ★★ 或者 ★★★"',
+    '"planned_date": "YYYY-MM-DD 格式的日期；无明确日期时为 null"',
+  ]
+  const requiredTodoKeys = new Set(['id', 'title', 'priority', 'planned_date'])
   let hintDesc = "";
 
-  if (activeFields.length === 0) {
-    jsonSchemaDesc += `      "title": "待办事项标题",\n      "priority": "★ 或者 ★★ 或者 ★★★",\n      "planned_date": "YYYY-MM-DD格式的日期，如无明确日期则留空"\n`;
-  } else {
-    for (const field of activeFields) {
-      const mapping = fieldMappings[field.id];
-      let typeDesc = "字符串";
-      if (field.type === 'date') typeDesc = "YYYY-MM-DD格式的日期，如无明确日期则留空";
-      if (field.type === 'checkbox') typeDesc = "布尔值(true/false)";
-      if (field.type === 'number') typeDesc = "数字";
-      if (field.type === 'select' || field.type === 'multi_select') {
-        typeDesc = `只能是以下枚举值之一: [${field.options?.join(', ') || ''}]`;
-      }
-      
-      jsonSchemaDesc += `      "${field.name}": "${typeDesc}",\n`;
-      if (mapping?.aiHint) {
-        hintDesc += `- "${field.name}": ${mapping.aiHint}\n`;
-      }
+  for (const field of activeFields) {
+    const mapping = fieldMappings[field.id];
+    let typeDesc = "字符串";
+    if (field.type === 'date') typeDesc = "YYYY-MM-DD格式的日期，如无明确日期则留空";
+    if (field.type === 'checkbox') typeDesc = "布尔值(true/false)";
+    if (field.type === 'number') typeDesc = "数字";
+    if (field.type === 'select' || field.type === 'multi_select') {
+      typeDesc = `只能是以下枚举值之一: [${field.options?.join(', ') || ''}]`;
+    }
+
+    if (!requiredTodoKeys.has(field.name)) {
+      todoSchemaLines.push(`${JSON.stringify(field.name)}: ${JSON.stringify(typeDesc)}`)
+    }
+    if (mapping?.aiHint) {
+      hintDesc += `- "${field.name}": ${mapping.aiHint}\n`;
     }
   }
-  jsonSchemaDesc += `    }`;
+
+  const jsonSchemaDesc = `{\n      ${todoSchemaLines.join(',\n      ')}\n    }`;
 
   const now = new Date();
   const timeStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${['日', '一', '二', '三', '四', '五', '六'][now.getDay()]} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
@@ -297,6 +373,12 @@ export async function extractTodosFromContent(textContent: string, base64Images:
   ]
 }
 如果没有待办事项，todos 数组留空。${keyPointsHint}
+
+【输出契约（必须遵守）】
+- todos 数组中的每一项都必须同时包含字面量字段 "id" 和 "title"，且二者均为非空字符串。
+- "id" 只用于本地唯一标识，可使用 "todo-1"、"todo-2" 等；同一次输出内不得重复。
+- 即使同时输出 Notion 动态字段，也不得用 task、content、name 或 Notion 字段名替代 "title"。
+- planned_date 无明确日期时必须输出 null，不得输出空字符串。
 ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
 
   const contentArray: any[] = [];

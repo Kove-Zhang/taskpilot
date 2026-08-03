@@ -303,6 +303,7 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
 
     scannerStore.resetScanControl();
     scannerStore.setRunning(true);
+    scannerStore.setStatus('fetching');
     lastRunTimestamp = Date.now();
     logger.info("Starting email scanner batch...");
     const batchId = `batch_${Date.now()}`;
@@ -325,7 +326,11 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                 break;
             }
             while (useScannerStore.getState().paused && !useScannerStore.getState().stopRequested) {
+                scannerStore.setStatus('paused');
                 await new Promise(r => setTimeout(r, 500));
+            }
+            if (!useScannerStore.getState().stopRequested) {
+                scannerStore.setStatus('fetching');
             }
             if (useScannerStore.getState().stopRequested) {
                 logger.info("用户停止扫描，终止本次运行。");
@@ -336,6 +341,11 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
             try {
                 scannerStore.setProgressMsg(`拉取目录 ${decodeIMAPFolder(folder)}...`);
                 const sinceDays = isManual ? (emailConfig.manualReadDays || 7) : (emailConfig.autoReadDays || 3);
+                const unreadOnly = isManual
+                    ? (emailConfig.manualUnreadOnly ?? false)
+                    : (emailConfig.autoUnreadOnly ?? true);
+                const maxEmailsPerFolder = Math.min(Math.max(emailConfig.maxEmailsPerFolder || 50, 1), 500);
+                const scanScope = unreadOnly ? '仅未读邮件' : '全部邮件';
                 const emails = await invoke('fetch_emails', {
                     request: {
                         host: emailConfig.host,
@@ -344,20 +354,23 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                         pass: emailConfig.pass,
                         ssl: emailConfig.ssl,
                         folder,
-                        unreadOnly: !isManual,
-                        sinceDays
+                        unreadOnly,
+                        sinceDays,
+                        maxEmails: maxEmailsPerFolder
                     }
                 }) as FetchedEmail[];
 
-                logger.info(`Fetched ${emails.length} ${isManual ? 'recent' : 'unread'} emails from ${folder}.`);
+                logger.info(`Fetched ${emails.length} recent emails from ${folder}.`);
+                scannerStore.setProgressMsg(`目录 ${decodeIMAPFolder(folder)} | 条件：${scanScope} | 回溯：${sinceDays} 天 | 拉取到 ${emails.length} 封候选邮件`);
 
                 let processedCount = 0;
-                for (const email of emails) {
+                for (const [emailIndex, email] of emails.entries()) {
                     if (useScannerStore.getState().stopRequested) {
                         logger.info("用户停止扫描，终止本次运行。");
                         break;
                     }
                     while (useScannerStore.getState().paused && !useScannerStore.getState().stopRequested) {
+                        scannerStore.setStatus('paused');
                         await new Promise(r => setTimeout(r, 500));
                     }
                     if (useScannerStore.getState().stopRequested) {
@@ -365,15 +378,22 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                         break;
                     }
 
+                    scannerStore.setStatus('processing');
                     const fingerprint = getEmailFingerprint(folder, email);
+                    const subject = email.subject?.trim() || '无主题';
+                    const candidateIndex = emailIndex + 1;
+                    if (processedUids.includes(fingerprint)) {
+                        scannerStore.setProgressMsg(`跳过已处理 (${candidateIndex}/${emails.length}): ${subject}`);
+                        continue;
+                    }
                     if (!isManual && terminalFailureFingerprints.has(fingerprint)) {
                         logger.info(`Email UID ${email.uid} in ${folder} previously failed due to a non-retryable error; skip automatic reprocessing until a manual scan is started.`);
+                        scannerStore.setProgressMsg(`跳过不可自动重试 (${candidateIndex}/${emails.length}): ${subject}`);
                         continue;
                     }
 
                     processedCount++;
-                    const shortSub = email.subject ? (email.subject.length > 18 ? email.subject.slice(0, 18) + '...' : email.subject) : '无主题';
-                    scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${shortSub}`);
+                    scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${subject}`);
                     const result = await processSingleEmail(email, batchId, folder, processedUids);
                     if (result.status === 'failed' && result.retryable === false) {
                         terminalFailureFingerprints.add(fingerprint);
@@ -411,13 +431,12 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
         logger.error("Failed to run email scanner", e);
     } finally {
         const store = useScannerStore.getState();
+        const stopped = store.stopRequested;
         store.setRunning(false);
         store.setPaused(false);
-        if (store.stopRequested) {
-            store.setProgressMsg('主动停止扫描');
-        } else {
-            store.setProgressMsg('扫描任务完成');
-        }
+        store.setStatus(stopped ? 'stopped' : 'completed');
+        store.setProgressMsg(stopped ? '主动停止扫描' : '扫描任务完成');
+        store.clearStopRequest();
     }
 }
 
