@@ -1,15 +1,10 @@
 import { useState, useEffect, useMemo } from 'react'
-import { X, Clock, Trash2, ChevronDown, ChevronUp, Loader2 } from 'lucide-react'
-import { invoke } from '@tauri-apps/api/core'
+import { X, Clock, Trash2, ChevronDown, ChevronUp } from 'lucide-react'
 import type { AIResult } from './lib/ai'
+import { loadHistory, updateHistory, type HistoryEntry } from './lib/history'
 import { useSettingsStore, useUIStore } from './store'
-
-interface HistoryEntry {
-  timestamp: string;
-  result: AIResult;
-  input?: string;
-  images?: string[];
-}
+import { FeedbackHistoryCard, FeedbackStatusBadge } from './components/FeedbackHistoryCard'
+import { getNotionSyncStatusLabel } from './lib/notionSyncState'
 
 interface HistoryPanelProps {
   onClose: () => void;
@@ -64,23 +59,21 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
       return;
     }
     setSelectedDate(dates[0]);
-  }, [grouped, dates]);
+  }, [grouped, dates, selectedDate]);
 
   const toggleExpand = (key: string) => {
     setExpandedTodos(prev => ({ ...prev, [key]: !prev[key] }));
   };
 
   useEffect(() => {
-    loadHistory();
+    void refreshHistory();
   }, []);
 
-  const loadHistory = async () => {
+  const refreshHistory = async () => {
     try {
-      const dataJson = await invoke<string>("load_history");
-      const data = JSON.parse(dataJson || "[]") as HistoryEntry[];
-      setHistory(data);
-    } catch (e) {
-      console.error("加载历史记录失败", e);
+      setHistory(await loadHistory());
+    } catch (error) {
+      console.error('加载历史记录失败', error);
     } finally {
       setLoading(false);
     }
@@ -92,10 +85,9 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
       message: '确定要清空所有手动提取记录吗？此操作不可恢复。',
       onConfirm: async () => {
         try {
-          await invoke("save_history", { data: "[]" });
-          setHistory([]);
-        } catch (e) {
-          console.error("清空历史记录失败", e);
+          setHistory(await updateHistory(() => []));
+        } catch (error) {
+          console.error('清空历史记录失败', error);
         }
         setConfirmDialog(prev => ({ ...prev, isOpen: false }));
       }
@@ -108,11 +100,9 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
       message: '确定要删除这条记录吗？此操作不可恢复。',
       onConfirm: async () => {
         try {
-          const newHistory = history.filter((_, idx) => idx !== indexToDelete);
-          await invoke("save_history", { data: JSON.stringify(newHistory) });
-          setHistory(newHistory);
-        } catch (e) {
-          console.error("删除单个历史记录失败", e);
+          setHistory(await updateHistory((current) => current.filter((_, index) => index !== indexToDelete)));
+        } catch (error) {
+          console.error('删除单个历史记录失败', error);
         }
         setConfirmDialog(prev => ({ ...prev, isOpen: false }));
       }
@@ -176,6 +166,17 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                     {grouped[selectedDate].map((entry) => {
                       const idx = entry.originalIndex;
                       const todosCount = entry.result.todos?.length || 0;
+                      const notionStatus = entry.result.notionSync?.status || (entry.result.syncedToNotion ? 'success' : 'idle');
+                      const notionStatusLabel = getNotionSyncStatusLabel(entry.result.notionSync) || (entry.result.syncedToNotion ? '已同步' : undefined);
+                      const notionStatusClass = notionStatus === 'success'
+                        ? 'border-green-500/30 bg-green-500/20 text-green-400'
+                        : notionStatus === 'needs_verification'
+                          ? 'border-amber-500/30 bg-amber-500/20 text-amber-300'
+                          : notionStatus === 'partial_failed'
+                            ? 'border-orange-500/30 bg-orange-500/20 text-orange-300'
+                            : notionStatus === 'failed'
+                              ? 'border-red-500/30 bg-red-500/20 text-red-300'
+                              : 'border-slate-500/30 bg-slate-500/20 text-slate-300';
                       const isListExpanded = !!expandedTodos[`list_${idx}`];
                       const displayTodos = isListExpanded ? (entry.result.todos || []) : (entry.result.todos || []).slice(0, 3);
 
@@ -186,21 +187,20 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                           className="bg-slate-900/50 p-4 rounded-lg border border-white/5 relative group cursor-pointer hover:border-blue-500/50 transition-colors"
                           title="双击恢复此记录"
                         >
-                          {entry.result.feedbackStatus === 'processing' && (
-                            <div className="absolute top-4 right-12 text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded border border-yellow-500/30 flex items-center gap-1">
-                              <Loader2 className="w-3 h-3 animate-spin" /> 正在教导 AI...
-                            </div>
-                          )}
-                          {entry.result.isRejected && (
-                            <div className="absolute top-4 right-12 text-xs bg-red-500/20 text-red-400 px-2 py-0.5 rounded border border-red-500/30">
-                              ❌ 已发送纠错
-                            </div>
-                          )}
-                          {entry.result.syncedToNotion && !entry.result.isRejected && (
-                            <div className="absolute top-4 right-12 text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30">
-                              已推送
-                            </div>
-                          )}
+                          <div className="absolute top-4 right-12 flex max-w-[calc(100%-6rem)] flex-wrap justify-end gap-1.5">
+                            <FeedbackStatusBadge
+                              feedbackStatus={entry.result.feedbackStatus}
+                              feedbackType={entry.result.feedbackType}
+                              explicitFeedback={entry.result.explicitFeedback}
+                              isRejected={entry.result.isRejected}
+                            />
+                            {notionStatusLabel && (
+                              <span className={`inline-flex h-6 items-center rounded-md border px-2.5 py-0.5 text-xs font-medium ${notionStatusClass}`}>
+                                {notionStatusLabel}
+                                {entry.result.notionSync && entry.result.notionSync.failedCount > 0 && ` · ${entry.result.notionSync.failedCount} 项`}
+                              </span>
+                            )}
+                          </div>
                           <button 
                             onClick={(e) => {
                               e.stopPropagation();
@@ -213,12 +213,13 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                           </button>
                           <div className="text-xs text-slate-500 mb-2 pr-8">{new Date(entry.timestamp).toLocaleString()}</div>
                           
-                          {entry.result.isRejected ? (
-                            <div className="mt-3 bg-red-950/30 border border-red-500/20 p-3 rounded-md">
-                              <div className="text-xs text-red-400 mb-1">您当时对 AI 的纠正/吐槽：</div>
-                              <div className="text-sm text-slate-300 italic">"{entry.result.explicitFeedback || '暂无说明'}"</div>
-                            </div>
-                          ) : (
+                          <FeedbackHistoryCard
+                            feedbackStatus={entry.result.feedbackStatus}
+                            feedbackType={entry.result.feedbackType}
+                            explicitFeedback={entry.result.explicitFeedback}
+                            isRejected={entry.result.isRejected}
+                          />
+                          {entry.result.isRejected ? null : (
                             <>
                               <div className="text-sm text-slate-300 mb-3 line-clamp-2">{entry.result.summary}</div>
                               <div className="space-y-1.5">

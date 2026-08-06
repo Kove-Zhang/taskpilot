@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Maximize2, X, Sparkles, Undo2, Loader2, Save, FileText, AlertTriangle } from 'lucide-react';
 
 export interface ZenEditorModalProps {
@@ -51,18 +51,18 @@ export const ZenEditorModal: React.FC<ZenEditorModalProps> = ({
   const charCount = text.length;
   const lineCount = text ? text.split('\n').length : 0;
 
-  const handleAttemptClose = () => {
+  const handleAttemptClose = useCallback(() => {
     if (isDirty) {
       setShowDirtyConfirm(true);
     } else {
       onClose();
     }
-  };
+  }, [isDirty, onClose]);
 
-  const handleSave = () => {
+  const handleSave = useCallback(() => {
     onSave(text);
     onClose();
-  };
+  }, [onClose, onSave, text]);
 
   // Keyboard shortcut: Ctrl+Enter or Cmd+Enter to save, Esc to close
   useEffect(() => {
@@ -82,7 +82,7 @@ export const ZenEditorModal: React.FC<ZenEditorModalProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, text, value, showDirtyConfirm]);
+  }, [handleAttemptClose, handleSave, isOpen, showDirtyConfirm]);
 
   if (!isOpen) return null;
 

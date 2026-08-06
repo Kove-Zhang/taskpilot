@@ -1,78 +1,227 @@
-use tauri::Manager;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-use aes_gcm::{aead::{Aead, AeadCore, KeyInit, OsRng}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use keyring::Entry;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::{ptr, slice};
 use tauri::Emitter;
-use sha2::{Sha256, Digest};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use keyring::Entry;
-use std::io::Write;
+
+use tauri::Manager;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::LocalFree,
+    Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    },
+};
 
 mod imap_cmds;
-use imap_cmds::{get_email_folders, fetch_emails, mark_email_read};
+use imap_cmds::{fetch_emails, get_email_folders, mark_email_read};
 
 struct AppState {
     is_recording: AtomicBool,
 }
 
-fn get_storage_path(app_handle: &tauri::AppHandle) -> PathBuf {
-    let mut path = app_handle.path().app_data_dir().unwrap();
-    fs::create_dir_all(&path).unwrap();
-    path.push("history.enc");
-    path
+fn app_data_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let path = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取应用数据目录: {error}"))?;
+    fs::create_dir_all(&path).map_err(|error| format!("无法创建应用数据目录: {error}"))?;
+    Ok(path)
 }
 
-fn get_key_path(app_handle: &tauri::AppHandle) -> PathBuf {
-    let mut path = app_handle.path().app_data_dir().unwrap();
-    fs::create_dir_all(&path).unwrap();
+fn get_storage_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut path = app_data_dir(app_handle)?;
+    path.push("history.enc");
+    Ok(path)
+}
+
+fn get_key_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut path = app_data_dir(app_handle)?;
     path.push("secret.key");
-    path
+    Ok(path)
+}
+
+fn get_secret_recovery_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let mut path = app_data_dir(app_handle)?;
+    path.push("secrets-key.dpapi");
+    Ok(path)
+}
+
+#[cfg(target_os = "windows")]
+fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.is_empty() || data.len() > u32::MAX as usize {
+        return Err("无效的 DPAPI 加密数据长度".to_string());
+    }
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        CryptProtectData(
+            &input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if success == 0 || output.pbData.is_null() {
+        return Err("Windows DPAPI 无法保护应用密钥".to_string());
+    }
+
+    let protected =
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(protected)
+}
+
+#[cfg(target_os = "windows")]
+fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.is_empty() || data.len() > u32::MAX as usize {
+        return Err("无效的 DPAPI 恢复数据长度".to_string());
+    }
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        CryptUnprotectData(
+            &input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if success == 0 || output.pbData.is_null() {
+        return Err("Windows DPAPI 无法恢复应用密钥".to_string());
+    }
+
+    let plaintext =
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(plaintext)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dpapi_protect(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("当前系统不支持 Windows DPAPI 密钥恢复".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dpapi_unprotect(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("当前系统不支持 Windows DPAPI 密钥恢复".to_string())
+}
+
+fn read_secret_recovery_key(app_handle: &tauri::AppHandle) -> Result<Option<Vec<u8>>, String> {
+    let path = get_secret_recovery_path(app_handle)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let protected =
+        fs::read(&path).map_err(|error| format!("无法读取应用密钥恢复副本: {error}"))?;
+    let key = dpapi_unprotect(&protected)?;
+    if key.len() != 32 {
+        return Err("应用密钥恢复副本格式无效".to_string());
+    }
+    Ok(Some(key))
+}
+
+fn write_secret_recovery_key(app_handle: &tauri::AppHandle, key: &[u8]) -> Result<(), String> {
+    if key.len() != 32 {
+        return Err("应用密钥长度无效".to_string());
+    }
+
+    let path = get_secret_recovery_path(app_handle)?;
+    if path.exists() {
+        let existing = read_secret_recovery_key(app_handle)?;
+        if existing.as_deref() == Some(key) {
+            return Ok(());
+        }
+        return Err(
+            "系统凭据库密钥与 DPAPI 恢复副本不一致；为避免覆盖既有加密设置，已停止操作。"
+                .to_string(),
+        );
+    }
+
+    let protected = dpapi_protect(key)?;
+    fs::write(&path, protected).map_err(|error| format!("无法写入应用密钥恢复副本: {error}"))
 }
 
 fn get_or_migrate_history_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, String> {
-    let entry = Entry::new("task-pilot", "history-key").map_err(|e| e.to_string())?;
-    
-    // Check if secure key exists
-    if let Ok(password) = entry.get_password() {
-        if let Ok(key) = STANDARD.decode(&password) {
-            if key.len() == 32 {
+    let entry = Entry::new("task-pilot", "history-key").map_err(|error| error.to_string())?;
+    let key_path = get_key_path(app_handle)?;
+
+    match entry.get_password() {
+        Ok(password) => {
+            let key = STANDARD.decode(&password).map_err(|_| {
+                "系统凭据库中的历史密钥格式无效。请先备份历史文件后重新配置。".to_string()
+            })?;
+            if key.len() != 32 {
+                return Err(
+                    "系统凭据库中的历史密钥长度无效。请先备份历史文件后重新配置。".to_string(),
+                );
+            }
+            Ok(key)
+        }
+        Err(keyring::Error::NoEntry) => {
+            if key_path.exists() {
+                let key =
+                    fs::read(&key_path).map_err(|error| format!("无法读取旧历史密钥: {error}"))?;
+                if key.len() != 32 {
+                    return Err("旧历史密钥格式无效。请先备份历史文件后重新配置。".to_string());
+                }
+
+                entry
+                    .set_password(&STANDARD.encode(&key))
+                    .map_err(|error| format!("无法将历史密钥迁移至系统凭据库: {error}"))?;
+                // Keep the legacy file for a user-controlled backup/cleanup step.
                 return Ok(key);
             }
+
+            let key = Aes256Gcm::generate_key(OsRng).to_vec();
+            entry
+                .set_password(&STANDARD.encode(&key))
+                .map_err(|error| format!("无法在系统凭据库中创建历史密钥: {error}"))?;
+            Ok(key)
         }
+        Err(error) => Err(format!("无法访问系统凭据库以读取历史密钥: {error}")),
     }
-    
-    // Check legacy file
-    let key_path = get_key_path(app_handle);
-    if key_path.exists() {
-        if let Ok(key_bytes) = fs::read(&key_path) {
-            if key_bytes.len() == 32 {
-                // Try to migrate to keyring, but do NOT delete the legacy file
-                // because keyring can be volatile/broken on some Windows setups.
-                let _ = entry.set_password(&STANDARD.encode(&key_bytes));
-                return Ok(key_bytes);
-            }
-        }
-    }
-    
-    // Generate new key
-    let key = Aes256Gcm::generate_key(OsRng);
-    let key_vec = key.to_vec();
-    
-    // Always write to local file as a reliable fallback
-    let _ = fs::write(&key_path, &key_vec);
-    let _ = entry.set_password(&STANDARD.encode(&key_vec));
-    
-    Ok(key_vec)
 }
 
 fn encrypt_history(data: &str, key_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(key_bytes).map_err(|e| e.to_string())?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
-    
-    let ciphertext = cipher.encrypt(&nonce, data.as_bytes().as_ref()).map_err(|e| e.to_string())?;
-    
+
+    let ciphertext = cipher
+        .encrypt(&nonce, data.as_bytes().as_ref())
+        .map_err(|e| e.to_string())?;
+
     let mut final_data = nonce.to_vec();
     final_data.extend_from_slice(&ciphertext);
     Ok(final_data)
@@ -86,8 +235,10 @@ fn decrypt_history(encrypted_data: &[u8], key_bytes: &[u8]) -> Result<String, St
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
     let cipher = Aes256Gcm::new_from_slice(key_bytes).map_err(|e| e.to_string())?;
-    
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())?;
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| e.to_string())?;
     String::from_utf8(plaintext).map_err(|e| e.to_string())
 }
 
@@ -95,51 +246,63 @@ fn decrypt_history(encrypted_data: &[u8], key_bytes: &[u8]) -> Result<String, St
 fn save_history(app_handle: tauri::AppHandle, data: String) -> Result<(), String> {
     let key_bytes = get_or_migrate_history_key(&app_handle)?;
     let final_data = encrypt_history(&data, &key_bytes)?;
-    
-    let path = get_storage_path(&app_handle);
+
+    let path = get_storage_path(&app_handle)?;
     let mut tmp_path = path.clone();
     tmp_path.set_extension("enc.tmp");
-    
+
     // Atomic write
     {
         let mut file = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
         file.write_all(&final_data).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
     }
-    
+
     fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 fn load_history(app_handle: tauri::AppHandle) -> Result<String, String> {
-    let path = get_storage_path(&app_handle);
+    let path = get_storage_path(&app_handle)?;
     if !path.exists() {
         return Ok("[]".to_string());
     }
 
     let key_bytes = get_or_migrate_history_key(&app_handle)?;
     let encrypted_data = fs::read(&path).map_err(|e| e.to_string())?;
-    
+
     decrypt_history(&encrypted_data, &key_bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_encryption_decryption() {
         let key = Aes256Gcm::generate_key(OsRng);
         let data = "test history data";
-        
+
         let encrypted = encrypt_history(data, key.as_slice()).unwrap();
         assert_ne!(encrypted, data.as_bytes()); // Ensure it is changed
-        
+
         let decrypted = decrypt_history(&encrypted, key.as_slice()).unwrap();
         assert_eq!(decrypted, data);
     }
-    
+
+    #[test]
+    fn test_custom_provider_url_validation() {
+        assert!(
+            validate_custom_provider_url("https://provider.example/v1/chat/completions").is_ok()
+        );
+        assert!(
+            validate_custom_provider_url("http://provider.example/v1/chat/completions").is_err()
+        );
+        assert!(validate_custom_provider_url("https://127.0.0.1/v1/chat/completions").is_err());
+        assert!(validate_custom_provider_url("https://user:pass@provider.example/v1").is_err());
+    }
+
     #[test]
     fn test_invalid_decryption_too_short() {
         let key = Aes256Gcm::generate_key(OsRng);
@@ -148,6 +311,167 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Invalid data format");
     }
+}
+
+const MAX_CUSTOM_LLM_REQUEST_BYTES: usize = 5 * 1024 * 1024;
+const MAX_CUSTOM_LLM_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const CUSTOM_LLM_REQUEST_TIMEOUT_SECS: u64 = 3 * 60;
+
+#[derive(Debug, Deserialize)]
+struct CustomLlmRequest {
+    url: String,
+    #[serde(rename = "apiKey")]
+    api_key: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct CustomLlmResponse {
+    status: u16,
+    body: String,
+}
+
+fn is_non_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            let first = octets[0];
+            let second = octets[1];
+            address.is_loopback()
+                || address.is_unspecified()
+                || address.is_link_local()
+                || first == 10
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 168)
+                || (first == 192 && second == 0)
+                || (first == 192 && second == 2)
+                || (first == 198 && (second == 18 || second == 19))
+                || (first == 198 && second == 51 && octets[2] == 100)
+                || (first == 203 && second == 0 && octets[2] == 113)
+                || first >= 224
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            let first = segments[0];
+            address.is_loopback()
+                || address.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xff00) == 0xff00
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| is_non_public_ip(IpAddr::V4(mapped)))
+        }
+    }
+}
+
+fn validate_custom_provider_url(raw_url: &str) -> Result<url::Url, String> {
+    let url =
+        url::Url::parse(raw_url).map_err(|error| format!("自定义供应商 URL 无效: {error}"))?;
+    if url.scheme() != "https" {
+        return Err("自定义供应商只允许使用 HTTPS URL".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("自定义供应商 URL 不允许包含用户名或密码".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "自定义供应商 URL 缺少主机名".to_string())?;
+    let normalized_host = host.to_ascii_lowercase();
+    if normalized_host == "localhost" || normalized_host.ends_with(".localhost") {
+        return Err("自定义供应商不允许访问 localhost".to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_non_public_ip(ip) {
+            return Err("自定义供应商不允许访问本地或内网 IP 地址".to_string());
+        }
+    }
+
+    Ok(url)
+}
+
+fn resolve_public_socket(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("无法解析自定义供应商域名: {error}"))?;
+    addresses
+        .filter(|address| !is_non_public_ip(address.ip()))
+        .find(|address| !is_non_public_ip(address.ip()))
+        .ok_or_else(|| "自定义供应商域名解析到了本地或内网地址，已阻止请求".to_string())
+}
+
+#[tauri::command]
+async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmResponse, String> {
+    let url = validate_custom_provider_url(&request.url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "自定义供应商 URL 缺少主机名".to_string())?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "自定义供应商 URL 缺少有效端口".to_string())?;
+    let payload_bytes = serde_json::to_vec(&request.payload)
+        .map_err(|error| format!("请求数据序列化失败: {error}"))?;
+    if payload_bytes.len() > MAX_CUSTOM_LLM_REQUEST_BYTES {
+        return Err("自定义供应商请求体超过 5 MB 限制".to_string());
+    }
+
+    let socket = tauri::async_runtime::spawn_blocking({
+        let host = host.clone();
+        move || resolve_public_socket(&host, port)
+    })
+    .await
+    .map_err(|error| format!("域名解析任务失败: {error}"))??;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(
+            CUSTOM_LLM_REQUEST_TIMEOUT_SECS,
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(&host, socket)
+        .build()
+        .map_err(|error| format!("创建自定义供应商 HTTP 客户端失败: {error}"))?;
+
+    let response = client
+        .post(url)
+        .bearer_auth(request.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(payload_bytes)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!(
+                    "自定义供应商请求超时（{} 秒）",
+                    CUSTOM_LLM_REQUEST_TIMEOUT_SECS
+                )
+            } else {
+                format!("自定义供应商网络请求失败: {error}")
+            }
+        })?;
+
+    if response
+        .content_length()
+        .is_some_and(|length| length as usize > MAX_CUSTOM_LLM_RESPONSE_BYTES)
+    {
+        return Err("自定义供应商响应超过 10 MB 限制".to_string());
+    }
+
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取自定义供应商响应失败: {error}"))?;
+    if body.len() > MAX_CUSTOM_LLM_RESPONSE_BYTES {
+        return Err("自定义供应商响应超过 10 MB 限制".to_string());
+    }
+
+    let body = String::from_utf8(body.to_vec())
+        .map_err(|_| "自定义供应商响应不是有效 UTF-8 文本".to_string())?;
+    Ok(CustomLlmResponse { status, body })
 }
 
 #[tauri::command]
@@ -168,26 +492,24 @@ fn trigger_screenshot() -> Result<(), String> {
 
 #[tauri::command]
 fn write_log(app_handle: tauri::AppHandle, message: String) -> Result<(), String> {
-    use std::io::Write;
-    let mut log_path = app_handle.path().app_data_dir().unwrap();
-    fs::create_dir_all(&log_path).unwrap();
+    let mut log_path = app_data_dir(&app_handle)?;
     log_path.push("task-pilot.log");
-    
+
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .map_err(|e| e.to_string())?;
-        
+
     writeln!(file, "{}", message).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 fn open_log_file(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let mut log_path = app_handle.path().app_data_dir().unwrap();
+    let mut log_path = app_data_dir(&app_handle)?;
     log_path.push("task-pilot.log");
-    
+
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("notepad")
@@ -204,7 +526,7 @@ fn open_log_file(app_handle: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn clear_log(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let mut log_path = app_handle.path().app_data_dir().unwrap();
+    let mut log_path = app_data_dir(&app_handle)?;
     log_path.push("task-pilot.log");
     if log_path.exists() {
         fs::write(&log_path, "").map_err(|e| e.to_string())?;
@@ -213,11 +535,25 @@ fn clear_log(app_handle: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn unregister_shortcut(app_handle: tauri::AppHandle) -> Result<(), String> {
+    app_handle
+        .global_shortcut()
+        .unregister_all()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn update_shortcut(app_handle: tauri::AppHandle, shortcut: String) -> Result<(), String> {
     use std::str::FromStr;
-    app_handle.global_shortcut().unregister_all().map_err(|e| e.to_string())?;
-    let new_shortcut = Shortcut::from_str(&shortcut).map_err(|e| e.to_string())?;
-    app_handle.global_shortcut().register(new_shortcut).map_err(|e| e.to_string())?;
+    let new_shortcut = Shortcut::from_str(&shortcut).map_err(|error| error.to_string())?;
+    app_handle
+        .global_shortcut()
+        .unregister_all()
+        .map_err(|error| error.to_string())?;
+    app_handle
+        .global_shortcut()
+        .register(new_shortcut)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -227,8 +563,9 @@ fn set_recording_mode(app_handle: tauri::AppHandle, is_recording: bool) {
     state.is_recording.store(is_recording, Ordering::SeqCst);
 }
 
-fn get_machine_key() -> Result<[u8; 32], String> {
-    let uid = machine_uid::get().unwrap_or_else(|_| "fallback-uid-task-pilot".to_string());
+// Only used to read settings encrypted by legacy versions. New secrets must use the OS keyring.
+fn get_legacy_machine_key() -> Result<[u8; 32], String> {
+    let uid = machine_uid::get().map_err(|error| format!("无法读取旧版机器标识: {error}"))?;
     let mut hasher = Sha256::new();
     hasher.update(uid.as_bytes());
     let result = hasher.finalize();
@@ -238,43 +575,58 @@ fn get_machine_key() -> Result<[u8; 32], String> {
 }
 
 #[tauri::command]
-fn encrypt_secret(value: String) -> Result<String, String> {
+fn encrypt_secret(app_handle: tauri::AppHandle, value: String) -> Result<String, String> {
     if value.is_empty() {
         return Ok("".to_string());
     }
-    let key = get_or_create_secret_key()?;
+    let key = get_or_create_secret_key(&app_handle)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
-    
-    let ciphertext = cipher.encrypt(&nonce, value.as_bytes().as_ref()).map_err(|e| e.to_string())?;
+
+    let ciphertext = cipher
+        .encrypt(&nonce, value.as_bytes().as_ref())
+        .map_err(|e| e.to_string())?;
     let mut final_data = nonce.to_vec();
     final_data.extend_from_slice(&ciphertext);
     Ok(STANDARD.encode(final_data))
 }
 
-fn get_or_create_secret_key() -> Result<Vec<u8>, String> {
-    let entry = Entry::new("task-pilot", "secrets-key").map_err(|e| e.to_string())?;
-    
-    if let Ok(password) = entry.get_password() {
-        if let Ok(key) = STANDARD.decode(&password) {
-            if key.len() == 32 {
+fn decode_keyring_secret_key(password: &str) -> Option<Vec<u8>> {
+    STANDARD.decode(password).ok().filter(|key| key.len() == 32)
+}
+
+fn get_or_create_secret_key(app_handle: &tauri::AppHandle) -> Result<Vec<u8>, String> {
+    let entry = Entry::new("task-pilot", "secrets-key").ok();
+
+    if let Some(entry) = entry.as_ref() {
+        if let Ok(password) = entry.get_password() {
+            if let Some(key) = decode_keyring_secret_key(&password) {
+                write_secret_recovery_key(app_handle, &key)?;
                 return Ok(key);
             }
         }
     }
-    
-    // If keyring fails to retrieve, use the deterministic machine key
-    // instead of generating a random key, because keyring might fail to persist it.
-    let machine_key = get_machine_key()?.to_vec();
-    
-    // Try to save it to keyring anyway
-    let _ = entry.set_password(&STANDARD.encode(&machine_key));
-    
-    Ok(machine_key)
+
+    if let Some(key) = read_secret_recovery_key(app_handle)? {
+        if let Some(entry) = entry.as_ref() {
+            let _ = entry.set_password(&STANDARD.encode(&key));
+        }
+        return Ok(key);
+    }
+
+    let key = Aes256Gcm::generate_key(OsRng).to_vec();
+    // Create the DPAPI-protected recovery copy before returning the key. If this
+    // cannot be written, fail the save instead of creating ciphertext that the
+    // next application start cannot decrypt.
+    write_secret_recovery_key(app_handle, &key)?;
+    if let Some(entry) = entry.as_ref() {
+        let _ = entry.set_password(&STANDARD.encode(&key));
+    }
+    Ok(key)
 }
 
 #[tauri::command]
-fn decrypt_secret(cipher_text: String) -> Result<String, String> {
+fn decrypt_secret(app_handle: tauri::AppHandle, cipher_text: String) -> Result<String, String> {
     if cipher_text.is_empty() {
         return Ok("".to_string());
     }
@@ -283,16 +635,16 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
         Ok(data) => data,
         Err(_) => return Ok(cipher_text),
     };
-    
+
     if encrypted_data.len() < 12 {
         return Ok(cipher_text); // Probably plain text that happens to be valid base64
     }
-    
+
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    
-    // Try new Keyring key first
-    if let Ok(key) = get_or_create_secret_key() {
+
+    // Prefer the keyring key and its DPAPI-protected recovery copy.
+    if let Ok(key) = get_or_create_secret_key(&app_handle) {
         if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
             if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
                 if let Ok(s) = String::from_utf8(plaintext) {
@@ -301,9 +653,9 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
             }
         }
     }
-    
+
     // Fallback to legacy machine_uid key
-    if let Ok(key) = get_machine_key() {
+    if let Ok(key) = get_legacy_machine_key() {
         if let Ok(cipher) = Aes256Gcm::new_from_slice(&key) {
             if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
                 if let Ok(s) = String::from_utf8(plaintext) {
@@ -312,12 +664,154 @@ fn decrypt_secret(cipher_text: String) -> Result<String, String> {
             }
         }
     }
-    
+
     // If we reach here, it IS a valid base64 string of correct length, but we CANNOT decrypt it.
     // It's highly likely it is a corrupted/orphaned encrypted string.
     // Returning the raw ciphertext causes double-encryption bugs and UI confusion.
     // We MUST return an empty string to clear the corrupted state so the user can re-enter it.
     Ok("".to_string())
+}
+
+#[cfg(test)]
+mod secret_key_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_a_valid_256_bit_keyring_key() {
+        let valid = STANDARD.encode([7u8; 32]);
+        assert_eq!(decode_keyring_secret_key(&valid), Some(vec![7u8; 32]));
+        assert_eq!(decode_keyring_secret_key("invalid"), None);
+        assert_eq!(decode_keyring_secret_key(&STANDARD.encode([7u8; 31])), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dpapi_recovery_material_round_trips_for_the_current_windows_user() {
+        let key = [42u8; 32];
+        let protected = dpapi_protect(&key).expect("DPAPI should protect the recovery key");
+        assert_ne!(protected, key);
+        assert_eq!(
+            dpapi_unprotect(&protected).expect("DPAPI should restore the recovery key"),
+            key
+        );
+    }
+}
+
+const MAX_DROPPED_FILE_SIZE: u64 = 15 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDroppedFile {
+    name: String,
+    mime_type: String,
+    data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeFileDropEvent {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    files: Vec<NativeDroppedFile>,
+    errors: Vec<String>,
+}
+
+fn dropped_file_mime_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("csv") => "text/csv",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        _ => "application/octet-stream",
+    }
+}
+
+fn read_dropped_file(path: &std::path::Path) -> Result<NativeDroppedFile, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("无法读取拖放文件信息: {error}"))?;
+    if !metadata.is_file() {
+        return Err("拖放目标不是文件。".to_string());
+    }
+    if metadata.len() > MAX_DROPPED_FILE_SIZE {
+        return Err("文件超过 15 MB 解析上限。".to_string());
+    }
+
+    let bytes = fs::read(path).map_err(|error| format!("无法读取拖放文件: {error}"))?;
+    if bytes.len() as u64 > MAX_DROPPED_FILE_SIZE {
+        return Err("文件超过 15 MB 解析上限。".to_string());
+    }
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| "无法获取拖放文件名称。".to_string())?;
+
+    Ok(NativeDroppedFile {
+        name,
+        mime_type: dropped_file_mime_type(path).to_string(),
+        data_base64: STANDARD.encode(bytes),
+    })
+}
+
+fn emit_native_file_drop_event<R: tauri::Runtime>(window: &tauri::Window<R>, event_type: &'static str, paths: &[PathBuf]) {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+
+    if event_type == "drop" {
+        for path in paths.iter().take(5) {
+            match read_dropped_file(path) {
+                Ok(file) => files.push(file),
+                Err(error) => errors.push(format!("{}：{error}", path.display())),
+            }
+        }
+        if paths.len() > 5 {
+            errors.push("单次最多解析 5 个文件。".to_string());
+        }
+    }
+
+    let payload = NativeFileDropEvent {
+        event_type,
+        files,
+        errors,
+    };
+    if let Err(error) = window.emit("native-file-drag-drop", payload) {
+        log::error!("无法向前端发送原生拖放事件: {error}");
+    }
+}
+fn toggle_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    match window.is_visible() {
+        Ok(true) => {
+            if let Err(error) = window.hide() {
+                eprintln!("无法隐藏主窗口: {error}");
+            }
+        }
+        Ok(false) => {
+            for operation in [window.unminimize(), window.show(), window.set_focus()] {
+                if let Err(error) = operation {
+                    eprintln!("无法显示主窗口: {error}");
+                    break;
+                }
+            }
+        }
+        Err(error) => eprintln!("无法读取主窗口可见状态: {error}"),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -332,7 +826,42 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .invoke_handler(tauri::generate_handler![save_history, load_history, trigger_screenshot, write_log, open_log_file, clear_log, update_shortcut, set_recording_mode, encrypt_secret, decrypt_secret, get_email_folders, fetch_emails, mark_email_read])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(drag_event) = event {
+                match drag_event {
+                    tauri::DragDropEvent::Enter { paths, .. } => {
+                        emit_native_file_drop_event(window, "enter", paths);
+                    }
+                    tauri::DragDropEvent::Over { .. } => {
+                        emit_native_file_drop_event(window, "over", &[]);
+                    }
+                    tauri::DragDropEvent::Drop { paths, .. } => {
+                        emit_native_file_drop_event(window, "drop", paths);
+                    }
+                    tauri::DragDropEvent::Leave => {
+                        emit_native_file_drop_event(window, "leave", &[]);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            save_history,
+            load_history,
+            trigger_screenshot,
+            write_log,
+            open_log_file,
+            clear_log,
+            unregister_shortcut,
+            update_shortcut,
+            set_recording_mode,
+            encrypt_secret,
+            decrypt_secret,
+            get_email_folders,
+            fetch_emails,
+            mark_email_read,
+            request_custom_llm
+        ])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -343,16 +872,8 @@ pub fn run() {
                             return;
                         }
 
-                        // Since we dynamically register the shortcut, any triggered shortcut for this app toggles the main window
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                window.hide().unwrap();
-                            } else {
-                                window.unminimize().unwrap();
-                                window.show().unwrap();
-                                window.set_focus().unwrap();
-                            }
-                        }
+                        // Since we dynamically register the shortcut, any triggered shortcut for this app toggles the main window.
+                        toggle_main_window(app);
                     }
                 })
                 .build(),
@@ -368,8 +889,12 @@ pub fn run() {
             let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&quit_i])?;
 
+            let default_icon = app.default_window_icon().cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "默认窗口图标不可用")
+            })?;
+
             tauri::tray::TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(default_icon)
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     if event.id.as_ref() == "quit" {
@@ -381,17 +906,9 @@ pub fn run() {
                         button: tauri::tray::MouseButton::Left,
                         button_state: tauri::tray::MouseButtonState::Up,
                         ..
-                    } = event {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                window.hide().unwrap();
-                            } else {
-                                window.unminimize().unwrap();
-                                window.show().unwrap();
-                                window.set_focus().unwrap();
-                            }
-                        }
+                    } = event
+                    {
+                        toggle_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
@@ -401,3 +918,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

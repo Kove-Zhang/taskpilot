@@ -1,9 +1,20 @@
 import { useSettingsStore, getEffectiveFocus } from '../store';
 import type { TodoItem } from './ai';
+import type { FeedbackType } from './feedbackAvailability';
 import { callAIWithFailover } from './ai';
 import { logger } from './logger';
-import { invoke } from '@tauri-apps/api/core';
+import { loadHistory } from './history';
 import { LazyStore } from '@tauri-apps/plugin-store';
+
+export type AutoOptimizeOutcome = 'updated' | 'unchanged' | 'skipped'
+
+function dispatchEvolutionCompleted(detail: {
+  status: 'updated' | 'unchanged'
+  title: string
+  message: string
+}): void {
+  window.dispatchEvent(new CustomEvent('ai-evolution-completed', { detail }))
+}
 
 function buildNotionSchemaDescription(): string {
   const { notionProperties, fieldMappings } = useSettingsStore.getState();
@@ -29,21 +40,23 @@ function buildNotionSchemaDescription(): string {
 }
 
 export async function backgroundReviewAndUpdateFocus(
-  originalResult: TodoItem[], 
+  originalResult: TodoItem[],
   acceptedResult: TodoItem[],
-  explicitFeedback?: string
-) {
+  explicitFeedback?: string,
+  feedbackType: FeedbackType = 'over_extraction'
+): Promise<AutoOptimizeOutcome> {
   try {
     const state = useSettingsStore.getState();
     if (state.promptMode !== 'auto') {
-      return;
+      return 'skipped';
     }
 
     const aiStr = JSON.stringify(originalResult);
     const finalStr = JSON.stringify(acceptedResult);
-    if (aiStr === finalStr && !explicitFeedback) {
+    const hasUserChange = aiStr !== finalStr;
+    if (!hasUserChange && !explicitFeedback) {
       logger.info("[AutoOptimize] 无修改，跳过更新记忆。");
-      return;
+      return 'skipped';
     }
 
     const notionSchema = buildNotionSchemaDescription();
@@ -53,6 +66,13 @@ export async function backgroundReviewAndUpdateFocus(
       orig => !acceptedResult.find(acc => acc.id === orig.id)
     );
 
+    const feedbackTypeDescription = feedbackType === 'missed_extraction'
+      ? '漏提取：AI 没有识别出用户认为应当出现的待办。'
+      : '误提取：AI 提取了用户认为不应出现的待办。';
+    const feedbackSpecificGuidance = feedbackType === 'missed_extraction'
+      ? '本次 AI 输出为空或缺少关键行动项。请从用户补充中归纳必须识别的行动信号、责任表达、截止时间和上下文；不能因为本次待办数组为空就忽略该负反馈。'
+      : '请从被拒绝的待办和用户补充中归纳不应被识别为行动项的内容、噪音或错误优先级。';
+
     const systemPrompt = `你是一个后台自我迭代与 Prompt 工程师助手。
 您的任务是分析用户对历史提取任务的修改痕迹（特别是负向反馈），进而自动演进和更新全局的【任务提取关注点提示词】。
 
@@ -61,6 +81,12 @@ ${notionSchema}
 
 【当前系统的任务提取提示词】
 ${currentFocus}
+
+【本次负反馈类型】
+${feedbackTypeDescription}
+
+【针对本次反馈的分析重点】
+${feedbackSpecificGuidance}
 
 【用户认可并最终勾选同步的待办】
 ${JSON.stringify(acceptedResult)}
@@ -108,31 +134,54 @@ ${explicitFeedback ? `【来自用户的强显式纠正指令】\n${explicitFeed
     if (isUpdated) {
       useSettingsStore.getState().setAutoOptimizedFocus(newFocus);
       logger.info("[AutoOptimize] 自动记忆更新成功", { old: currentFocus, new: newFocus });
-      window.dispatchEvent(new CustomEvent('ai-evolution-completed', { 
-        detail: { 
-          title: "🧠 AI 认知已自我演进",
-          message: explicitFeedback ? "系统已根据您的纠正指令，深度学习并更新了全局提取规则。" : "系统深度学习了您最近的操作偏好，全局提取规则已更新完毕。" 
-        } 
-      }));
+      dispatchEvolutionCompleted({
+        status: 'updated',
+        title: "🧠 AI 认知已自我演进",
+        message: explicitFeedback
+          ? "系统已根据您的纠正指令，深度学习并更新了全局提取规则。"
+          : "系统深度学习了您最近的操作偏好，全局提取规则已更新完毕。",
+      })
+      return 'updated';
     } else if (explicitFeedback) {
       // If user explicitly provided feedback but AI decided not to change the prompt
       logger.info("[AutoOptimize] 自动记忆未更新 (已有规则覆盖或无效纠正)", { newFocus });
-      window.dispatchEvent(new CustomEvent('ai-evolution-completed', { 
-        detail: { 
-          title: "🧠 AI 深度反思完毕",
-          message: "系统认为当前核心规则已能完全覆盖您的诉求，本次未对底层规则做大改。" 
-        } 
-      }));
+      dispatchEvolutionCompleted({
+        status: 'unchanged',
+        title: explicitFeedback ? "🧠 AI 深度反思完毕" : "✅ 正反馈已记录",
+        message: explicitFeedback
+          ? "系统认为当前核心规则已能完全覆盖您的诉求，本次未对底层规则做大改。"
+          : "AI 已分析您确认的待办选择，当前规则无需额外修改。",
+      })
+      return 'unchanged';
+    } else if (hasUserChange) {
+      logger.info("[AutoOptimize] 正反馈已分析，但当前规则无需修改", { newFocus });
+      dispatchEvolutionCompleted({
+        status: 'unchanged',
+        title: "✅ 正反馈已记录",
+        message: "AI 已分析您确认的待办选择，当前规则无需额外修改。",
+      })
+      return 'unchanged';
     }
+
+    return 'skipped';
   } catch (err) {
     logger.warn("[AutoOptimize] 自动更新失败", err);
+    window.dispatchEvent(new CustomEvent('ai-evolution-failed', {
+      detail: {
+        title: explicitFeedback ? '⚠️ AI 反馈学习失败' : '⚠️ 正反馈学习失败',
+        message: explicitFeedback
+          ? '反馈已保存，但 AI 自动演进未完成，请稍后重试。'
+          : 'Notion 同步已完成，但 AI 自动演进未完成，请稍后重试。',
+      },
+    }));
+    throw err;
   }
 }
 
 export async function analyzeHistoryAndUpdateFocus() {
-  let dataJson;
+  let data;
   try {
-    dataJson = await invoke<string>("load_history");
+    data = await loadHistory();
   } catch (err: any) {
     const errorStr = typeof err === 'string' ? err : (err.message || String(err));
     if (errorStr.includes("aead::Error")) {
@@ -140,7 +189,6 @@ export async function analyzeHistoryAndUpdateFocus() {
     }
     throw new Error(errorStr);
   }
-  const data = JSON.parse(dataJson || "[]");
   
   const emailHistoryStore = new LazyStore('email_history.enc');
   const emailData: any[] = await emailHistoryStore.get('history') || [];

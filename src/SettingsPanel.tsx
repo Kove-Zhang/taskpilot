@@ -2,13 +2,15 @@ import { useEffect, useState } from 'react'
 import { X, Save, Key, Database, BrainCircuit, Wand2, Terminal, Loader2, CheckCircle2, XCircle, RotateCcw, Settings, Sparkles, Undo2, Keyboard, ArrowUp, ArrowDown, Mail, Plus, Trash2, ShieldCheck, ChevronDown, ChevronUp, Lock, Maximize2 } from 'lucide-react'
 import { useSettingsStore, getSortedLLMProviders, type LLMProvider } from './store'
 import { logger } from './lib/logger'
-import { fetch } from '@tauri-apps/plugin-http'
+import { fetchWithTimeout } from './lib/http'
+import { notionDatabaseEndpoint, notionHeaders } from './lib/notionApi'
+import { requestProviderChatCompletion } from './lib/providerTransport'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ZenEditorModal } from './components/ZenEditorModal'
 
 
-import { decodeIMAPFolder } from './lib/parser'
+import { decodeIMAPFolder } from './lib/imapFolder'
 interface SettingsPanelProps {
 
   onClose: () => void;
@@ -17,7 +19,7 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const {
     apiBaseUrl, apiKey, modelName, personalFocus, notionApiKey, notionDatabaseId, enableLogging, globalShortcut,
-    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount, isWindowMode,
+    notionProperties, fieldMappings, tokenLimit, enableReasoning, emailConfig, enableFailover, failoverRetryCount, failoverOnAuthError, isWindowMode,
     promptMode, staticPersonalFocus, autoOptimizedFocus, staticFocusUpdatedAt, autoOptimizedUpdatedAt,
     setPromptMode, setStaticFocus, setAutoOptimizedFocus, setNotionSettings, setEnableLogging, setGlobalShortcut, setNotionProperties, setFieldMapping, setTokenLimit, setEnableReasoning, setEmailConfig, setLLMProviders, setFailoverConfig, setWindowMode
   } = useSettingsStore();
@@ -39,6 +41,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   });
   const [formEnableFailover, setFormEnableFailover] = useState<boolean>(enableFailover !== undefined ? enableFailover : true);
   const [formRetryCount, setFormRetryCount] = useState<number>(failoverRetryCount || 1);
+  const [formFailoverOnAuthError, setFormFailoverOnAuthError] = useState<boolean>(failoverOnAuthError ?? false);
   const [showFailoverGuide, setShowFailoverGuide] = useState<boolean>(false);
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [providerTestResults, setProviderTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string }>>({});
@@ -114,7 +117,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const handleSave = () => {
     setLLMProviders(formProviders);
-    setFailoverConfig(formEnableFailover, formRetryCount);
+    setFailoverConfig(formEnableFailover, formRetryCount, formFailoverOnAuthError);
     setPromptMode(formPromptMode);
     setStaticFocus(formStaticFocus);
     setAutoOptimizedFocus(formAutoFocus);
@@ -151,30 +154,46 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   };
 
   useEffect(() => {
-    import('@tauri-apps/api/core').then(m => {
-      if (isRecordingShortcut) {
-        m.invoke('unregister_shortcut').catch(console.error);
-      } else {
-        m.invoke('update_shortcut', { shortcut: formGlobalShortcut }).catch(console.error);
-      }
-    });
+    let disposed = false
 
-    const blockSystemMenu = (e: KeyboardEvent) => {
-      if (isRecordingShortcut) {
-        e.preventDefault();
-        // Allow the React synthetic event to still process it, or we can just let React handle it.
-        // preventDefault at window level often stops OS defaults like Alt+Space menu in Chromium.
+    const syncShortcutRecordingState = async () => {
+      try {
+        const api = await import('@tauri-apps/api/core')
+        if (disposed) return
+
+        await api.invoke('set_recording_mode', { isRecording: isRecordingShortcut })
+        if (isRecordingShortcut) {
+          await api.invoke('unregister_shortcut')
+        } else {
+          // Editing a shortcut is only a draft operation. Restore the persisted shortcut until the user saves.
+          await api.invoke('update_shortcut', { shortcut: globalShortcut })
+        }
+      } catch (error) {
+        console.error('Failed to synchronize shortcut recording state', error)
       }
-    };
-    
-    if (isRecordingShortcut) {
-      window.addEventListener('keydown', blockSystemMenu, { capture: true });
     }
-    
+
+    void syncShortcutRecordingState()
+
+    const blockSystemMenu = (event: KeyboardEvent) => {
+      if (isRecordingShortcut) {
+        event.preventDefault()
+      }
+    }
+
+    if (isRecordingShortcut) {
+      window.addEventListener('keydown', blockSystemMenu, { capture: true })
+    }
+
     return () => {
-      window.removeEventListener('keydown', blockSystemMenu, { capture: true });
-    };
-  }, [isRecordingShortcut, formGlobalShortcut]);
+      disposed = true
+      window.removeEventListener('keydown', blockSystemMenu, { capture: true })
+    }
+  }, [isRecordingShortcut, globalShortcut])
+
+  useEffect(() => () => {
+    void import('@tauri-apps/api/core').then((api) => api.invoke('set_recording_mode', { isRecording: false })).catch(console.error)
+  }, [])
 
   const buildShortcutString = (e: React.KeyboardEvent) => {
     const parts = [];
@@ -263,27 +282,23 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         }
       }
 
-      const normalizedUrl = provider.apiBaseUrl.trim().endsWith('/') ? provider.apiBaseUrl.trim().slice(0, -1) : provider.apiBaseUrl.trim();
-      logger.info('Testing provider API connection...', { baseUrl: normalizedUrl, model: provider.modelName });
+      logger.info('Testing provider API connection...', { baseUrl: provider.apiBaseUrl, model: provider.modelName });
 
-      const response = await fetch(`${normalizedUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${provider.apiKey}`
-        },
-        body: JSON.stringify(payload)
+      const response = await requestProviderChatCompletion({
+        baseUrl: provider.apiBaseUrl,
+        apiKey: provider.apiKey,
+        payload,
       });
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+        const errData = await response.json().catch(() => ({})) as { error?: { message?: string } };
         throw new Error(errData.error?.message || `HTTP Error ${response.status}`);
       }
 
-      const data = await response.json();
-      if (data.choices && data.choices.length > 0) {
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      if (data.choices?.some(choice => typeof choice.message?.content === 'string')) {
         setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'success' } }));
-        logger.info('Provider API connection test successful', data);
+        logger.info('Provider API connection test successful', { choiceCount: data.choices.length });
       } else {
         throw new Error('Invalid response format');
       }
@@ -309,12 +324,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     
     try {
       logger.info('Testing Notion connection...');
-      const response = await fetch(`https://api.notion.com/v1/databases/${formNotionDb}`, {
+      const response = await fetchWithTimeout(notionDatabaseEndpoint(formNotionDb), {
         method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${formNotionKey}`,
-          'Notion-Version': '2022-06-28'
-        }
+        headers: notionHeaders(formNotionKey),
       });
 
       if (!response.ok) {
@@ -330,6 +342,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           let options = undefined;
           if (val.type === 'select' && val.select?.options) {
             options = val.select.options.map((o: any) => o.name);
+          } else if (val.type === 'status' && val.status?.options) {
+            options = val.status.options.map((o: any) => o.name);
           } else if (val.type === 'multi_select' && val.multi_select?.options) {
             options = val.multi_select.options.map((o: any) => o.name);
           }
@@ -380,7 +394,6 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
     setOptimizingPrompt(true);
     try {
-      const normalizedUrl = topProvider.apiBaseUrl.trim().endsWith('/') ? topProvider.apiBaseUrl.trim().slice(0, -1) : topProvider.apiBaseUrl.trim();
       const isOSeries = /^o\d+/.test(topProvider.modelName.toLowerCase());
       const isClaude = topProvider.modelName.toLowerCase().includes('claude');
       const isDeepSeek = topProvider.modelName.toLowerCase().includes('deepseek') || topProvider.modelName.toLowerCase().includes('reasoner') || topProvider.modelName.toLowerCase().includes('thinking');
@@ -420,30 +433,30 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         }
       }
 
-      const response = await fetch(`${normalizedUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${topProvider.apiKey}`
-        },
-        body: JSON.stringify(payload)
+      const response = await requestProviderChatCompletion({
+        baseUrl: topProvider.apiBaseUrl,
+        apiKey: topProvider.apiKey,
+        payload,
       });
 
       if (!response.ok) {
         throw new Error(`HTTP Error ${response.status}`);
       }
 
-      const data = await response.json();
-      logger.info('Received raw prompt optimization response from AI', { response: data });
-      if (data.choices && data.choices.length > 0) {
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      logger.info('Received prompt optimization response from AI', { choiceCount: data.choices?.length ?? 0 });
+      const optimizedContent = data.choices?.[0]?.message?.content;
+      if (typeof optimizedContent === 'string' && optimizedContent.trim()) {
         if (formPromptMode === 'static') {
           setPreviousFocus(formStaticFocus);
-          setFormStaticFocus(data.choices[0].message.content.trim());
+          setFormStaticFocus(optimizedContent.trim());
         } else {
           setPreviousFocus(formAutoFocus);
-          setFormAutoFocus(data.choices[0].message.content.trim());
+          setFormAutoFocus(optimizedContent.trim());
         }
         logger.info('Prompt optimization successful');
+      } else {
+        throw new Error('Invalid response format');
       }
     } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
@@ -723,6 +736,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                           <label className="text-xs text-slate-400 mb-1 block font-mono">API Base URL</label>
                           <input
                             type="text"
+                            data-testid={index === 0 ? 'settings-api-base-url' : undefined}
                             value={provider.apiBaseUrl}
                             onChange={(e) => {
                               const updated = [...formProviders];
@@ -741,6 +755,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                           </label>
                           <input
                             type="password"
+                            data-testid={index === 0 ? 'settings-api-key' : undefined}
                             value={provider.apiKey}
                             onChange={(e) => {
                               const updated = [...formProviders];
@@ -800,6 +815,25 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                     />
                     <span>次</span>
                   </div>
+                </div>
+
+                <div className="border-t border-white/5 pt-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="failoverOnAuthError"
+                      checked={formFailoverOnAuthError}
+                      disabled={!formEnableFailover}
+                      onChange={(e) => setFormFailoverOnAuthError(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded border-white/20 bg-black/20 text-amber-500 focus:ring-amber-500/50 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                    <label htmlFor="failoverOnAuthError" className={`text-xs select-none ${formEnableFailover ? 'text-slate-300 cursor-pointer' : 'text-slate-500 cursor-not-allowed'}`}>
+                      认证失败（401）时也尝试备用服务商
+                    </label>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-amber-300/80">
+                    关闭时会立即提示当前 API Key 配置错误；开启后会直接轮换到下一服务商，不会用同一失效 Key 重试。请求内容会发送给备用服务商。
+                  </p>
                 </div>
 
                 <div className="border-t border-white/5 pt-3 flex items-center justify-between gap-3">
@@ -1183,22 +1217,56 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                        </label>
                     </div>
 
-                    <div className="flex gap-4 border-t border-white/5 pt-3">
-                       <label className="flex flex-col gap-1 text-xs text-slate-300 w-1/2">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 border-t border-white/5 pt-3">
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
+                          <span>自动扫描范围</span>
+                          <select
+                            value={formEmailConfig.autoUnreadOnly === false ? 'all' : 'unread'}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, autoUnreadOnly: e.target.value === 'unread'})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                          >
+                            <option value="unread">仅未读邮件</option>
+                            <option value="all">回溯范围内全部邮件</option>
+                          </select>
+                       </label>
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
+                          <span>手动扫描范围</span>
+                          <select
+                            value={formEmailConfig.manualUnreadOnly === true ? 'unread' : 'all'}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, manualUnreadOnly: e.target.value === 'unread'})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                          >
+                            <option value="all">回溯范围内全部邮件</option>
+                            <option value="unread">仅未读邮件</option>
+                          </select>
+                       </label>
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
+                          <span>每个文件夹最多拉取</span>
+                          <input
+                            type="number"
+                            min="1" max="500"
+                            value={formEmailConfig.maxEmailsPerFolder || 50}
+                            onChange={(e) => setFormEmailConfig({...formEmailConfig, maxEmailsPerFolder: Math.min(Math.max(parseInt(e.target.value) || 50, 1), 500)})}
+                            className="bg-black/30 border border-white/10 rounded p-1.5 text-sm text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none"
+                          />
+                       </label>
+                    </div>
+                    <p className="text-[11px] text-slate-500">自动扫描默认仅处理未读邮件；切换为全部邮件后，系统仍会通过防重复指纹避免重复解析。</p>
+                    <div className="grid grid-cols-2 gap-3 border-t border-white/5 pt-3">
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
                           <span>自动抓取回溯天数 (Auto)</span>
-                          <input 
-                            type="number" 
+                          <input
+                            type="number"
                             min="1" max="365"
                             value={formEmailConfig.autoReadDays || 3}
                             onChange={(e) => setFormEmailConfig({...formEmailConfig, autoReadDays: parseInt(e.target.value) || 3})}
                             className="bg-black/30 border border-white/10 rounded p-1.5 text-slate-200 focus:ring-1 focus:ring-pink-500 outline-none w-full"
                           />
                        </label>
-                       
-                       <label className="flex flex-col gap-1 text-xs text-slate-300 w-1/2">
+                       <label className="flex flex-col gap-1 text-xs text-slate-300">
                           <span>手动抓取回溯天数 (Manual)</span>
-                          <input 
-                            type="number" 
+                          <input
+                            type="number"
                             min="1" max="365"
                             value={formEmailConfig.manualReadDays || 7}
                             onChange={(e) => setFormEmailConfig({...formEmailConfig, manualReadDays: parseInt(e.target.value) || 7})}
@@ -1544,7 +1612,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                         const m = await import('@tauri-apps/api/core');
                         await m.invoke('clear_log');
                         btn.innerText = '已清空！';
-                      } catch (err) {
+                      } catch {
                         btn.innerText = '清空失败';
                       }
                       setTimeout(() => { btn.innerText = originalText; }, 2000);
@@ -1567,6 +1635,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
             所有文件（PDF/Word/Excel 等）的解析读取 100% 在本地沙箱执行。提取和润色过程会调用您配置的 API Base URL 发送请求，请勿向不受信任的服务端发送机密信息。
           </p>
           <button 
+            data-testid="save-settings"
             onClick={handleSave}
             className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md shadow-lg shadow-purple-500/20 transition-all active:scale-95 shrink-0 whitespace-nowrap self-end sm:self-auto"
           >

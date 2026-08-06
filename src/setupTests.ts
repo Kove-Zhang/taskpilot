@@ -38,6 +38,9 @@ vi.mock('@tauri-apps/api/window', () => ({
     hide: vi.fn(() => Promise.resolve()),
     show: vi.fn(() => Promise.resolve()),
     onFocusChanged: vi.fn(() => Promise.resolve(() => {})),
+    setSkipTaskbar: vi.fn(() => Promise.resolve()),
+    setAlwaysOnTop: vi.fn(() => Promise.resolve()),
+    setResizable: vi.fn(() => Promise.resolve()),
   })),
 }))
 

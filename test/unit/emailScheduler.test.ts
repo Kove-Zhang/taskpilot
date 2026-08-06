@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { useSettingsStore } from '../../src/store'
 
 describe('Email Config State Tests', () => {
@@ -15,7 +15,13 @@ describe('Email Config State Tests', () => {
         scheduleTime: 'every_1h',
         markAsRead: false,
         retryCount: 1,
-        enabled: true
+        enabled: true,
+        autoSyncToNotion: false,
+        autoUnreadOnly: true,
+        manualUnreadOnly: false,
+        autoReadDays: 3,
+        manualReadDays: 7,
+        maxEmailsPerFolder: 50
       }
     })
   })

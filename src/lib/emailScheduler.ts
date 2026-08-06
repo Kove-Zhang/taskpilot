@@ -1,17 +1,22 @@
 import { useSettingsStore, useScannerStore } from '../store';
 import { invoke } from '@tauri-apps/api/core';
-import { decodeIMAPFolder } from './parser';
+import { decodeIMAPFolder } from './imapFolder';
 import { extractTodosFromContent, type AIResult } from './ai';
 import { parseEmailThread } from './emailThreadParser';
 import { syncToNotion } from './notion';
 import { logger } from './logger';
 import { LazyStore } from '@tauri-apps/plugin-store';
 import { compressBase64Image } from './imageUtils';
+import { limitEmailHistoryHtml, limitEmailHistoryText } from './emailHistoryContent';
+import { isRetryableRequestError } from './http';
+import type { NotionSyncState } from './notionSyncState';
+import { summarizeNotionSyncResults } from './notionSyncState';
 
 export interface EmailHistoryItem {
     batchId: string;
     timestamp: number;
     emailUid: number;
+    emailUidValidity?: number;
     subject: string;
     sender: string;
     status: 'success' | 'failed';
@@ -19,14 +24,51 @@ export interface EmailHistoryItem {
     aiResult?: AIResult;
     emailDate?: string;
     syncedToNotion?: boolean;
+    notionSync?: NotionSyncState;
     folder?: string;
     rawBodyText?: string;
     htmlBody?: string;
     inlineImages?: string[];
     reviewed?: boolean;
+    /** True only when the latest failure was caused by a transient error. */
+    retryable?: boolean;
 }
 
 const historyStore = new LazyStore('email_history.enc');
+
+interface FetchedEmail {
+    uid: number;
+    uid_validity?: number;
+    sender: string;
+    subject: string;
+    date: string;
+    body_text: string;
+    html_body?: string | null;
+    inline_images?: string[];
+    parse_error?: string | null;
+}
+
+class EmailProcessingError extends Error {
+    readonly retryable: boolean;
+
+    constructor(message: string, retryable: boolean) {
+        super(message);
+        this.name = 'EmailProcessingError';
+        this.retryable = retryable;
+    }
+}
+
+function isRetryableEmailProcessingError(error: unknown): boolean {
+    return error instanceof EmailProcessingError ? error.retryable : isRetryableRequestError(error);
+}
+
+function getEmailFingerprint(folder: string, email: Pick<FetchedEmail, 'uid' | 'uid_validity'>): string {
+    return `${folder}_${email.uid_validity ?? 'legacy'}_${email.uid}`;
+}
+
+function getEmailHistoryFingerprint(item: Pick<EmailHistoryItem, 'folder' | 'emailUid' | 'emailUidValidity'>): string | null {
+    return item.folder ? `${item.folder}_${item.emailUidValidity ?? 'legacy'}_${item.emailUid}` : null;
+}
 
 // In-memory flag to prevent overlapping runs
 let lastRunTimestamp = 0;
@@ -64,9 +106,9 @@ function shouldRunNow(): boolean {
     }
 }
 
-async function processSingleEmail(email: any, batchId: string, folder: string, processedUids: string[]): Promise<EmailHistoryItem> {
+async function processSingleEmail(email: FetchedEmail, batchId: string, folder: string, processedUids: string[]): Promise<EmailHistoryItem> {
     const { emailConfig } = useSettingsStore.getState();
-    const fingerprint = `${folder}_${email.uid}`;
+    const fingerprint = getEmailFingerprint(folder, email);
     
     if (processedUids.includes(fingerprint)) {
         logger.info(`Email UID ${email.uid} in ${folder} already processed, skipping.`);
@@ -74,14 +116,37 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
             batchId,
             timestamp: Date.now(),
             emailUid: email.uid,
+            emailUidValidity: email.uid_validity,
             subject: email.subject,
             sender: email.sender,
             emailDate: email.date,
             status: 'success', // Consider it success so it's not retried as error
             syncedToNotion: false, // or undefined, as it was skipped
             folder,
-            rawBodyText: email.body_text,
-            htmlBody: email.html_body,
+            rawBodyText: limitEmailHistoryText(email.body_text),
+            htmlBody: limitEmailHistoryHtml(email.html_body),
+            inlineImages: email.inline_images || []
+        };
+    }
+
+    if (email.parse_error) {
+        const parseError = `邮件 UID ${email.uid} 无法解析：${email.parse_error}`;
+        logger.error(parseError);
+        processedUids.push(fingerprint);
+        return {
+            batchId,
+            timestamp: Date.now(),
+            emailUid: email.uid,
+            emailUidValidity: email.uid_validity,
+            subject: email.subject,
+            sender: email.sender,
+            emailDate: email.date,
+            status: 'failed',
+            error: parseError,
+            retryable: false,
+            folder,
+            rawBodyText: limitEmailHistoryText(email.body_text),
+            htmlBody: limitEmailHistoryHtml(email.html_body),
             inlineImages: email.inline_images || []
         };
     }
@@ -89,6 +154,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
     let attempt = 0;
     const maxAttempts = emailConfig.retryCount + 1;
     let lastError = '';
+    let lastErrorRetryable = false;
 
     let aiResult: AIResult | undefined = undefined;
     let synced = false;
@@ -151,8 +217,10 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                     });
                     
                     const failed = syncRes.filter(r => !r.success);
+                    aiResult.notionSync = summarizeNotionSyncResults(syncRes, todosToSync.length);
                     if (failed.length > 0) {
-                        throw new Error(`Notion sync failed for ${failed.length} items`);
+                        const retryable = failed.some((item) => item.retryable === true);
+                        throw new EmailProcessingError(`Notion sync failed for ${failed.length} items`, retryable);
                     }
                 }
                 synced = true;
@@ -176,6 +244,7 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                 batchId,
                 timestamp: Date.now(),
                 emailUid: email.uid,
+                emailUidValidity: email.uid_validity,
                 subject: email.subject,
                 sender: email.sender,
                 emailDate: email.date,
@@ -183,18 +252,23 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
                 aiResult,
                 syncedToNotion: synced,
                 folder,
-                rawBodyText: email.body_text,
-                htmlBody: email.html_body,
+                rawBodyText: limitEmailHistoryText(email.body_text),
+                htmlBody: limitEmailHistoryHtml(email.html_body),
                 inlineImages: compressedImages
             };
 
         } catch (e: any) {
             lastError = typeof e === 'string' ? e : e.message || String(e);
+            lastErrorRetryable = isRetryableEmailProcessingError(e);
             logger.error(`Error processing email ${email.uid}`, e);
+            if (!lastErrorRetryable) {
+                logger.warn(`Email ${email.uid} failed for a non-retryable reason; skip automatic retry and wait for a manual scan after configuration is corrected.`, e);
+                break;
+            }
             if (attempt >= maxAttempts) {
                 break;
             }
-            // Add a small delay before retry
+            // Add a small delay before retrying a transient failure.
             await new Promise(r => setTimeout(r, 2000));
         }
     }
@@ -203,15 +277,17 @@ async function processSingleEmail(email: any, batchId: string, folder: string, p
         batchId,
         timestamp: Date.now(),
         emailUid: email.uid,
+        emailUidValidity: email.uid_validity,
         subject: email.subject,
         sender: email.sender,
         emailDate: email.date,
         status: 'failed',
         error: lastError,
+        retryable: lastErrorRetryable,
         aiResult,
         folder,
-        rawBodyText: email.body_text,
-        htmlBody: email.html_body,
+        rawBodyText: limitEmailHistoryText(email.body_text),
+        htmlBody: limitEmailHistoryHtml(email.html_body),
         inlineImages: compressedImages
     };
 }
@@ -231,6 +307,7 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
 
     scannerStore.resetScanControl();
     scannerStore.setRunning(true);
+    scannerStore.setStatus('fetching');
     lastRunTimestamp = Date.now();
     logger.info("Starting email scanner batch...");
     const batchId = `batch_${Date.now()}`;
@@ -238,6 +315,13 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
     try {
         scannerStore.setProgressMsg('连接服务器...');
         let processedUids: string[] = await historyStore.get('processed_uids') || [];
+        const existingHistory: EmailHistoryItem[] = await historyStore.get('history') || [];
+        const terminalFailureFingerprints = new Set(
+            existingHistory
+                .filter((item) => item.status === 'failed' && item.retryable === false)
+                .map(getEmailHistoryFingerprint)
+                .filter((fingerprint): fingerprint is string => fingerprint !== null),
+        );
         const folders = emailConfig.targetFolder ? emailConfig.targetFolder.split(',').map(f => f.trim()).filter(Boolean) : ['INBOX'];
         
         for (const folder of folders) {
@@ -246,7 +330,11 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                 break;
             }
             while (useScannerStore.getState().paused && !useScannerStore.getState().stopRequested) {
+                scannerStore.setStatus('paused');
                 await new Promise(r => setTimeout(r, 500));
+            }
+            if (!useScannerStore.getState().stopRequested) {
+                scannerStore.setStatus('fetching');
             }
             if (useScannerStore.getState().stopRequested) {
                 logger.info("用户停止扫描，终止本次运行。");
@@ -257,26 +345,36 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
             try {
                 scannerStore.setProgressMsg(`拉取目录 ${decodeIMAPFolder(folder)}...`);
                 const sinceDays = isManual ? (emailConfig.manualReadDays || 7) : (emailConfig.autoReadDays || 3);
+                const unreadOnly = isManual
+                    ? (emailConfig.manualUnreadOnly ?? false)
+                    : (emailConfig.autoUnreadOnly ?? true);
+                const maxEmailsPerFolder = Math.min(Math.max(emailConfig.maxEmailsPerFolder || 50, 1), 500);
+                const scanScope = unreadOnly ? '仅未读邮件' : '全部邮件';
                 const emails = await invoke('fetch_emails', {
-                    host: emailConfig.host,
-                    port: emailConfig.port,
-                    user: emailConfig.user,
-                    pass: emailConfig.pass,
-                    ssl: emailConfig.ssl,
-                    folder: folder,
-                    unreadOnly: true,
-                    sinceDays: sinceDays
-                }) as any[];
+                    request: {
+                        host: emailConfig.host,
+                        port: emailConfig.port,
+                        user: emailConfig.user,
+                        pass: emailConfig.pass,
+                        ssl: emailConfig.ssl,
+                        folder,
+                        unreadOnly,
+                        sinceDays,
+                        maxEmails: maxEmailsPerFolder
+                    }
+                }) as FetchedEmail[];
 
-                logger.info(`Fetched ${emails.length} unread emails from ${folder}.`);
+                logger.info(`Fetched ${emails.length} recent emails from ${folder}.`);
+                scannerStore.setProgressMsg(`目录 ${decodeIMAPFolder(folder)} | 条件：${scanScope} | 回溯：${sinceDays} 天 | 拉取到 ${emails.length} 封候选邮件`);
 
                 let processedCount = 0;
-                for (const email of emails) {
+                for (const [emailIndex, email] of emails.entries()) {
                     if (useScannerStore.getState().stopRequested) {
                         logger.info("用户停止扫描，终止本次运行。");
                         break;
                     }
                     while (useScannerStore.getState().paused && !useScannerStore.getState().stopRequested) {
+                        scannerStore.setStatus('paused');
                         await new Promise(r => setTimeout(r, 500));
                     }
                     if (useScannerStore.getState().stopRequested) {
@@ -284,18 +382,30 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                         break;
                     }
 
-                    processedCount++;
-                    const shortSub = email.subject ? (email.subject.length > 18 ? email.subject.slice(0, 18) + '...' : email.subject) : '无主题';
-                    scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${shortSub}`);
-                    const result = await processSingleEmail(email, batchId, folder, processedUids);
-                    if (!processedUids.includes(`${folder}_${email.uid}`)) {
-                        // If it wasn't added inside processSingleEmail, it means it skipped or failed
+                    scannerStore.setStatus('processing');
+                    const fingerprint = getEmailFingerprint(folder, email);
+                    const subject = email.subject?.trim() || '无主题';
+                    const candidateIndex = emailIndex + 1;
+                    if (processedUids.includes(fingerprint)) {
+                        scannerStore.setProgressMsg(`跳过已处理 (${candidateIndex}/${emails.length}): ${subject}`);
+                        continue;
                     }
-                    
+                    if (!isManual && terminalFailureFingerprints.has(fingerprint)) {
+                        logger.info(`Email UID ${email.uid} in ${folder} previously failed due to a non-retryable error; skip automatic reprocessing until a manual scan is started.`);
+                        scannerStore.setProgressMsg(`跳过不可自动重试 (${candidateIndex}/${emails.length}): ${subject}`);
+                        continue;
+                    }
+
+                    processedCount++;
+                    scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${subject}`);
+                    const result = await processSingleEmail(email, batchId, folder, processedUids);
+                    if (result.status === 'failed' && result.retryable === false) {
+                        terminalFailureFingerprints.add(fingerprint);
+                    }
                     // Immediately save to history for real-time feedback (with deduplication for retried failed items)
                     if (result.aiResult || result.status === 'failed') {
                         let existing: EmailHistoryItem[] = await historyStore.get('history') || [];
-                        const existingIdx = existing.findIndex(item => item.folder === result.folder && item.emailUid === result.emailUid);
+                        const existingIdx = existing.findIndex(item => item.folder === result.folder && item.emailUidValidity === result.emailUidValidity && item.emailUid === result.emailUid);
                         if (existingIdx >= 0) {
                             existing[existingIdx] = result;
                         } else {
@@ -325,13 +435,12 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
         logger.error("Failed to run email scanner", e);
     } finally {
         const store = useScannerStore.getState();
+        const stopped = store.stopRequested;
         store.setRunning(false);
         store.setPaused(false);
-        if (store.stopRequested) {
-            store.setProgressMsg('主动停止扫描');
-        } else {
-            store.setProgressMsg('扫描任务完成');
-        }
+        store.setStatus(stopped ? 'stopped' : 'completed');
+        store.setProgressMsg(stopped ? '主动停止扫描' : '扫描任务完成');
+        store.clearStopRequest();
     }
 }
 

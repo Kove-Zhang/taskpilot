@@ -1,17 +1,34 @@
 import { useSettingsStore, getSortedLLMProviders, getEffectiveFocus, type LLMProvider } from '../store'
-import { fetch } from '@tauri-apps/plugin-http';
-import { logger } from './logger';
+import { HttpRequestError, isRetryableHttpStatus, isRetryableTransportError } from './http'
+import { logger } from './logger'
+import { requestProviderChatCompletion } from './providerTransport'
+import type { FeedbackType } from './feedbackAvailability'
+import type { NotionSyncState } from './notionSyncState'
+
+export type PositiveFeedbackStatus =
+  | 'processing'
+  | 'pending_verification'
+  | 'completed'
+  | 'unchanged'
+  | 'skipped'
+  | 'failed'
 
 export interface AIResult {
   id?: string;
   summary: string;
   key_points?: string[];
   todos: TodoItem[];
-  originalTodos?: TodoItem[]; // For auto memory optimization diff
+  originalTodos?: TodoItem[];
   syncedToNotion?: boolean;
+  notionSync?: NotionSyncState;
   feedbackStatus?: 'processing' | 'completed';
   explicitFeedback?: string;
+  feedbackType?: FeedbackType;
   isRejected?: boolean;
+  positiveFeedbackStatus?: PositiveFeedbackStatus;
+  positiveFeedbackFingerprint?: string;
+  positiveFeedbackUpdatedAt?: number;
+  positiveFeedbackError?: string;
 }
 
 export interface TodoItem {
@@ -23,36 +40,125 @@ export interface TodoItem {
   [key: string]: any;
 }
 
-/**
- * 清洗并压缩长文本，节约 Token
- * @param text 原始文本
- * @param maxLength 安全截断阈值
- */
-function compressTextForAI(text: string, maxLength: number = 8000): string {
-  if (!text) return "";
-  // 替换多个连续空行/换行为单换行，替换连续空格为单空格，去除首尾空白
-  let optimized = text.replace(/\n\s*\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
-  // 超过阈值则截断
-  if (optimized.length > maxLength) {
-    optimized = optimized.substring(0, maxLength) + '\n\n...(注：为防止 Token 溢出与历史旧任务干扰，超出阈值的尾部历史转发记录已自动精简。提炼待办和要点时请将 100% 重心放在顶部的【最新核心正文】中！)';
+type ChatMessageContent = string | Array<Record<string, unknown>>
+
+interface ChatCompletionPayload {
+  model: string
+  messages: Array<{ role: string; content: ChatMessageContent }>
+  [key: string]: unknown
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function getCompletionContent(data: unknown, providerName: string): string {
+  if (!isRecord(data) || !Array.isArray(data.choices) || data.choices.length === 0 || !isRecord(data.choices[0])) {
+    throw new Error(`服务商 [${providerName}] 返回数据结构异常：缺少 choices[0]`)
   }
-  return optimized;
+
+  const message = data.choices[0].message
+  if (!isRecord(message) || typeof message.content !== 'string' || !message.content.trim()) {
+    throw new Error(`服务商 [${providerName}] 返回数据结构异常：缺少有效 message.content`)
+  }
+
+  return message.content
+}
+
+const TODO_TITLE_FIELD_ALIASES = ['title', 'task', 'content', 'name', 'text', 'description']
+const TODO_ID_FIELD_ALIASES = ['id', 'task_id', 'todo_id', 'uuid']
+
+function getNonEmptyText(value: unknown, allowNumber = false): string | null {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (allowNumber && typeof value === 'number' && Number.isFinite(value)) return String(value)
+  return null
+}
+
+function findTextField(
+  value: Record<string, unknown>,
+  fieldNames: readonly string[],
+  allowNumber = false,
+): { fieldName: string; value: string } | null {
+  for (const fieldName of fieldNames) {
+    const text = getNonEmptyText(value[fieldName], allowNumber)
+    if (text) return { fieldName, value: text }
+  }
+  return null
+}
+
+function getConfiguredTodoTitleFields(): string[] {
+  const { notionProperties, fieldMappings } = useSettingsStore.getState()
+  return notionProperties
+    .filter((property) => property.type === 'title' && fieldMappings[property.id]?.enabled)
+    .map((property) => property.name)
+}
+
+/** Creates a stable local ID when a compatible provider omits its optional model-generated ID. */
+function createFallbackTodoId(rawContent: string, index: number, title: string): string {
+  const input = `${rawContent}\u0000${index}\u0000${title}`
+  let hash = 2_166_136_261
+  for (let position = 0; position < input.length; position += 1) {
+    hash ^= input.charCodeAt(position)
+    hash = Math.imul(hash, 16_777_619)
+  }
+  return `generated-${index + 1}-${(hash >>> 0).toString(36)}`
+}
+
+function getSafeFieldNames(value: unknown): string[] {
+  return isRecord(value) ? Object.keys(value).sort().slice(0, 30) : []
+}
+
+function sanitizePayloadForLog(payload: ChatCompletionPayload): Record<string, unknown> {
+  return {
+    ...payload,
+    messages: payload.messages.map((message) => ({
+      role: message.role,
+      content: Array.isArray(message.content)
+        ? message.content.map((item) => ({
+            type: item.type,
+            text: item.type === 'text' ? `[Text length: ${String(item.text ?? '').length}]` : undefined,
+            image_url: item.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined,
+          }))
+        : `[Text length: ${message.content.length}]`,
+    })),
+  }
+}
+
+function formatProviderError(providerName: string, status: number, body: string): HttpRequestError {
+  const compactBody = body.replace(/\s+/g, ' ').slice(0, 1_000)
+  return new HttpRequestError(`API 请求失败 [${providerName}] (${status}): ${compactBody}`, { status })
+}
+
+function waitBeforeRetry(attempt: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 1_000 * attempt))
 }
 
 /**
- * 带多供应商轮换与重试机制的 AI 调用核心引擎
+ * 清洗并压缩长文本，节约 Token。
+ */
+function compressTextForAI(text: string, maxLength: number = 8000): string {
+  if (!text) return ''
+  let optimized = text.replace(/\n\s*\n/g, '\n').replace(/[ \t]+/g, ' ').trim()
+  if (optimized.length > maxLength) {
+    optimized = optimized.substring(0, maxLength) + '\n\n...(注：为防止 Token 溢出与历史旧任务干扰，超出阈值的尾部历史转发记录已自动精简。提炼待办和要点时请将 100% 重心放在顶部的【最新核心正文】中！)'
+  }
+  return optimized
+}
+
+/**
+ * 带超时、重试与多供应商轮换的 AI 调用核心引擎。
+ * 仅网络错误、超时、408、429 与 5xx 会重试或切换服务商，避免将同一内容发送给多个服务商处理配置类 4xx 错误。
  */
 export async function callAIWithFailover(
-  buildPayload: (provider: LLMProvider) => any,
-  logContextName: string
+  buildPayload: (provider: LLMProvider) => ChatCompletionPayload,
+  logContextName: string,
 ): Promise<string> {
-  const { enableFailover, failoverRetryCount, apiBaseUrl, apiKey, modelName } = useSettingsStore.getState();
-  let providers = getSortedLLMProviders().filter(p => p.enabled);
+  const { enableFailover, failoverRetryCount, failoverOnAuthError, apiBaseUrl, apiKey, modelName } = useSettingsStore.getState()
+  let providers = getSortedLLMProviders().filter((provider) => provider.enabled)
 
-  // 若提供商列表为空或均无可用的 API Key，尝试回退到传统的单节点设置
-  if (providers.length === 0 || providers.every(p => !p.apiKey || !p.apiKey.trim())) {
-    if (!apiKey || !apiKey.trim()) {
-      throw new Error("请先在设置中配置 API Key");
+  if (providers.length === 0 || providers.every((provider) => !provider.apiKey.trim())) {
+    if (!apiKey.trim()) {
+      throw new Error('请先在设置中配置 API Key')
     }
     providers = [{
       id: 'legacy',
@@ -61,100 +167,155 @@ export async function callAIWithFailover(
       apiKey,
       modelName,
       enabled: true,
-      priority: 1
-    }];
+      priority: 1,
+    }]
   }
 
-  const maxRetriesPerProvider = Math.max(1, failoverRetryCount || 1);
-  let lastError: Error | null = null;
+  const maxRetriesPerProvider = Math.max(1, failoverRetryCount || 1)
+  let lastRetryableError: Error | null = null
 
-  for (let pIndex = 0; pIndex < providers.length; pIndex++) {
-    const provider = providers[pIndex];
-    if (!provider.apiKey) {
-      logger.warn(`服务商 [${provider.name}] 未配置 API Key，跳过。`);
-      continue;
+  for (let providerIndex = 0; providerIndex < providers.length; providerIndex += 1) {
+    const provider = providers[providerIndex]
+    if (!provider.apiKey.trim()) {
+      logger.warn(`服务商 [${provider.name}] 未配置 API Key，跳过。`)
+      continue
     }
 
-    const payload = buildPayload(provider);
-    const normalizedUrl = provider.apiBaseUrl.endsWith('/') ? provider.apiBaseUrl.slice(0, -1) : provider.apiBaseUrl;
-    const endpoint = `${normalizedUrl}/chat/completions`;
+    if (!provider.apiBaseUrl.trim()) {
+      throw new Error(`服务商 [${provider.name}] 未配置 API Base URL`)
+    }
+    const payload = buildPayload(provider)
 
-    // 对当前服务商进行最大 maxRetriesPerProvider 次尝试
-    for (let attempt = 1; attempt <= maxRetriesPerProvider; attempt++) {
+    for (let attempt = 1; attempt <= maxRetriesPerProvider; attempt += 1) {
       try {
-        const logPayload = { ...payload };
-        if (logPayload.messages) {
-          logPayload.messages = logPayload.messages.map((m: any) => {
-            if (m.role === 'user' && Array.isArray(m.content)) {
-              return {
-                role: m.role,
-                content: m.content.map((c: any) => ({
-                  type: c.type,
-                  text: c.type === 'text' ? `[Text length: ${c.text?.length}]` : undefined,
-                  image_url: c.type === 'image_url' ? '[Base64 Image Data omitted]' : undefined
-                }))
-              };
-            }
-            return m;
-          });
-        }
+        logger.info(
+          `[${logContextName}] 发起调用 -> 服务商: [${provider.name}] (模型: ${provider.modelName}, 尝试 ${attempt}/${maxRetriesPerProvider})`,
+          { payload: sanitizePayloadForLog(payload) },
+        )
 
-        logger.info(`[${logContextName}] 发起调用 -> 服务商: [${provider.name}] (模型: ${provider.modelName}, 尝试 ${attempt}/${maxRetriesPerProvider})`, { payload: logPayload });
-        
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${provider.apiKey}`
-          },
-          body: JSON.stringify(payload)
-        });
+        const response = await requestProviderChatCompletion({
+          baseUrl: provider.apiBaseUrl,
+          apiKey: provider.apiKey,
+          payload,
+        })
 
         if (!response.ok) {
-          const errText = await response.text();
-          const status = response.status;
-          // 判断是否为限流或服务端异常（429, 500+），或者是未达到单个供应商最大重试次数
-          const isRateLimitOrServerErr = status === 429 || status >= 500;
-          const errMsg = `API 请求失败 [${provider.name}] (${status}): ${errText}`;
-          if (isRateLimitOrServerErr || attempt < maxRetriesPerProvider) {
-            logger.warn(errMsg);
-            lastError = new Error(errMsg);
-            if (attempt < maxRetriesPerProvider) {
-              await new Promise(r => setTimeout(r, 1000 * attempt)); // 指数退避重试
-              continue; // 继续重试当前供应商
-            }
-          } else {
-            lastError = new Error(errMsg);
-            break; // 中断当前供应商重试，转入下一个供应商
+          const error = formatProviderError(provider.name, response.status, await response.text())
+          if (!isRetryableHttpStatus(response.status)) {
+            throw error
           }
+          lastRetryableError = error
+          logger.warn(error.message)
         } else {
-          const data = await response.json();
-          logger.info(`[${logContextName}] 成功收到回复 <- 服务商: [${provider.name}]`, { response: data });
-          if (!data.choices || !data.choices[0] || !data.choices[0].message) {
-            throw new Error(`服务商 [${provider.name}] 返回数据结构异常: ${JSON.stringify(data)}`);
+          let responseData: unknown
+          try {
+            responseData = await response.json()
+          } catch {
+            throw new HttpRequestError(`服务商 [${provider.name}] 返回的成功响应不是有效 JSON`, {
+              isRetryable: true,
+            })
           }
-          return data.choices[0].message.content;
+          const content = getCompletionContent(responseData, provider.name)
+          logger.info(`[${logContextName}] 成功收到回复 <- 服务商: [${provider.name}]`, { contentLength: content.length })
+          return content
         }
-      } catch (err: any) {
-        logger.warn(`[${logContextName}] 呼叫异常 -> 服务商: [${provider.name}] (尝试 ${attempt}/${maxRetriesPerProvider}): ${err.message || err}`);
-        lastError = err instanceof Error ? err : new Error(String(err));
-        if (attempt < maxRetriesPerProvider) {
-          await new Promise(r => setTimeout(r, 1000 * attempt));
+      } catch (error) {
+        const isAuthenticationFailure = error instanceof HttpRequestError && error.status === 401
+        const shouldFailoverOnAuthenticationFailure = enableFailover && failoverOnAuthError && isAuthenticationFailure
+
+        if (isAuthenticationFailure && !shouldFailoverOnAuthenticationFailure) {
+          throw error
         }
+        if (error instanceof HttpRequestError && error.status !== undefined && !isRetryableHttpStatus(error.status) && !shouldFailoverOnAuthenticationFailure) {
+          throw error
+        }
+        if (!shouldFailoverOnAuthenticationFailure && !isRetryableTransportError(error) && !(error instanceof HttpRequestError && error.status !== undefined)) {
+          throw error instanceof Error ? error : new Error(String(error))
+        }
+        lastRetryableError = error instanceof Error ? error : new Error(String(error))
+
+        if (shouldFailoverOnAuthenticationFailure) {
+          logger.warn(`[${logContextName}] 服务商 [${provider.name}] 认证失败（401），已启用认证失败备用服务商策略，将直接轮换。`)
+          break
+        }
+
+        logger.warn(`[${logContextName}] 可重试调用失败 -> 服务商: [${provider.name}] (尝试 ${attempt}/${maxRetriesPerProvider}): ${lastRetryableError.message}`)
+      }
+
+      if (attempt < maxRetriesPerProvider) {
+        await waitBeforeRetry(attempt)
       }
     }
 
-    // 若当前供应商所有重试均失败，检查是否允许轮换
     if (!enableFailover) {
-      logger.warn(`未开启异常自动轮换，终止调用。`);
-      break;
+      break
     }
-    if (pIndex < providers.length - 1) {
-      logger.info(`触发大模型自动故障转移，顺位轮换至下一服务商: [${providers[pIndex + 1].name}]...`);
+    if (providerIndex < providers.length - 1) {
+      logger.info(`触发大模型自动故障转移，顺位轮换至下一服务商: [${providers[providerIndex + 1].name}]...`)
     }
   }
 
-  throw lastError || new Error("所有大模型服务商均调用失败，请检查网络或 API 配置。");
+  throw lastRetryableError || new Error('所有大模型服务商均调用失败，请检查网络或 API 配置。')
+}
+
+function normalizeExtractionResult(rawContent: string): AIResult {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawContent)
+  } catch (error) {
+    logger.error('Failed to parse AI response', { rawLength: rawContent.length, error })
+    throw new Error('AI 返回的格式无法解析为 JSON')
+  }
+
+  if (!isRecord(parsed) || typeof parsed.summary !== 'string' || !Array.isArray(parsed.todos)) {
+    logger.warn('AI 返回提取结果字段不兼容', {
+      topLevelFields: getSafeFieldNames(parsed),
+      hasStringSummary: isRecord(parsed) && typeof parsed.summary === 'string',
+      hasTodosArray: isRecord(parsed) && Array.isArray(parsed.todos),
+    })
+    throw new Error('AI 返回的 JSON 缺少 summary 或 todos 字段')
+  }
+
+  const titleFieldNames = [...new Set([...TODO_TITLE_FIELD_ALIASES, ...getConfiguredTodoTitleFields()])]
+  const todos = parsed.todos.map((todo, index) => {
+    if (!isRecord(todo)) {
+      logger.warn('AI 返回的待办无法规范化', { index: index + 1, receivedType: Array.isArray(todo) ? 'array' : typeof todo })
+      throw new Error(`AI 返回的第 ${index + 1} 条待办不是对象`)
+    }
+
+    const title = findTextField(todo, titleFieldNames)
+    if (!title) {
+      logger.warn('AI 返回的待办缺少可识别标题字段', {
+        index: index + 1,
+        fieldNames: getSafeFieldNames(todo),
+      })
+      throw new Error(`AI 返回的第 ${index + 1} 条待办缺少有效 title`)
+    }
+
+    const modelId = findTextField(todo, TODO_ID_FIELD_ALIASES, true)
+    const id = modelId?.value || createFallbackTodoId(rawContent, index, title.value)
+    if (title.fieldName !== 'title' || !modelId || modelId.fieldName !== 'id') {
+      logger.warn('AI 返回的待办已按兼容规则规范化', {
+        index: index + 1,
+        originalFieldNames: getSafeFieldNames(todo),
+        titleSource: title.fieldName,
+        idSource: modelId?.fieldName || 'generated',
+      })
+    }
+
+    return { ...todo, id, title: title.value, selected: true } as TodoItem
+  })
+
+  const keyPoints = Array.isArray(parsed.key_points)
+    ? parsed.key_points.filter((item): item is string => typeof item === 'string')
+    : undefined
+
+  return {
+    summary: parsed.summary,
+    key_points: keyPoints,
+    todos,
+    originalTodos: structuredClone(todos),
+  }
 }
 
 export async function extractTodosFromContent(textContent: string, base64Images: string[]): Promise<AIResult> {
@@ -163,29 +324,34 @@ export async function extractTodosFromContent(textContent: string, base64Images:
 
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled) || [];
   
-  let jsonSchemaDesc = `{\n      "id": "唯一随机ID",\n`;
+  const todoSchemaLines = [
+    '"id": "待办唯一 ID（非空字符串，同一次输出内不可重复）"',
+    '"title": "待办事项标题（非空字符串）"',
+    '"priority": "★ 或者 ★★ 或者 ★★★"',
+    '"planned_date": "YYYY-MM-DD 格式的日期；无明确日期时为 null"',
+  ]
+  const requiredTodoKeys = new Set(['id', 'title', 'priority', 'planned_date'])
   let hintDesc = "";
 
-  if (activeFields.length === 0) {
-    jsonSchemaDesc += `      "title": "待办事项标题",\n      "priority": "★ 或者 ★★ 或者 ★★★",\n      "planned_date": "YYYY-MM-DD格式的日期，如无明确日期则留空"\n`;
-  } else {
-    for (const field of activeFields) {
-      const mapping = fieldMappings[field.id];
-      let typeDesc = "字符串";
-      if (field.type === 'date') typeDesc = "YYYY-MM-DD格式的日期，如无明确日期则留空";
-      if (field.type === 'checkbox') typeDesc = "布尔值(true/false)";
-      if (field.type === 'number') typeDesc = "数字";
-      if (field.type === 'select' || field.type === 'multi_select') {
-        typeDesc = `只能是以下枚举值之一: [${field.options?.join(', ') || ''}]`;
-      }
-      
-      jsonSchemaDesc += `      "${field.name}": "${typeDesc}",\n`;
-      if (mapping?.aiHint) {
-        hintDesc += `- "${field.name}": ${mapping.aiHint}\n`;
-      }
+  for (const field of activeFields) {
+    const mapping = fieldMappings[field.id];
+    let typeDesc = "字符串";
+    if (field.type === 'date') typeDesc = "YYYY-MM-DD格式的日期，如无明确日期则留空";
+    if (field.type === 'checkbox') typeDesc = "布尔值(true/false)";
+    if (field.type === 'number') typeDesc = "数字";
+    if (field.type === 'select' || field.type === 'multi_select') {
+      typeDesc = `只能是以下枚举值之一: [${field.options?.join(', ') || ''}]`;
+    }
+
+    if (!requiredTodoKeys.has(field.name)) {
+      todoSchemaLines.push(`${JSON.stringify(field.name)}: ${JSON.stringify(typeDesc)}`)
+    }
+    if (mapping?.aiHint) {
+      hintDesc += `- "${field.name}": ${mapping.aiHint}\n`;
     }
   }
-  jsonSchemaDesc += `    }`;
+
+  const jsonSchemaDesc = `{\n      ${todoSchemaLines.join(',\n      ')}\n    }`;
 
   const now = new Date();
   const timeStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${['日', '一', '二', '三', '四', '五', '六'][now.getDay()]} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
@@ -221,6 +387,12 @@ export async function extractTodosFromContent(textContent: string, base64Images:
   ]
 }
 如果没有待办事项，todos 数组留空。${keyPointsHint}
+
+【输出契约（必须遵守）】
+- todos 数组中的每一项都必须同时包含字面量字段 "id" 和 "title"，且二者均为非空字符串。
+- "id" 只用于本地唯一标识，可使用 "todo-1"、"todo-2" 等；同一次输出内不得重复。
+- 即使同时输出 Notion 动态字段，也不得用 task、content、name 或 Notion 字段名替代 "title"。
+- planned_date 无明确日期时必须输出 null，不得输出空字符串。
 ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
 
   const contentArray: any[] = [];
@@ -276,28 +448,7 @@ ${hintDesc ? `\n【针对特定字段的提取约束】\n${hintDesc}` : ''}`;
     return payload;
   }, "提取待办");
   
-  try {
-    const parsedResult = JSON.parse(rawContent) as AIResult;
-    if (!parsedResult.todos || !Array.isArray(parsedResult.todos)) {
-      parsedResult.todos = [];
-    }
-    if (!parsedResult.key_points || !Array.isArray(parsedResult.key_points)) {
-      parsedResult.key_points = undefined;
-    }
-    parsedResult.todos = parsedResult.todos.map(t => ({ 
-      ...t, 
-      selected: true
-    }));
-    return {
-      summary: parsedResult.summary,
-      key_points: parsedResult.key_points,
-      todos: parsedResult.todos,
-      originalTodos: JSON.parse(JSON.stringify(parsedResult.todos))
-    };
-  } catch (err) {
-    logger.error('Failed to parse AI response', { rawContent, error: err });
-    throw new Error('AI 返回的格式无法解析为 JSON');
-  }
+  return normalizeExtractionResult(rawContent)
 }
 
 export async function generateWriting(
