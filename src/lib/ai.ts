@@ -3,6 +3,15 @@ import { HttpRequestError, isRetryableHttpStatus, isRetryableTransportError } fr
 import { logger } from './logger'
 import { requestProviderChatCompletion } from './providerTransport'
 import type { FeedbackType } from './feedbackAvailability'
+import type { NotionSyncState } from './notionSyncState'
+
+export type PositiveFeedbackStatus =
+  | 'processing'
+  | 'pending_verification'
+  | 'completed'
+  | 'unchanged'
+  | 'skipped'
+  | 'failed'
 
 export interface AIResult {
   id?: string;
@@ -11,10 +20,15 @@ export interface AIResult {
   todos: TodoItem[];
   originalTodos?: TodoItem[];
   syncedToNotion?: boolean;
+  notionSync?: NotionSyncState;
   feedbackStatus?: 'processing' | 'completed';
   explicitFeedback?: string;
   feedbackType?: FeedbackType;
   isRejected?: boolean;
+  positiveFeedbackStatus?: PositiveFeedbackStatus;
+  positiveFeedbackFingerprint?: string;
+  positiveFeedbackUpdatedAt?: number;
+  positiveFeedbackError?: string;
 }
 
 export interface TodoItem {

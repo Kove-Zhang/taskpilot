@@ -1,16 +1,18 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2, Trash2, Play, Pause, Square, Rocket, ScrollText, ArrowRight, Clock, UploadCloud, Terminal } from 'lucide-react'
+import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2, Trash2, Play, Pause, Square, Rocket, ScrollText, ArrowRight, Clock, UploadCloud, Terminal, AlertTriangle } from 'lucide-react'
 import { LazyStore } from '@tauri-apps/plugin-store'
 import type { EmailHistoryItem } from './lib/emailScheduler'
 import { forceRunEmailScanner } from './lib/emailScheduler'
 import { useSettingsStore, useScannerStore } from './store'
-import { syncToNotion } from './lib/notion'
+import { markNotionSyncVerified, syncToNotion } from './lib/notion'
+import { createNotionSyncFailureState, createNotionSyncInProgressState, getNotionSyncButtonLabel, getNotionSyncStatusLabel, resolveNotionSyncTodos, summarizeNotionSyncResults } from './lib/notionSyncState'
 import { decodeIMAPFolder } from './lib/imapFolder'
 import { parseEmailThread } from './lib/emailThreadParser'
 import { sanitizeEmailHtml } from './lib/emailHtml'
 import { canProvideExplicitFeedback, getFeedbackType, isMissedExtractionFeedback } from './lib/feedbackAvailability'
 import { AutoResizeTextarea } from './components/AutoResizeTextarea'
 import { FeedbackHistoryCard, FeedbackStatusBadge } from './components/FeedbackHistoryCard'
+import { createPositiveFeedbackSnapshot, runPositiveFeedbackLearning, shouldStartPositiveFeedbackLearning, type PositiveFeedbackSnapshot } from './lib/feedbackLearning'
 
 interface EmailTasksPanelProps {
   onClose: () => void;
@@ -53,11 +55,15 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   const [expandedThreads, setExpandedThreads] = useState<Record<number, boolean>>({});
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [emailViewMode, setEmailViewMode] = useState<'light' | 'dark'>('light');
+  const [notionVerificationByEntry, setNotionVerificationByEntry] = useState<Record<string, { todoIds: string[]; message: string }>>({});
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     message: string;
     isAlert?: boolean;
-    onConfirm: () => void;
+    confirmLabel?: string;
+    secondaryLabel?: string;
+    onSecondary?: () => void | Promise<void>;
+    onConfirm: () => void | Promise<void>;
   }>({ isOpen: false, message: '', onConfirm: () => {} });
 
   const showAlert = (message: string) => {
@@ -70,6 +76,41 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   };
 
   const [selectedGroup, setSelectedGroup] = useState<{ folder: string, date: string } | null>(null);
+  const getNotionRecoveryKey = (entry: EmailHistoryItem, fallbackIndex: number) => `${entry.emailUidValidity ?? 'unknown'}:${entry.emailUid}:${entry.timestamp || fallbackIndex}`;
+
+  const openNotionRecoveryDialog = (targetIdx: number, recoveryKey: string, recovery: { todoIds: string[]; message: string }) => {
+    setNotionVerificationByEntry(prev => ({ ...prev, [recoveryKey]: recovery }));
+    setConfirmDialog({
+      isOpen: true,
+      isAlert: false,
+      message: recovery.message,
+      secondaryLabel: '已存在，标记已同步',
+      confirmLabel: '确认未创建，强制重试',
+      onSecondary: async () => {
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+        try {
+          await persistVerifiedNotionTodos(targetIdx, recovery.todoIds);
+          setNotionVerificationByEntry(prev => {
+            const next = { ...prev };
+            delete next[recoveryKey];
+            return next;
+          });
+        } catch (error) {
+          showAlert(`标记同步状态失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      },
+      onConfirm: async () => {
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+        setNotionVerificationByEntry(prev => {
+          const next = { ...prev };
+          delete next[recoveryKey];
+          return next;
+        });
+        await handleSyncNotion(targetIdx, recovery.todoIds);
+      },
+    });
+  };
+
 
   const reviewList = useMemo(() => {
     return history.map((item, originalIndex) => ({ ...item, originalIndex })).filter(item => {
@@ -220,59 +261,236 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
     await historyStore.save();
   }
 
-  const handleSyncNotion = async (targetIdx?: number) => {
+  const persistPositiveFeedbackState = async (
+    entry: EmailHistoryItem,
+    status: NonNullable<EmailHistoryItem['aiResult']>['positiveFeedbackStatus'],
+    fingerprint: string,
+    error?: string,
+  ) => {
+    const updatedAt = Date.now();
+    const latestHistory = await historyStore.get<EmailHistoryItem[]>('history') || history;
+    const updatedHistory = latestHistory.map((item) => (
+      item.emailUid === entry.emailUid && item.timestamp === entry.timestamp && item.aiResult
+        ? {
+            ...item,
+            aiResult: {
+              ...item.aiResult,
+              positiveFeedbackStatus: status,
+              positiveFeedbackFingerprint: fingerprint,
+              positiveFeedbackUpdatedAt: updatedAt,
+              positiveFeedbackError: error,
+            },
+          }
+        : item
+    ));
+    setHistory(updatedHistory);
+    await historyStore.set('history', updatedHistory);
+    await historyStore.save();
+  };
+
+  const startPositiveFeedbackLearning = (entry: EmailHistoryItem, snapshot: PositiveFeedbackSnapshot) => {
+    void runPositiveFeedbackLearning(snapshot)
+      .then((outcome) => persistPositiveFeedbackState(
+        entry,
+        outcome === 'updated' ? 'completed' : outcome === 'unchanged' ? 'unchanged' : 'skipped',
+        snapshot.fingerprint,
+      ))
+      .catch((error) => persistPositiveFeedbackState(
+        entry,
+        'failed',
+        snapshot.fingerprint,
+        error instanceof Error ? error.message : String(error),
+      ));
+  };
+
+  const retryPositiveFeedbackLearning = async (entry: EmailHistoryItem) => {
+    if (!entry.aiResult) return;
+    const snapshot = createPositiveFeedbackSnapshot(entry.aiResult.originalTodos || entry.aiResult.todos, entry.aiResult.todos);
+    if (!snapshot.changed) return;
+    await persistPositiveFeedbackState(entry, 'processing', snapshot.fingerprint);
+    startPositiveFeedbackLearning(entry, snapshot);
+  };
+
+  const persistVerifiedNotionTodos = async (targetIdx: number, todoIds: string[]) => {
+    const entry = history[targetIdx];
+    if (!entry?.aiResult) return;
+
+    const todoIdSet = new Set(todoIds);
+    for (const todo of entry.aiResult.todos) {
+      if (todoIdSet.has(todo.id)) {
+        await markNotionSyncVerified(todo);
+      }
+    }
+
+    const newHistory = [...history];
+    const targetEntry = { ...newHistory[targetIdx] };
+    let learningSnapshot: PositiveFeedbackSnapshot | null = null;
+    let shouldLearn = false;
+    if (targetEntry.aiResult) {
+      const todos = targetEntry.aiResult.todos.map(todo => (
+        todoIdSet.has(todo.id) ? { ...todo, synced: true } : todo
+      ));
+      const selectedTodos = todos.filter(todo => todo.selected !== false);
+      learningSnapshot = createPositiveFeedbackSnapshot(
+        targetEntry.aiResult.originalTodos || targetEntry.aiResult.todos,
+        todos,
+      );
+      shouldLearn = shouldStartPositiveFeedbackLearning(targetEntry.aiResult, learningSnapshot);
+      targetEntry.aiResult = {
+        ...targetEntry.aiResult,
+        todos,
+        notionSync: resolveNotionSyncTodos(targetEntry.aiResult.notionSync, todoIds),
+        ...(shouldLearn
+          ? {
+              positiveFeedbackStatus: 'processing' as const,
+              positiveFeedbackFingerprint: learningSnapshot.fingerprint,
+              positiveFeedbackUpdatedAt: Date.now(),
+              positiveFeedbackError: undefined,
+            }
+          : {}),
+      };
+      targetEntry.syncedToNotion = selectedTodos.length > 0 && selectedTodos.every(todo => todo.synced);
+    }
+    newHistory[targetIdx] = targetEntry;
+    setHistory(newHistory);
+    await historyStore.set('history', newHistory);
+    await historyStore.save();
+    if (shouldLearn && learningSnapshot) startPositiveFeedbackLearning(targetEntry, learningSnapshot);
+  }
+
+  const handleSyncNotion = async (targetIdx?: number, forceTodoIds?: string[]) => {
     const idx = getActiveTargetIndex(targetIdx);
     if (idx === null) return;
     const entry = history[idx];
     if (!entry.aiResult || !entry.aiResult.todos) return;
 
-    const selectedTodos = entry.aiResult.todos.filter(t => t.selected !== false && !t.synced);
-    if (selectedTodos.length === 0) {
+    const recoveryKey = getNotionRecoveryKey(entry, idx);
+    if (!forceTodoIds && notionVerificationByEntry[recoveryKey]) {
+      openNotionRecoveryDialog(idx, recoveryKey, notionVerificationByEntry[recoveryKey]);
+      return;
+    }
+    if (!forceTodoIds && entry.aiResult.notionSync?.uncertainTodoIds.length) {
+      const uncertainIds = entry.aiResult.notionSync.uncertainTodoIds;
+      const uncertainTitles = entry.aiResult.todos
+        .filter(todo => uncertainIds.includes(todo.id))
+        .map(todo => `「${todo.title || todo.id}」`)
+        .join('、');
+      openNotionRecoveryDialog(idx, recoveryKey, {
+        todoIds: uncertainIds,
+        message: `以下待办的 Notion 推送结果无法确认：${uncertainTitles || '部分待办'}。\n\n${entry.aiResult.notionSync.lastError || ''}\n\n请先在 Notion 中核对：如果页面已存在，请标记为已同步；如果确认未创建，再强制重试。强制重试可能产生重复页面。`,
+      });
+      return;
+    }
+
+    const positiveFeedbackSnapshot = createPositiveFeedbackSnapshot(
+      entry.aiResult.originalTodos || entry.aiResult.todos,
+      entry.aiResult.todos,
+    );
+    const shouldLearnAfterSync = shouldStartPositiveFeedbackLearning(entry.aiResult, positiveFeedbackSnapshot);
+    const forceIdSet = forceTodoIds ? new Set(forceTodoIds) : null;
+    const selectedTodos = entry.aiResult.todos.filter(todo => (
+      todo.selected !== false &&
+      !todo.synced &&
+      (!forceIdSet || forceIdSet.has(todo.id))
+    ));
+    const todosToSync = forceTodoIds
+      ? selectedTodos.filter(todo => forceTodoIds.includes(todo.id))
+      : selectedTodos;
+    if (todosToSync.length === 0) {
       showAlert("当前没有可同步的待办事项：您选中的条目可能已全部同步至 Notion，或未勾选任何有效事项。");
       return;
     }
 
     setSyncing(true);
+    const syncingEntry = { ...entry, aiResult: {
+      ...entry.aiResult,
+      notionSync: createNotionSyncInProgressState(
+        todosToSync.length,
+        todosToSync.map(todo => todo.id),
+      ),
+    }};
+    const syncingHistory = [...history];
+    syncingHistory[idx] = syncingEntry;
+    setHistory(syncingHistory);
     try {
-      const syncRes = await syncToNotion(selectedTodos);
+      const syncRes = await syncToNotion(
+        todosToSync,
+        forceTodoIds ? { forceTodoIds } : undefined,
+      );
       const succeeded = syncRes.filter(r => r.success);
       const failed = syncRes.filter(r => !r.success);
+      const uncertainResults = failed.filter(result => result.needsVerification);
 
       const newHistory = [...history];
       const targetEntry = { ...newHistory[idx] };
       if (targetEntry.aiResult) {
+        const succeededIds = new Set(succeeded.map(result => result.id));
+        const todos = targetEntry.aiResult.todos.map(todo => (
+          succeededIds.has(todo.id) ? { ...todo, synced: true } : todo
+        ));
+        const selectedHistoryTodos = todos.filter(todo => todo.selected !== false);
+        const shouldTrackLearning = shouldLearnAfterSync && succeeded.length > 0;
         targetEntry.aiResult = {
           ...targetEntry.aiResult,
-          todos: targetEntry.aiResult.todos.map(t => {
-            if (succeeded.find(s => s.id === t.id)) {
-              return { ...t, synced: true };
-            }
-            return t;
-          })
+          todos,
+          notionSync: summarizeNotionSyncResults(syncRes, todosToSync.length),
+          ...(shouldTrackLearning
+            ? {
+                positiveFeedbackStatus: uncertainResults.length > 0 ? 'pending_verification' as const : 'processing' as const,
+                positiveFeedbackFingerprint: positiveFeedbackSnapshot.fingerprint,
+                positiveFeedbackUpdatedAt: Date.now(),
+                positiveFeedbackError: undefined,
+              }
+            : {}),
         };
+        targetEntry.syncedToNotion = selectedHistoryTodos.length > 0 && selectedHistoryTodos.every(todo => todo.synced);
       }
-      targetEntry.syncedToNotion = failed.length === 0;
       newHistory[idx] = targetEntry;
 
       setHistory(newHistory);
       await historyStore.set('history', newHistory);
       await historyStore.save();
 
-      // 触发后台静默分析 (fire-and-forget)
-      const baseTodosForSync = entry.aiResult?.originalTodos || entry.aiResult?.todos || [];
-      if (baseTodosForSync.length > 0) {
-        import('./lib/autoOptimize').then(m => {
-          m.backgroundReviewAndUpdateFocus(baseTodosForSync, selectedTodos).catch(console.error);
+      if (shouldLearnAfterSync && succeeded.length > 0 && uncertainResults.length === 0) {
+        startPositiveFeedbackLearning(entry, positiveFeedbackSnapshot);
+      }
+
+      if (uncertainResults.length > 0) {
+        const uncertainIds = uncertainResults.map(result => result.id);
+        const uncertainTitles = todosToSync
+          .filter(todo => uncertainIds.includes(todo.id))
+          .map(todo => `「${todo.title || todo.id}」`)
+          .join('、');
+        const errorMsgs = failed.map(result => `条目错误: ${result.error}`).join('\n');
+
+        openNotionRecoveryDialog(idx, recoveryKey, {
+          todoIds: uncertainIds,
+          message: `上次 Notion 推送结果未知：${uncertainTitles || '部分待办'}。\n\n${errorMsgs}\n\n请先在 Notion 中核对。若页面已存在，请标记为已同步；若确认未创建，再强制重试。强制重试可能产生重复页面。`,
         });
+        return;
       }
 
       if (failed.length > 0) {
-        const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\n');
-        throw new Error(`部分同步失败 (${failed.length}/${selectedTodos.length}):\n${errorMsgs}`);
+        const errorMsgs = failed.map(result => `条目错误: ${result.error}`).join('\n');
+        showAlert(`部分同步失败 (${failed.length}/${todosToSync.length}):\n${errorMsgs}`);
       }
     } catch (e: any) {
+      const msg = typeof e === 'string' ? e : e.message || String(e);
+      const failedEntry = { ...entry, aiResult: {
+        ...entry.aiResult,
+        notionSync: createNotionSyncFailureState(
+          todosToSync.length,
+          todosToSync.map(todo => todo.id),
+          msg,
+        ),
+      }};
+      const failedHistory = [...history];
+      failedHistory[idx] = failedEntry;
+      setHistory(failedHistory);
+      await historyStore.set('history', failedHistory);
+      await historyStore.save();
       console.error(e);
-      showAlert('同步失败: ' + (e.message || String(e)));
+      showAlert('同步失败: ' + msg);
     } finally {
       setSyncing(false);
     }
@@ -566,6 +784,20 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
 
   function renderEmailDetailsContent(entry: EmailHistoryItem, entryIndex: number) {
     const result = entry.aiResult;
+    const notionStatus = result?.notionSync?.status || (entry.syncedToNotion ? 'success' : 'idle');
+    const notionStatusLabel = getNotionSyncStatusLabel(result?.notionSync) || (entry.syncedToNotion ? '已同步' : undefined);
+    const recoveryKey = getNotionRecoveryKey(entry, entryIndex);
+    const hasPendingVerification = !!notionVerificationByEntry[recoveryKey] || notionStatus === 'needs_verification';
+    const notionButtonLabel = getNotionSyncButtonLabel(result?.notionSync, hasPendingVerification, !!entry.syncedToNotion);
+    const notionStatusClass = notionStatus === 'success'
+      ? 'bg-green-500/15 text-green-300 border-green-500/30'
+      : notionStatus === 'needs_verification'
+        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+        : notionStatus === 'partial_failed'
+          ? 'bg-orange-500/15 text-orange-300 border-orange-500/30'
+          : notionStatus === 'failed'
+            ? 'bg-red-500/15 text-red-300 border-red-500/30'
+            : 'bg-slate-500/15 text-slate-300 border-slate-500/30';
     const parsedThread = parseEmailThread(entry.htmlBody || entry.rawBodyText || '', !!entry.htmlBody);
     return (
       <>
@@ -734,16 +966,50 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                         </button>
                       )}
                       {result.todos.length > 0 && (
-                        <button
-                          onClick={() => handleSyncNotion(entryIndex)}
-                          disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || entry.syncedToNotion || result.feedbackStatus === 'processing' || result.feedbackStatus === 'completed'}
-                          className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${entry.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
-                        >
-                          {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                          <span>{syncing ? '同步中...' : entry.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
-                        </button>
+                        <>
+                          {notionStatusLabel && (
+                            <span
+                              className={`hidden sm:inline-flex items-center rounded-md border px-2.5 py-1 text-xs font-medium ${notionStatusClass}`}
+                              title={result.notionSync?.lastError || undefined}
+                            >
+                              {notionStatusLabel}
+                              {result.notionSync && result.notionSync.failedCount > 0 && ` · ${result.notionSync.failedCount} 项`}
+                            </span>
+                          )}
+                          <button
+                            onClick={() => handleSyncNotion(entryIndex)}
+                            disabled={syncing || (result.todos.filter(todo => todo.selected !== false && !todo.synced).length === 0 && !hasPendingVerification) || entry.syncedToNotion || result.feedbackStatus === 'processing' || result.feedbackStatus === 'completed'}
+                            title={result.notionSync?.lastError || undefined}
+                            className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${notionStatus === 'success' ? 'bg-green-600 shadow-green-500/20' : notionStatus === 'failed' ? 'bg-red-600 hover:bg-red-500 shadow-red-500/20' : notionStatus === 'partial_failed' || notionStatus === 'needs_verification' ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
+                          >
+                            {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : notionStatus === 'success' ? <Check className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+                            <span>{notionButtonLabel}</span>
+                          </button>
+                        </>
                       )}
                     </div>
+
+                    {result.positiveFeedbackStatus === 'processing' && (
+                      <div className="animate-in fade-in bg-purple-900/20 border border-purple-500/30 p-3 rounded-lg flex items-center gap-2 text-xs text-purple-200">
+                        <Loader2 className="w-4 h-4 animate-spin" /> 正在分析本次同步选择并优化全局规则...
+                      </div>
+                    )}
+                    {result.positiveFeedbackStatus === 'pending_verification' && (
+                      <div className="animate-in fade-in bg-amber-900/20 border border-amber-500/30 p-3 rounded-lg text-xs text-amber-200">
+                        ⏸️ Notion 结果待核对，确认页面状态后再提交正反馈学习。
+                      </div>
+                    )}
+                    {result.positiveFeedbackStatus === 'unchanged' && (
+                      <div className="animate-in fade-in bg-green-900/20 border border-green-500/30 p-3 rounded-lg text-xs text-green-200">
+                        ✅ 正反馈已记录，当前规则无需额外修改。
+                      </div>
+                    )}
+                    {result.positiveFeedbackStatus === 'failed' && (
+                      <div className="animate-in fade-in bg-red-900/20 border border-red-500/30 p-3 rounded-lg flex items-center justify-between gap-3 text-xs text-red-200">
+                        <span>⚠️ 正反馈学习失败：{result.positiveFeedbackError || '未知错误'}</span>
+                        <button onClick={() => retryPositiveFeedbackLearning(entry)} className="px-2 py-1 rounded bg-red-500/20 hover:bg-red-500/30">重试</button>
+                      </div>
+                    )}
 
                     {feedbackEntryIdx === entryIndex && canProvideExplicitFeedback(result.feedbackStatus) && (
                       <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
@@ -1096,6 +1362,15 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
   if (editingEntryIndex !== null) {
     const entry = history[editingEntryIndex];
     if (!entry) return null;
+    const editingNotionStatus = entry.aiResult?.notionSync?.status || (entry.syncedToNotion ? 'success' : 'idle');
+    const editingNotionStatusLabel = getNotionSyncStatusLabel(entry.aiResult?.notionSync) || (entry.syncedToNotion ? '已同步' : undefined);
+    const editingNotionStatusClass = editingNotionStatus === 'success'
+      ? 'bg-green-500/15 text-green-300 border-green-500/30'
+      : editingNotionStatus === 'needs_verification'
+        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+        : editingNotionStatus === 'partial_failed'
+          ? 'bg-orange-500/15 text-orange-300 border-orange-500/30'
+          : 'bg-red-500/15 text-red-300 border-red-500/30';
     return (
       <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 sm:p-8">
         <div className={`glass-panel flex flex-col gap-4 shadow-2xl relative animate-in slide-in-from-right-4 duration-200 ${isWindowMode ? 'w-full max-w-5xl p-8 h-[90vh] rounded-2xl' : 'w-[95%] max-w-[920px] p-6 h-[85vh] rounded-xl'}`}>
@@ -1132,10 +1407,10 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                 {entry.reviewed ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <Clock className="w-3.5 h-3.5 shrink-0" />}
                 {entry.reviewed ? '已审核' : '未审核'}
               </button>
-              {entry.syncedToNotion && (
-                <div className="h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 bg-sky-500/15 text-sky-300 border border-sky-500/30 shadow-sm shadow-sky-500/10 shrink-0">
-                  <UploadCloud className="w-3.5 h-3.5 shrink-0" />
-                  <span>已推送</span>
+              {editingNotionStatusLabel && (
+                <div className={`h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 border shrink-0 ${editingNotionStatusClass}`}>
+                  {editingNotionStatus === 'success' ? <UploadCloud className="w-3.5 h-3.5 shrink-0" /> : <AlertTriangle className="w-3.5 h-3.5 shrink-0" />}
+                  <span>{editingNotionStatusLabel}</span>
                 </div>
               )}
             </div>
@@ -1330,6 +1605,15 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                     {grouped[selectedGroup.folder][selectedGroup.date].map((entry) => {
                       const idx = entry.originalIndex;
                       const todosCount = entry.aiResult?.todos?.length || 0;
+                      const listNotionStatus = entry.aiResult?.notionSync?.status || (entry.syncedToNotion ? 'success' : 'idle');
+                      const listNotionStatusLabel = getNotionSyncStatusLabel(entry.aiResult?.notionSync) || (entry.syncedToNotion ? '已同步' : undefined);
+                      const listNotionStatusClass = listNotionStatus === 'success'
+                        ? 'bg-green-500/15 text-green-300 border-green-500/30'
+                        : listNotionStatus === 'needs_verification'
+                          ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                          : listNotionStatus === 'partial_failed'
+                            ? 'bg-orange-500/15 text-orange-300 border-orange-500/30'
+                            : 'bg-red-500/15 text-red-300 border-red-500/30';
                       const isListExpanded = !!expandedTodos[`list_${idx}`];
                       const displayTodos = isListExpanded ? (entry.aiResult?.todos || []) : (entry.aiResult?.todos || []).slice(0, 3);
 
@@ -1382,10 +1666,11 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                                 explicitFeedback={entry.aiResult?.explicitFeedback}
                                 isRejected={entry.aiResult?.isRejected}
                               />
-                              {entry.syncedToNotion && (
-                                <div className="h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 bg-sky-500/15 text-sky-300 border border-sky-500/30 shadow-sm shadow-sky-500/10 shrink-0">
-                                  <UploadCloud className="w-3.5 h-3.5 shrink-0" />
-                                  <span>已推送</span>
+                              {listNotionStatusLabel && (
+                                <div className={`h-6 px-2.5 py-0.5 rounded-md text-xs font-medium flex items-center gap-1.5 border shrink-0 ${listNotionStatusClass}`}>
+                                  {listNotionStatus === 'success' ? <UploadCloud className="w-3.5 h-3.5 shrink-0" /> : <AlertTriangle className="w-3.5 h-3.5 shrink-0" />}
+                                  <span>{listNotionStatusLabel}</span>
+                                  {entry.aiResult?.notionSync && entry.aiResult.notionSync.failedCount > 0 && ` · ${entry.aiResult.notionSync.failedCount} 项`}
                                 </div>
                               )}
                               <div className="h-6 px-2 py-0.5 rounded-md text-xs text-slate-400 font-mono bg-slate-800/80 border border-slate-700/50 flex items-center gap-1 shrink-0">
@@ -1498,11 +1783,19 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                   取消
                 </button>
               )}
+              {confirmDialog.onSecondary && (
+                <button
+                  onClick={() => void confirmDialog.onSecondary?.()}
+                  className="px-4 py-2 text-sm text-amber-200 hover:text-white bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 rounded-md transition-colors"
+                >
+                  {confirmDialog.secondaryLabel || '其他操作'}
+                </button>
+              )}
               <button
-                onClick={confirmDialog.onConfirm}
+                onClick={() => void confirmDialog.onConfirm()}
                 className={`px-4 py-2 text-sm text-white rounded-md shadow-lg transition-all active:scale-95 ${confirmDialog.isAlert ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-500/20' : 'bg-pink-600 hover:bg-pink-500 shadow-pink-500/20'}`}
               >
-                确定
+                {confirmDialog.confirmLabel || '确定'}
               </button>
             </div>
           </div>

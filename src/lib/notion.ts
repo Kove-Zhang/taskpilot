@@ -11,6 +11,13 @@ export interface SyncResult {
   pageId?: string
   skipped?: boolean
   retryable?: boolean
+  /** True when the request outcome cannot be confirmed safely. */
+  needsVerification?: boolean
+}
+
+export interface SyncOptions {
+  /** Todo IDs explicitly confirmed by the user for a force retry. */
+  forceTodoIds?: string[]
 }
 
 type NotionPropertyValue = Record<string, unknown>
@@ -164,7 +171,7 @@ function syncRecordKey(databaseId: string, todoId: string): string {
   return `${databaseId}:${todoId}`
 }
 
-async function syncOne(todo: TodoItem): Promise<SyncResult> {
+async function syncOne(todo: TodoItem, options: SyncOptions = {}): Promise<SyncResult> {
   const { notionApiKey, notionDatabaseId } = useSettingsStore.getState()
   if (!todo.id) return { id: '', success: false, error: '待办缺少本地唯一 ID' }
 
@@ -173,16 +180,24 @@ async function syncOne(todo: TodoItem): Promise<SyncResult> {
   const recordKey = syncRecordKey(notionDatabaseId, todo.id)
   const records = await readSyncRecords()
   const existing = records[recordKey]
+  const forceRetry = options.forceTodoIds?.includes(todo.id) ?? false
 
   if (existing?.fingerprint === fingerprint && existing.state === 'succeeded') {
     return { id: todo.id, success: true, pageId: existing.pageId, skipped: true }
   }
-  if (existing?.fingerprint === fingerprint && (existing.state === 'pending' || existing.state === 'unknown')) {
+  if (existing?.fingerprint === fingerprint && (existing.state === 'pending' || existing.state === 'unknown') && !forceRetry) {
     return {
       id: todo.id,
       success: false,
+      retryable: false,
+      needsVerification: true,
       error: '该待办上次同步结果未知，系统已阻止自动重试以避免重复创建 Notion 页面。请先在 Notion 中核对后再处理。',
     }
+  }
+
+  if (forceRetry && existing?.fingerprint === fingerprint && (existing.state === 'pending' || existing.state === 'unknown')) {
+    delete records[recordKey]
+    await writeSyncRecords(records)
   }
 
   records[recordKey] = { fingerprint, state: 'pending', updatedAt: Date.now() }
@@ -226,7 +241,23 @@ async function syncOne(todo: TodoItem): Promise<SyncResult> {
   }
 }
 
-export async function syncToNotion(todos: TodoItem[]): Promise<SyncResult[]> {
+export async function markNotionSyncVerified(todo: TodoItem, pageId?: string): Promise<void> {
+  const { notionDatabaseId } = useSettingsStore.getState()
+  if (!todo.id) throw new Error('待办缺少本地唯一 ID')
+
+  const pageBody = buildPageBody(todo)
+  const fingerprint = await fingerprintPageBody(pageBody)
+  const records = await readSyncRecords()
+  records[syncRecordKey(notionDatabaseId, todo.id)] = {
+    fingerprint,
+    state: 'succeeded',
+    pageId,
+    updatedAt: Date.now(),
+  }
+  await writeSyncRecords(records)
+}
+
+export async function syncToNotion(todos: TodoItem[], options: SyncOptions = {}): Promise<SyncResult[]> {
   const { notionApiKey, notionDatabaseId } = useSettingsStore.getState()
   if (!notionApiKey || !notionDatabaseId) {
     throw new Error('请先在设置中配置 Notion API Key 和 Database ID')
@@ -236,13 +267,14 @@ export async function syncToNotion(todos: TodoItem[]): Promise<SyncResult[]> {
     const results: SyncResult[] = []
     for (const todo of todos) {
       try {
-        results.push(await syncOne(todo))
+        results.push(await syncOne(todo, options))
       } catch (error) {
         results.push({
           id: todo.id,
           success: false,
           error: error instanceof Error ? error.message : String(error),
           retryable: isRetryableRequestError(error),
+          needsVerification: isRetryableRequestError(error),
         })
       }
     }

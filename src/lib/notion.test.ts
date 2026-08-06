@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetch } from '@tauri-apps/plugin-http'
-import { syncToNotion } from './notion'
+import { markNotionSyncVerified, syncToNotion } from './notion'
 import { useSettingsStore } from '../store'
 
 let sequence = 0
@@ -105,8 +105,36 @@ describe('Notion sync', () => {
     vi.mocked(fetch).mockResolvedValue({ ok: true, json: async () => ({ id: 'should-not-be-created' }) } as Response)
     const second = await syncToNotion([todo])
 
-    expect(second[0].success).toBe(false)
+    expect(second[0]).toMatchObject({ success: false, retryable: false, needsVerification: true })
     expect(second[0].error).toContain('上次同步结果未知')
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('allows an explicitly confirmed force retry after an unknown result', async () => {
+    const todo = makeTodo()
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      text: async () => 'temporarily unavailable',
+    } as Response)
+
+    const first = await syncToNotion([todo])
+    expect(first[0]).toMatchObject({ needsVerification: true })
+
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ id: 'notion-page-retried' }) } as Response)
+    const forced = await syncToNotion([todo], { forceTodoIds: [todo.id] })
+
+    expect(forced).toEqual([{ id: todo.id, success: true, pageId: 'notion-page-retried' }])
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('can mark a manually verified existing page as synchronized without another POST', async () => {
+    const todo = makeTodo()
+
+    await markNotionSyncVerified(todo, 'existing-page-id')
+    const result = await syncToNotion([todo])
+
+    expect(result).toEqual([{ id: todo.id, success: true, pageId: 'existing-page-id', skipped: true }])
     expect(fetch).not.toHaveBeenCalled()
   })
 

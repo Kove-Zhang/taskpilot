@@ -9,6 +9,8 @@ import { LazyStore } from '@tauri-apps/plugin-store';
 import { compressBase64Image } from './imageUtils';
 import { limitEmailHistoryHtml, limitEmailHistoryText } from './emailHistoryContent';
 import { isRetryableRequestError } from './http';
+import type { NotionSyncState } from './notionSyncState';
+import { summarizeNotionSyncResults } from './notionSyncState';
 
 export interface EmailHistoryItem {
     batchId: string;
@@ -22,6 +24,7 @@ export interface EmailHistoryItem {
     aiResult?: AIResult;
     emailDate?: string;
     syncedToNotion?: boolean;
+    notionSync?: NotionSyncState;
     folder?: string;
     rawBodyText?: string;
     htmlBody?: string;
@@ -214,6 +217,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
                     });
                     
                     const failed = syncRes.filter(r => !r.success);
+                    aiResult.notionSync = summarizeNotionSyncResults(syncRes, todosToSync.length);
                     if (failed.length > 0) {
                         const retryable = failed.some((item) => item.retryable === true);
                         throw new EmailProcessingError(`Notion sync failed for ${failed.length} items`, retryable);

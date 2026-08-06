@@ -4,6 +4,7 @@ import type { AIResult } from './lib/ai'
 import { loadHistory, updateHistory, type HistoryEntry } from './lib/history'
 import { useSettingsStore, useUIStore } from './store'
 import { FeedbackHistoryCard, FeedbackStatusBadge } from './components/FeedbackHistoryCard'
+import { getNotionSyncStatusLabel } from './lib/notionSyncState'
 
 interface HistoryPanelProps {
   onClose: () => void;
@@ -165,6 +166,17 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                     {grouped[selectedDate].map((entry) => {
                       const idx = entry.originalIndex;
                       const todosCount = entry.result.todos?.length || 0;
+                      const notionStatus = entry.result.notionSync?.status || (entry.result.syncedToNotion ? 'success' : 'idle');
+                      const notionStatusLabel = getNotionSyncStatusLabel(entry.result.notionSync) || (entry.result.syncedToNotion ? '已同步' : undefined);
+                      const notionStatusClass = notionStatus === 'success'
+                        ? 'border-green-500/30 bg-green-500/20 text-green-400'
+                        : notionStatus === 'needs_verification'
+                          ? 'border-amber-500/30 bg-amber-500/20 text-amber-300'
+                          : notionStatus === 'partial_failed'
+                            ? 'border-orange-500/30 bg-orange-500/20 text-orange-300'
+                            : notionStatus === 'failed'
+                              ? 'border-red-500/30 bg-red-500/20 text-red-300'
+                              : 'border-slate-500/30 bg-slate-500/20 text-slate-300';
                       const isListExpanded = !!expandedTodos[`list_${idx}`];
                       const displayTodos = isListExpanded ? (entry.result.todos || []) : (entry.result.todos || []).slice(0, 3);
 
@@ -182,9 +194,10 @@ export default function HistoryPanel({ onClose, onRestore }: HistoryPanelProps) 
                               explicitFeedback={entry.result.explicitFeedback}
                               isRejected={entry.result.isRejected}
                             />
-                            {entry.result.syncedToNotion && (
-                              <span className="inline-flex h-6 items-center rounded-md border border-green-500/30 bg-green-500/20 px-2.5 py-0.5 text-xs font-medium text-green-400">
-                                已推送
+                            {notionStatusLabel && (
+                              <span className={`inline-flex h-6 items-center rounded-md border px-2.5 py-0.5 text-xs font-medium ${notionStatusClass}`}>
+                                {notionStatusLabel}
+                                {entry.result.notionSync && entry.result.notionSync.failedCount > 0 && ` · ${entry.result.notionSync.failedCount} 项`}
                               </span>
                             )}
                           </div>

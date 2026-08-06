@@ -1,19 +1,23 @@
-import { lazy, Suspense, useState, useRef, useEffect } from 'react'
-import type { ClipboardEvent, ChangeEvent, DragEvent } from 'react'
-import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail, Minus, Maximize2 } from 'lucide-react'
-import { startEmailScheduler, stopEmailScheduler } from './lib/emailScheduler'
-import { extractTodosFromContent, generateWriting } from './lib/ai'
-import type { AIResult } from './lib/ai'
-import { syncToNotion } from './lib/notion'
-import { canProvideExplicitFeedback, getFeedbackType, isMissedExtractionFeedback } from './lib/feedbackAvailability'
-import { invoke } from '@tauri-apps/api/core'
-import { getCurrentWindow } from '@tauri-apps/api/window'
-import { assertFileBatchWithinLimits } from './lib/fileLimits'
-import { logger } from './lib/logger'
-import { useSettingsStore } from './store'
-import { compressImage } from './lib/imageUtils'
-import { updateHistory } from './lib/history'
-import { AutoResizeTextarea } from './components/AutoResizeTextarea'
+import { lazy, Suspense, useState, useRef, useEffect} from 'react'
+import type { ClipboardEvent, ChangeEvent, DragEvent} from 'react'
+import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail, Minus, Maximize2, AlertTriangle} from 'lucide-react'
+import { startEmailScheduler, stopEmailScheduler} from './lib/emailScheduler'
+import { extractTodosFromContent, generateWriting} from './lib/ai'
+import type { AIResult} from './lib/ai'
+import { markNotionSyncVerified, syncToNotion} from './lib/notion'
+import { createNotionSyncFailureState, createNotionSyncInProgressState, getNotionSyncButtonLabel, getNotionSyncStatusLabel, resolveNotionSyncTodos, summarizeNotionSyncResults} from './lib/notionSyncState'
+import { canProvideExplicitFeedback, getFeedbackType, isMissedExtractionFeedback} from './lib/feedbackAvailability'
+import { createPositiveFeedbackSnapshot, runPositiveFeedbackLearning, shouldStartPositiveFeedbackLearning, type PositiveFeedbackSnapshot} from './lib/feedbackLearning'
+import { invoke} from '@tauri-apps/api/core'
+import { getCurrentWindow} from '@tauri-apps/api/window'
+import { getCurrentWebview} from '@tauri-apps/api/webview'
+import { assertFileBatchWithinLimits} from './lib/fileLimits'
+import { logger} from './lib/logger'
+import { useSettingsStore} from './store'
+import { compressImage} from './lib/imageUtils'
+import { updateHistory} from './lib/history'
+import { AutoResizeTextarea} from './components/AutoResizeTextarea'
+import { nativeDroppedFilePayloadsToFiles, type NativeFileDropEvent} from './lib/nativeFileDrop'
 
 const SettingsPanel = lazy(() => import('./SettingsPanel'))
 const HistoryPanel = lazy(() => import('./HistoryPanel'))
@@ -38,16 +42,17 @@ export default function App() {
   const [toast, setToast] = useState<{title: string, message: string} | null>(null)
   const [showFeedback, setShowFeedback] = useState(false)
   const [feedbackText, setFeedbackText] = useState('')
-  const { notionProperties, fieldMappings, isWindowMode, globalShortcut } = useSettingsStore()
+  const [notionRecovery, setNotionRecovery] = useState<{ todoIds: string[]; message: string; isOpen: boolean} | null>(null)
+  const { notionProperties, fieldMappings, isWindowMode, globalShortcut} = useSettingsStore()
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled).sort((a, b) => {
     const orderA = fieldMappings[a.id]?.order ?? 999;
     const orderB = fieldMappings[b.id]?.order ?? 999;
     return orderA - orderB;
-  }) || []
+}) || []
   const displayFields = activeFields.length > 0 ? activeFields : [
-    { id: 't1', name: 'title', type: 'title' },
-    { id: 't2', name: 'priority', type: 'select', options: ['★', '★★', '★★★'] },
-    { id: 't3', name: 'planned_date', type: 'date' }
+    { id: 't1', name: 'title', type: 'title'},
+    { id: 't2', name: 'priority', type: 'select', options: ['★', '★★', '★★★']},
+    { id: 't3', name: 'planned_date', type: 'date'}
   ];
 
   const [writeIntent, setWriteIntent] = useState('')
@@ -57,56 +62,62 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const isFileDialogOpen = useRef(false)
   const isScreenshotting = useRef(false)
+  const domDragDepthRef = useRef(0)
+  const suppressDomDropUntilRef = useRef(0)
+  const handleFilesRef = useRef<(files: FileList | File[]) => Promise<void>>(async () => {})
 
   const isDraggingRef = useRef(isDragging);
-  useEffect(() => { isDraggingRef.current = isDragging; }, [isDragging]);
+  useEffect(() => { isDraggingRef.current = isDragging;}, [isDragging]);
 
   const isWindowModeRef = useRef(isWindowMode);
-  useEffect(() => { isWindowModeRef.current = isWindowMode; }, [isWindowMode]);
+  useEffect(() => { isWindowModeRef.current = isWindowMode;}, [isWindowMode]);
 
   useEffect(() => {
     let unlisten: () => void;
 
-    getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+    getCurrentWindow().onFocusChanged(({ payload: focused}) => {
       if (!focused && !isDraggingRef.current && !isWindowModeRef.current && !isFileDialogOpen.current && !isScreenshotting.current) {
         getCurrentWindow().hide();
-      }
-    }).then(fn => unlisten = fn);
+    }
+  }).then(fn => unlisten = fn);
 
     return () => {
       if (unlisten) unlisten();
-    }
-  }, []);
+  }
+}, []);
 
   useEffect(() => {
-    const handleEvolutionCompleted = (e: Event) => {
+    const showEvolutionToast = (e: Event) => {
       const customEvent = e as CustomEvent;
       setToast({
         title: customEvent.detail.title,
-        message: customEvent.detail.message
-      });
-      // 5 seconds auto dismiss
-      setTimeout(() => setToast(null), 5000);
-    };
-    window.addEventListener('ai-evolution-completed', handleEvolutionCompleted);
-    return () => window.removeEventListener('ai-evolution-completed', handleEvolutionCompleted);
-  }, []);
+        message: customEvent.detail.message,
+    });
+      window.setTimeout(() => setToast(null), 5000);
+  };
+    window.addEventListener('ai-evolution-completed', showEvolutionToast);
+    window.addEventListener('ai-evolution-failed', showEvolutionToast);
+    return () => {
+      window.removeEventListener('ai-evolution-completed', showEvolutionToast);
+      window.removeEventListener('ai-evolution-failed', showEvolutionToast);
+  };
+}, []);
 
   useEffect(() => {
     startEmailScheduler();
 
     return () => {
       stopEmailScheduler();
-    }
-  }, []);
+  }
+}, []);
 
   useEffect(() => {
     if (globalShortcut) {
-      invoke('update_shortcut', { shortcut: globalShortcut }).catch(e => {
+      invoke('update_shortcut', { shortcut: globalShortcut}).catch(e => {
           logger.error('Failed to sync global shortcut', e);
-      });
-    }
-  }, [globalShortcut]);
+    });
+  }
+}, [globalShortcut]);
 
   const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData.items;
@@ -118,59 +129,59 @@ export default function App() {
           pastedImages++;
           compressImage(file).then(base64 => {
             setImages(prev => [...prev, base64]);
-          }).catch(err => {
+        }).catch(err => {
             logger.error('Image compression failed', err);
-          });
-        }
+        });
       }
     }
+  }
     if (pastedImages > 0) {
       logger.info(`Pasted ${pastedImages} images`);
-    }
   }
+}
 
   const handleFiles = async (files: FileList | File[]) => {
     const selectedFiles = Array.from(files)
     try {
       assertFileBatchWithinLimits(selectedFiles)
-    } catch (error) {
+  } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setError(`解析文件出错: ${message}`)
       return
-    }
+  }
 
     setLoading(true)
     setError('')
     let appendedText = ''
     try {
       logger.info(`Processing ${selectedFiles.length} dropped/selected files`)
-      const { parseFile } = await import('./lib/parser')
+      const { parseFile} = await import('./lib/parser')
       for (const file of selectedFiles) {
         if (file.type.startsWith('image/')) {
           try {
             const base64 = await compressImage(file)
             setImages(prev => [...prev, base64])
-          } catch (error) {
+        } catch (error) {
             logger.error('File image compression failed', error)
-          }
-        } else {
+        }
+      } else {
           const text = await parseFile(file)
           appendedText += `
 [文件 ${file.name}]:
 ${text}
 `
-        }
       }
+    }
       if (appendedText) {
         setInput(prev => prev + appendedText)
-      }
-    } catch (error) {
+    }
+  } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setError(`解析文件出错: ${message}`)
-    } finally {
+  } finally {
       setLoading(false)
-    }
   }
+}
 
   const handleExplicitFeedback = async () => {
     if (!result) return;
@@ -180,16 +191,16 @@ ${text}
     if (!currentId) return;
 
     // 1. Immediately set the UI to 'processing'
-    setResult({ ...result, feedbackStatus: 'processing', explicitFeedback: feedbackText, feedbackType });
+    setResult({ ...result, feedbackStatus: 'processing', explicitFeedback: feedbackText, feedbackType});
 
     // 2. Persist to history immediately (so it's not lost on reload)
     try {
       await updateHistory((history) => history.map((entry) => entry.result?.id === currentId
-        ? { ...entry, result: { ...entry.result, feedbackStatus: 'processing', explicitFeedback: feedbackText, feedbackType } }
+        ? { ...entry, result: { ...entry.result, feedbackStatus: 'processing', explicitFeedback: feedbackText, feedbackType}}
         : entry));
-    } catch (error) {
+  } catch (error) {
       console.error('Failed to update processing status in history', error);
-    }
+  }
 
     // 3. Call AI
     try {
@@ -199,40 +210,104 @@ ${text}
       // 4. Update history to 'completed' & 'isRejected'
       try {
         await updateHistory((history) => history.map((entry) => entry.result?.id === currentId
-          ? { ...entry, result: { ...entry.result, feedbackStatus: 'completed', feedbackType, isRejected: feedbackType === 'over_extraction' } }
+          ? { ...entry, result: { ...entry.result, feedbackStatus: 'completed', feedbackType, isRejected: feedbackType === 'over_extraction'}}
           : entry));
-      } catch (error) {
+    } catch (error) {
         console.error('Failed to update completed status in history', error);
-      }
+    }
 
       // 5. Update local UI to show success briefly, then close
-      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: 'completed', feedbackType, isRejected: feedbackType === 'over_extraction' } : prev);
+      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: 'completed', feedbackType, isRejected: feedbackType === 'over_extraction'} : prev);
       setTimeout(() => {
         setResult(prev => prev && prev.id === currentId ? null : prev);
         setShowFeedback(false);
         setFeedbackText('');
-      }, 1500);
+    }, 1500);
 
-    } catch (e) {
+  } catch (e) {
       console.error(e);
       // Revert if it failed
-      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: undefined } : prev);
+      setResult(prev => prev && prev.id === currentId ? { ...prev, feedbackStatus: undefined} : prev);
+  }
+};
+
+  handleFilesRef.current = handleFiles
+
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+
+    getCurrentWebview().listen<NativeFileDropEvent>('native-file-drag-drop', (event) => {
+      const payload = event.payload
+      if (payload.type === 'enter' || payload.type === 'over') {
+        setIsDragging(true)
+        return
     }
-  };
+      if (payload.type === 'leave') {
+        setIsDragging(false)
+        return
+    }
+
+      suppressDomDropUntilRef.current = Date.now() + 1000
+      domDragDepthRef.current = 0
+      setIsDragging(false)
+      const files = nativeDroppedFilePayloadsToFiles(payload.files || [])
+      if (payload.errors && payload.errors.length > 0) {
+        setError(payload.errors.join('\n'))
+    }
+      if (files.length > 0) {
+        void handleFilesRef.current(files)
+    }
+  }).then((removeListener) => {
+      if (disposed) {
+        removeListener()
+    } else {
+        unlisten = removeListener
+    }
+  }).catch((error) => {
+      // Browser development mode does not expose the Tauri event bridge; DOM fallback remains available.
+      logger.warn('Native file drag/drop listener unavailable', error)
+  })
+
+    return () => {
+      disposed = true
+      unlisten?.()
+  }
+}, [])
+
+  const handleDragEnter = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    domDragDepthRef.current += 1
+    setIsDragging(true)
+}
+
+  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+    setIsDragging(true)
+}
+
+  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+    domDragDepthRef.current = Math.max(0, domDragDepthRef.current - 1)
+    if (domDragDepthRef.current === 0) setIsDragging(false)
+}
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsDragging(false);
+    e.preventDefault()
+    domDragDepthRef.current = 0
+    setIsDragging(false)
+    if (Date.now() < suppressDomDropUntilRef.current) return
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      handleFiles(e.dataTransfer.files);
-    }
+      void handleFiles(e.dataTransfer.files)
   }
-
+}
   const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       handleFiles(e.target.files);
-    }
   }
+}
 
   const triggerScreenshot = async () => {
     try {
@@ -244,127 +319,309 @@ ${text}
       setTimeout(() => {
         win.show();
         isScreenshotting.current = false;
-      }, 3000);
-    } catch (err: any) {
+    }, 3000);
+  } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
       setError(msg);
       logger.error('Screenshot trigger failed', msg);
       isScreenshotting.current = false;
-    }
   }
+}
 
   const removeImage = (index: number) => {
     setImages(prev => prev.filter((_, i) => i !== index))
-  }
+}
 
   const handleExtract = async () => {
     if (!input && images.length === 0) return;
     setLoading(true);
     setError('');
+    setNotionRecovery(null);
 
-    logger.info('Starting AI extraction...', { inputLength: input.length, imagesCount: images.length });
+    logger.info('Starting AI extraction...', { inputLength: input.length, imagesCount: images.length});
     try {
       const res = await extractTodosFromContent(input, images);
       res.id = Math.random().toString(36).substring(2, 11);
       setResult(res);
-      logger.info('AI extraction success', { todosCount: res.todos.length });
+      logger.info('AI extraction success', { todosCount: res.todos.length});
       try {
         await updateHistory((history) => [{
           timestamp: new Date().toISOString(),
           result: res,
           input,
           images,
-        }, ...history].slice(0, 50));
-      } catch (error) {
+      }, ...history].slice(0, 50));
+    } catch (error) {
         logger.warn('Failed to save history', error);
-      }
-    } catch (err: any) {
+    }
+  } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
       setError(msg);
       logger.error('AI extraction error', msg);
-    } finally {
+  } finally {
       setLoading(false);
+  }
+}
+
+  const persistPositiveFeedbackState = async (
+    resultId: string,
+    status: AIResult['positiveFeedbackStatus'],
+    fingerprint: string,
+    error?: string,
+  ) => {
+    const updatedAt = Date.now();
+    setResult(prev => prev && prev.id === resultId
+      ? {
+          ...prev,
+          positiveFeedbackStatus: status,
+          positiveFeedbackFingerprint: fingerprint,
+          positiveFeedbackUpdatedAt: updatedAt,
+          positiveFeedbackError: error,
+      }
+      : prev);
+    try {
+      await updateHistory((history) => history.map((entry) => entry.result?.id === resultId
+        ? {
+            ...entry,
+            result: {
+              ...entry.result,
+              positiveFeedbackStatus: status,
+              positiveFeedbackFingerprint: fingerprint,
+              positiveFeedbackUpdatedAt: updatedAt,
+              positiveFeedbackError: error,
+          },
+        }
+        : entry));
+  } catch (persistError) {
+      logger.warn('Failed to persist positive feedback status', persistError);
+  }
+};
+
+  const startPositiveFeedbackLearning = (resultId: string, snapshot: PositiveFeedbackSnapshot) => {
+    void runPositiveFeedbackLearning(snapshot)
+      .then((outcome) => persistPositiveFeedbackState(
+        resultId,
+        outcome === 'updated' ? 'completed' : outcome === 'unchanged' ? 'unchanged' : 'skipped',
+        snapshot.fingerprint,
+      ))
+      .catch((error) => persistPositiveFeedbackState(
+        resultId,
+        'failed',
+        snapshot.fingerprint,
+        error instanceof Error ? error.message : String(error),
+      ));
+};
+
+  const retryPositiveFeedbackLearning = async () => {
+    if (!result?.id) return;
+    const snapshot = createPositiveFeedbackSnapshot(result.originalTodos || result.todos, result.todos);
+    if (!snapshot.changed) return;
+    await persistPositiveFeedbackState(result.id, 'processing', snapshot.fingerprint);
+    startPositiveFeedbackLearning(result.id, snapshot);
+};
+
+  const persistVerifiedNotionTodos = async (todoIds: string[]) => {
+    if (!result) return;
+
+    const todoIdSet = new Set(todoIds);
+    for (const todo of result.todos) {
+      if (todoIdSet.has(todo.id)) {
+        await markNotionSyncVerified(todo);
     }
   }
 
-  const handleSyncNotion = async () => {
-    if (!result || result.todos.length === 0) return;
-    const selectedTodos = result.todos.filter(t => t.selected !== false && !t.synced);
-    if (selectedTodos.length === 0) {
-      setError("当前没有可同步的待办事项：您选中的条目可能已全部分步至 Notion，或未勾选任何有效事项。");
-      return;
-    }
+    const todos = result.todos.map(todo => (
+      todoIdSet.has(todo.id) ? { ...todo, synced: true} : todo
+    ));
+    const selectedTodos = todos.filter(todo => todo.selected !== false);
+    const learningSnapshot = createPositiveFeedbackSnapshot(
+      result.originalTodos || result.todos,
+      todos,
+    );
+    const shouldLearn = shouldStartPositiveFeedbackLearning(result, learningSnapshot);
+    const nextResult = {
+      ...result,
+      todos,
+      syncedToNotion: selectedTodos.length > 0 && selectedTodos.every(todo => todo.synced),
+      notionSync: resolveNotionSyncTodos(result.notionSync, todoIds),
+      ...(shouldLearn
+        ? {
+            positiveFeedbackStatus: 'processing' as const,
+            positiveFeedbackFingerprint: learningSnapshot.fingerprint,
+            positiveFeedbackUpdatedAt: Date.now(),
+            positiveFeedbackError: undefined,
+        }
+        : {}),
+  };
+    setResult(nextResult);
+    await updateHistory((history) => history.map((entry) => entry.result?.id === result.id
+      ? { ...entry, result: nextResult}
+      : entry));
+    if (shouldLearn) startPositiveFeedbackLearning(result.id || '', learningSnapshot);
+}
 
+  const handleSyncNotion = async (forceTodoIds?: string[]) => {
+    if (!result || result.todos.length === 0) return;
+
+    const pendingVerificationIds = notionRecovery?.todoIds || result.notionSync?.uncertainTodoIds || [];
+    if (!forceTodoIds && pendingVerificationIds.length > 0) {
+      const uncertainTitles = result.todos
+        .filter(todo => pendingVerificationIds.includes(todo.id))
+        .map(todo => `「${todo.title || todo.id}」`)
+        .join('、');
+      setNotionRecovery({
+        todoIds: pendingVerificationIds,
+        isOpen: true,
+        message: `以下待办的 Notion 推送结果无法确认：${uncertainTitles || '部分待办'}。\n\n${result.notionSync?.lastError || ''}\n\n请先在 Notion 中核对：如果页面已存在，请标记为已同步；如果确认未创建，再强制重试。强制重试可能产生重复页面。`,
+    });
+      return;
+  }
+
+    const forceIdSet = forceTodoIds ? new Set(forceTodoIds) : null;
+    const selectedTodos = result.todos.filter(todo => (
+      todo.selected !== false &&
+      !todo.synced &&
+      (!forceIdSet || forceIdSet.has(todo.id))
+    ));
+    if (selectedTodos.length === 0) {
+      setError("当前没有可同步的待办事项：您选中的条目可能已全部同步至 Notion，或未勾选任何有效事项。");
+      return;
+  }
+
+    const positiveFeedbackSnapshot = createPositiveFeedbackSnapshot(
+      result.originalTodos || result.todos,
+      result.todos,
+    );
+    const shouldLearnAfterSync = shouldStartPositiveFeedbackLearning(result, positiveFeedbackSnapshot);
+
+    setNotionRecovery(null);
     setSyncing(true);
     setError('');
-    logger.info('Syncing to Notion...', { count: selectedTodos.length });
+    const syncingResult = {
+      ...result,
+      notionSync: createNotionSyncInProgressState(
+        selectedTodos.length,
+        selectedTodos.map(todo => todo.id),
+      ),
+  };
+    setResult(syncingResult);
+    logger.info('Syncing to Notion...', { count: selectedTodos.length, forced: !!forceTodoIds});
     try {
-      const syncResults = await syncToNotion(selectedTodos);
+      const syncResults = await syncToNotion(
+        selectedTodos,
+        forceTodoIds ? { forceTodoIds} : undefined,
+      );
 
       const failed = syncResults.filter(r => !r.success);
       const succeeded = syncResults.filter(r => r.success);
+      const uncertainResults = failed.filter(item => item.needsVerification);
+      const succeededIds = new Set(succeeded.map((item) => item.id));
+      const todos = result.todos.map(todo => (
+        succeededIds.has(todo.id) ? { ...todo, synced: true} : todo
+      ));
+      const selectedResultTodos = todos.filter(todo => todo.selected !== false);
+      const shouldTrackLearning = shouldLearnAfterSync && succeeded.length > 0;
+      const nextResult = {
+        ...result,
+        todos,
+        syncedToNotion: selectedResultTodos.length > 0 && selectedResultTodos.every(todo => todo.synced),
+        notionSync: summarizeNotionSyncResults(syncResults, selectedTodos.length),
+        ...(shouldTrackLearning
+          ? {
+              positiveFeedbackStatus: uncertainResults.length > 0 ? 'pending_verification' as const : 'processing' as const,
+              positiveFeedbackFingerprint: positiveFeedbackSnapshot.fingerprint,
+              positiveFeedbackUpdatedAt: Date.now(),
+              positiveFeedbackError: undefined,
+          }
+          : {}),
+    };
 
       if (failed.length > 0) {
         const errorMsgs = failed.map(f => `条目错误: ${f.error}`).join('\n');
         setError(`部分同步失败 (${failed.length}/${selectedTodos.length}):\n${errorMsgs}`);
-        logger.warn('Partial Notion sync failure', { failedCount: failed.length, errors: failed.map(f => f.error) });
-      }
+        logger.warn('Partial Notion sync failure', { failedCount: failed.length, errors: failed.map(f => f.error)});
+    }
 
-      setResult(prev => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          syncedToNotion: failed.length === 0,
-          todos: prev.todos.map(t => {
-            if (succeeded.find(s => s.id === t.id)) {
-              return { ...t, synced: true };
-            }
-            return t;
-          })
-        };
-      });
-
-      // 触发后台静默分析 (fire-and-forget)
-      const baseTodosForSync = result.originalTodos || result.todos || [];
-      if (baseTodosForSync.length > 0) {
-        import('./lib/autoOptimize').then(m => {
-          m.backgroundReviewAndUpdateFocus(baseTodosForSync, selectedTodos).catch(console.error);
-        });
-      }
-
-      const succeededIds = new Set(succeeded.map((item) => item.id));
+      setResult(nextResult);
       await updateHistory((history) => history.map((entry) => entry.result?.id === result.id
-        ? {
-            ...entry,
-            result: {
-              ...result,
-              syncedToNotion: failed.length === 0,
-              todos: result.todos.map((todo) => succeededIds.has(todo.id) ? { ...todo, synced: true } : todo),
-            },
-          }
+        ? { ...entry, result: nextResult}
         : entry));
-      if (failed.length === 0) {
-        logger.info('Sync to Notion complete (all success)');
-      }
 
-    } catch (err: any) {
+      if (shouldTrackLearning && uncertainResults.length === 0) {
+        startPositiveFeedbackLearning(result.id || '', positiveFeedbackSnapshot);
+    }
+
+      if (uncertainResults.length > 0) {
+        const uncertainIds = uncertainResults.map(item => item.id);
+        const uncertainTitles = selectedTodos
+          .filter(todo => uncertainIds.includes(todo.id))
+          .map(todo => `「${todo.title || todo.id}」`)
+          .join('、');
+        setNotionRecovery({
+          todoIds: uncertainIds,
+          isOpen: true,
+          message: `以下待办的 Notion 推送结果无法确认：${uncertainTitles || '部分待办'}。\n\n${nextResult.notionSync?.lastError || ''}\n\n请先在 Notion 中核对：如果页面已存在，请标记为已同步；如果确认未创建，再强制重试。强制重试可能产生重复页面。`,
+      });
+    } else if (failed.length === 0) {
+        logger.info('Sync to Notion complete (all success)');
+    }
+  } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+      const failedState = createNotionSyncFailureState(
+        selectedTodos.length,
+        selectedTodos.map(todo => todo.id),
+        msg,
+      );
+      const failedResult = {
+        ...result,
+        notionSync: failedState,
+    };
+      setResult(failedResult);
+      await updateHistory((history) => history.map((entry) => entry.result?.id === result.id
+        ? { ...entry, result: failedResult}
+        : entry));
       setError(msg);
       logger.error('Notion sync error', msg);
-    } finally {
+  } finally {
       setSyncing(false);
-    }
   }
+}
+
+  const handleMarkNotionRecovery = async () => {
+    if (!notionRecovery) return;
+    const todoIds = notionRecovery.todoIds;
+    setNotionRecovery(null);
+    setSyncing(true);
+    try {
+      await persistVerifiedNotionTodos(todoIds);
+      setError('');
+      setToast({ title: '✅ 已标记为已同步', message: '已将核对确认存在的 Notion 页面标记为已同步。'});
+      setTimeout(() => setToast(null), 3000);
+  } catch (err: any) {
+      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+      setError(`标记 Notion 同步状态失败：${msg}`);
+      logger.error('Mark Notion sync verified error', msg);
+  } finally {
+      setSyncing(false);
+  }
+}
+
+  const handleForceNotionRecovery = async () => {
+    if (!notionRecovery) return;
+    const todoIds = notionRecovery.todoIds;
+    setNotionRecovery(null);
+    await handleSyncNotion(todoIds);
+}
 
   const updateTodo = (id: string, field: string, value: any) => {
     setResult(prev => {
       if (!prev) return prev;
       return {
         ...prev,
-        todos: prev.todos.map(t => t.id === id ? { ...t, [field]: value } : t)
-      }
-    })
-  }
+        todos: prev.todos.map(t => t.id === id ? { ...t, [field]: value} : t)
+    }
+  })
+}
 
   const handleAddTodo = () => {
     setResult(prev => {
@@ -373,79 +630,97 @@ ${text}
       const newTodo: any = {
         id: Math.random().toString(36).substr(2, 9),
         selected: true
-      };
+    };
       displayFields.forEach(f => {
         if (f.type === 'date') newTodo[f.name] = today;
         else if (f.type === 'select' && f.options && f.options.length > 0) newTodo[f.name] = f.options[0];
         else if (f.type === 'checkbox') newTodo[f.name] = false;
         else newTodo[f.name] = '';
-      });
+    });
       return {
         ...prev,
         todos: [...prev.todos, newTodo]
-      }
-    })
-  }
+    }
+  })
+}
 
   const startNewSession = () => {
     setInput('');
     setImages([]);
     setResult(null);
     setError('');
+    setNotionRecovery(null);
 
     setWriteIntent('');
     setWritingResult('');
-  }
+}
 
   const handleRestoreHistory = (restoredResult: any, restoredInput?: string, restoredImages?: string[]) => {
     setResult(restoredResult);
+    setNotionRecovery(null);
 
     setInput(restoredInput || '');
     setImages(restoredImages || []);
     setWriteIntent('');
     setWritingResult('');
-  }
+}
 
   const handleGenerateWriting = async () => {
     if (!result || result.todos.length === 0 || !writeIntent) return;
     setWriting(true);
     setError('');
-    logger.info('Starting AI writing...', { intent: writeIntent });
+    logger.info('Starting AI writing...', { intent: writeIntent});
     try {
       const generated = await generateWriting(writeIntent, result.todos, input, images);
       setWritingResult(generated);
       logger.info('AI writing success');
-    } catch (err: any) {
+  } catch (err: any) {
       const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
       setError(msg);
       logger.error('AI writing error', msg);
-    } finally {
+  } finally {
       setWriting(false);
-    }
   }
+}
 
   const handleCopyWriting = async () => {
     try {
       await navigator.clipboard.writeText(writingResult);
-      setToast({ title: '✅ 复制成功', message: '内容已复制到剪贴板' });
+      setToast({ title: '✅ 复制成功', message: '内容已复制到剪贴板'});
       setTimeout(() => setToast(null), 3000);
-    } catch (e) {
+  } catch (e) {
       console.error(e);
-      setToast({ title: '❌ 复制失败', message: '无法写入剪贴板，请重试' });
+      setToast({ title: '❌ 复制失败', message: '无法写入剪贴板，请重试'});
       setTimeout(() => setToast(null), 3000);
-    }
   }
+}
+
+  const notionStatus = result?.notionSync?.status || (result?.syncedToNotion ? 'success' : 'idle');
+  const notionStatusLabel = getNotionSyncStatusLabel(result?.notionSync);
+  const notionButtonLabel = getNotionSyncButtonLabel(result?.notionSync, !!notionRecovery, !!result?.syncedToNotion);
+  const selectedSyncTodoCount = result?.todos.filter(todo => todo.selected !== false && !todo.synced).length || 0;
+  const hasPendingVerification = !!notionRecovery || notionStatus === 'needs_verification';
+  const notionStatusClass = notionStatus === 'success'
+    ? 'bg-green-500/15 text-green-300 border-green-500/30'
+    : notionStatus === 'needs_verification'
+      ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+      : notionStatus === 'partial_failed'
+        ? 'bg-orange-500/15 text-orange-300 border-orange-500/30'
+        : notionStatus === 'failed'
+          ? 'bg-red-500/15 text-red-300 border-red-500/30'
+          : 'bg-slate-500/15 text-slate-300 border-slate-500/30';
 
   return (
     <div
       className="w-full h-full overflow-y-auto block relative"
-      onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-      onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       <div
         className="min-h-[100vh] w-full overflow-y-auto custom-scrollbar flex flex-col items-center justify-center p-4 sm:p-8"
-        onClick={async () => { if (!isWindowMode) await getCurrentWindow().hide() }}
+        onClick={async () => { if (!isWindowMode) await getCurrentWindow().hide()}}
       >
         {isWindowMode && (
           <>
@@ -515,7 +790,7 @@ ${text}
             onChange={(e) => setInput(e.target.value)}
             onPaste={handlePaste}
             placeholder={isDragging ? "松开鼠标以解析文件..." : "粘贴文字/图片，或拖拽文件 (Word/PDF/Excel) 到这里..."}
-            className={`w-full bg-slate-900/50 border border-white/10 rounded-lg p-4 text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none ${isWindowMode ? 'min-h-[240px]' : 'min-h-[120px]'} ${isDragging ? 'pointer-events-none' : ''}`}
+            className={`w-full bg-slate-900/50 border border-white/10 rounded-lg p-4 text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none ${isWindowMode ? 'min-h-[240px]' : 'min-h-[120px]'}`}
           />
           {images.length > 0 && (
             <div className="absolute bottom-4 left-4 flex gap-2">
@@ -545,7 +820,7 @@ ${text}
             <input
               type="file"
               ref={fileInputRef}
-              style={{ display: 'none' }}
+              style={{ display: 'none'}}
               onChange={handleFileSelect}
               multiple
               accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,image/*"
@@ -554,8 +829,8 @@ ${text}
               onClick={() => {
                 isFileDialogOpen.current = true;
                 fileInputRef.current?.click();
-                setTimeout(() => { isFileDialogOpen.current = false; }, 3000);
-              }}
+                setTimeout(() => { isFileDialogOpen.current = false;}, 3000);
+            }}
               className="flex items-center gap-2 px-3 py-1.5 text-sm bg-white/5 hover:bg-white/10 text-slate-300 rounded-md border border-white/5 transition-colors cursor-pointer"
             >
               <FileText className="w-4 h-4" />
@@ -611,7 +886,7 @@ ${text}
                           className={`flex-1 min-w-[80px] bg-transparent text-sm focus:outline-none focus:border-b focus:border-purple-500/50 px-1 ${todo.selected === false ? 'text-slate-500 line-through' : 'text-slate-200'} disabled:cursor-not-allowed`}
                         />
                       );
-                    } else if (field.type === 'select') {
+                  } else if (field.type === 'select') {
                       return (
                         <select
                           key={field.id}
@@ -626,7 +901,7 @@ ${text}
                           ))}
                         </select>
                       );
-                    } else if (field.type === 'date') {
+                  } else if (field.type === 'date') {
                       return (
                         <input
                           key={field.id}
@@ -637,7 +912,7 @@ ${text}
                           className="text-xs text-slate-300 bg-white/5 border border-white/10 px-1.5 py-1 rounded cursor-pointer focus:ring-1 focus:ring-slate-400 outline-none disabled:opacity-50 disabled:cursor-not-allowed"
                         />
                       );
-                    } else if (field.type === 'checkbox') {
+                  } else if (field.type === 'checkbox') {
                       return (
                         <label key={field.id} className="flex items-center gap-1 text-xs text-slate-400 cursor-pointer shrink-0">
                           <input
@@ -650,7 +925,7 @@ ${text}
                           {field.name}
                         </label>
                       );
-                    } else {
+                  } else {
                       return (
                         <AutoResizeTextarea
                           key={field.id}
@@ -661,8 +936,8 @@ ${text}
                           className="flex-1 min-w-[120px] bg-transparent text-xs border-b border-white/10 focus:border-purple-500/50 outline-none text-slate-300 px-1"
                         />
                       );
-                    }
-                  })}
+                  }
+                })}
                 </div>
               ))}
               {!result.syncedToNotion && (
@@ -686,16 +961,50 @@ ${text}
                   </button>
                 )}
                 {result.todos.length > 0 && (
-                  <button
-                    onClick={handleSyncNotion}
-                    disabled={syncing || result.todos.filter(t => t.selected !== false).length === 0 || result.syncedToNotion || result.feedbackStatus === 'processing' || result.feedbackStatus === 'completed'}
-                    className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${result.syncedToNotion ? 'bg-green-600 shadow-green-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
-                  >
-                    {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                    <span>{syncing ? '同步中...' : result.syncedToNotion ? '已同步' : '同步至 Notion'}</span>
-                  </button>
+                  <>
+                    {notionStatusLabel && (
+                      <span
+                        className={`hidden sm:inline-flex items-center rounded-md border px-2.5 py-1 text-xs font-medium ${notionStatusClass}`}
+                        title={result.notionSync?.lastError || undefined}
+                      >
+                        {notionStatusLabel}
+                        {result.notionSync && result.notionSync.failedCount > 0 && ` · ${result.notionSync.failedCount} 项`}
+                      </span>
+                    )}
+                    <button
+                      onClick={() => void handleSyncNotion()}
+                      disabled={syncing || (selectedSyncTodoCount === 0 && !hasPendingVerification) || result.syncedToNotion || result.feedbackStatus === 'processing' || result.feedbackStatus === 'completed'}
+                      title={result.notionSync?.lastError || undefined}
+                      className={`flex items-center gap-2 px-5 py-2 text-sm font-medium text-white rounded-md shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${notionStatus === 'success' ? 'bg-green-600 shadow-green-500/20' : notionStatus === 'failed' ? 'bg-red-600 hover:bg-red-500 shadow-red-500/20' : notionStatus === 'partial_failed' || notionStatus === 'needs_verification' ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-500/20' : 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20'}`}
+                    >
+                      {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : notionStatus === 'success' ? <Check className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+                      <span>{notionButtonLabel}</span>
+                    </button>
+                  </>
                 )}
               </div>
+
+              {result.positiveFeedbackStatus === 'processing' && (
+                <div className="animate-in fade-in bg-purple-900/20 border border-purple-500/30 p-3 rounded-lg flex items-center gap-2 text-xs text-purple-200">
+                  <Loader2 className="w-4 h-4 animate-spin" /> 正在分析本次同步选择并优化全局规则...
+                </div>
+              )}
+              {result.positiveFeedbackStatus === 'pending_verification' && (
+                <div className="animate-in fade-in bg-amber-900/20 border border-amber-500/30 p-3 rounded-lg text-xs text-amber-200">
+                  ⏸️ Notion 结果待核对，确认页面状态后再提交正反馈学习。
+                </div>
+              )}
+              {result.positiveFeedbackStatus === 'unchanged' && (
+                <div className="animate-in fade-in bg-green-900/20 border border-green-500/30 p-3 rounded-lg text-xs text-green-200">
+                  ✅ 正反馈已记录，当前规则无需额外修改。
+                </div>
+              )}
+              {result.positiveFeedbackStatus === 'failed' && (
+                <div className="animate-in fade-in bg-red-900/20 border border-red-500/30 p-3 rounded-lg flex items-center justify-between gap-3 text-xs text-red-200">
+                  <span>⚠️ 正反馈学习失败：{result.positiveFeedbackError || '未知错误'}</span>
+                  <button onClick={retryPositiveFeedbackLearning} className="px-2 py-1 rounded bg-red-500/20 hover:bg-red-500/30">重试</button>
+                </div>
+              )}
 
               {showFeedback && canProvideExplicitFeedback(result.feedbackStatus) && (
                 <div className="animate-in fade-in slide-in-from-top-2 bg-slate-900/80 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3">
@@ -796,7 +1105,7 @@ ${text}
             onClick={(e) => {
               e.stopPropagation();
               setPreviewImage(null);
-            }}
+          }}
           />
         </div>
       )}
@@ -804,6 +1113,54 @@ ${text}
       {showSettings && <Suspense fallback={<PanelLoading />}><SettingsPanel onClose={() => setShowSettings(false)} /></Suspense>}
       {showHistory && <Suspense fallback={<PanelLoading />}><HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} /></Suspense>}
       {showEmailHistory && <Suspense fallback={<PanelLoading />}><EmailTasksPanel onClose={() => setShowEmailHistory(false)} /></Suspense>}
+
+      {notionRecovery?.isOpen && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          onClick={(event) => {
+            event.stopPropagation();
+            setNotionRecovery(prev => prev ? { ...prev, isOpen: false} : prev);
+        }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="notion-recovery-title"
+            className="w-full max-w-lg rounded-xl border border-amber-500/30 bg-slate-900 p-6 shadow-2xl"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="mb-4 flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+              <div>
+                <h3 id="notion-recovery-title" className="text-lg font-semibold text-white">Notion 推送结果需要核对</h3>
+                <p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-300">{notionRecovery.message}</p>
+              </div>
+            </div>
+            <div className="flex flex-wrap justify-end gap-3">
+              <button
+                onClick={() => setNotionRecovery(prev => prev ? { ...prev, isOpen: false} : prev)}
+                className="rounded-md bg-white/5 px-4 py-2 text-sm text-slate-300 transition-colors hover:bg-white/10 hover:text-white"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => void handleMarkNotionRecovery()}
+                disabled={syncing}
+                className="rounded-md border border-amber-500/30 bg-amber-500/15 px-4 py-2 text-sm text-amber-200 transition-colors hover:bg-amber-500/25 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                已存在，标记已同步
+              </button>
+              <button
+                onClick={() => void handleForceNotionRecovery()}
+                disabled={syncing}
+                className="rounded-md bg-orange-600 px-4 py-2 text-sm text-white shadow-lg shadow-orange-500/20 transition-colors hover:bg-orange-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                确认未创建，强制重试
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {toast && (
         <div className="fixed bottom-6 right-6 z-[100] animate-in slide-in-from-bottom-8 slide-in-from-right-8 fade-in duration-500">
@@ -827,3 +1184,6 @@ ${text}
     </div>
   )
 }
+
+
+

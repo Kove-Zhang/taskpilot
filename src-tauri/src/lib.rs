@@ -697,6 +697,100 @@ mod secret_key_tests {
     }
 }
 
+const MAX_DROPPED_FILE_SIZE: u64 = 15 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDroppedFile {
+    name: String,
+    mime_type: String,
+    data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeFileDropEvent {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    files: Vec<NativeDroppedFile>,
+    errors: Vec<String>,
+}
+
+fn dropped_file_mime_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("csv") => "text/csv",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        _ => "application/octet-stream",
+    }
+}
+
+fn read_dropped_file(path: &std::path::Path) -> Result<NativeDroppedFile, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("无法读取拖放文件信息: {error}"))?;
+    if !metadata.is_file() {
+        return Err("拖放目标不是文件。".to_string());
+    }
+    if metadata.len() > MAX_DROPPED_FILE_SIZE {
+        return Err("文件超过 15 MB 解析上限。".to_string());
+    }
+
+    let bytes = fs::read(path).map_err(|error| format!("无法读取拖放文件: {error}"))?;
+    if bytes.len() as u64 > MAX_DROPPED_FILE_SIZE {
+        return Err("文件超过 15 MB 解析上限。".to_string());
+    }
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| "无法获取拖放文件名称。".to_string())?;
+
+    Ok(NativeDroppedFile {
+        name,
+        mime_type: dropped_file_mime_type(path).to_string(),
+        data_base64: STANDARD.encode(bytes),
+    })
+}
+
+fn emit_native_file_drop_event<R: tauri::Runtime>(window: &tauri::Window<R>, event_type: &'static str, paths: &[PathBuf]) {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+
+    if event_type == "drop" {
+        for path in paths.iter().take(5) {
+            match read_dropped_file(path) {
+                Ok(file) => files.push(file),
+                Err(error) => errors.push(format!("{}：{error}", path.display())),
+            }
+        }
+        if paths.len() > 5 {
+            errors.push("单次最多解析 5 个文件。".to_string());
+        }
+    }
+
+    let payload = NativeFileDropEvent {
+        event_type,
+        files,
+        errors,
+    };
+    if let Err(error) = window.emit("native-file-drag-drop", payload) {
+        log::error!("无法向前端发送原生拖放事件: {error}");
+    }
+}
 fn toggle_main_window(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -732,6 +826,25 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(drag_event) = event {
+                match drag_event {
+                    tauri::DragDropEvent::Enter { paths, .. } => {
+                        emit_native_file_drop_event(window, "enter", paths);
+                    }
+                    tauri::DragDropEvent::Over { .. } => {
+                        emit_native_file_drop_event(window, "over", &[]);
+                    }
+                    tauri::DragDropEvent::Drop { paths, .. } => {
+                        emit_native_file_drop_event(window, "drop", paths);
+                    }
+                    tauri::DragDropEvent::Leave => {
+                        emit_native_file_drop_event(window, "leave", &[]);
+                    }
+                    _ => {}
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             save_history,
             load_history,
@@ -805,3 +918,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
