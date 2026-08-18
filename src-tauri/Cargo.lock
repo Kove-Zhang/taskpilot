@@ -143,6 +143,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-sql",
  "tauri-plugin-store",
+ "tokio",
  "url",
  "windows-sys 0.61.2",
 ]

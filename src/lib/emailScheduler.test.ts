@@ -11,7 +11,7 @@ vi.mock('./ai', async (importOriginal) => {
   return { ...actual, extractTodosFromContent: schedulerMocks.extractTodosFromContent }
 })
 
-import { forceRunEmailScanner } from './emailScheduler'
+import { cancelActiveEmailScan, forceRunEmailScanner } from './emailScheduler'
 import { useScannerStore, useSettingsStore } from '../store'
 
 const baseConfig = {
@@ -248,6 +248,45 @@ describe('email scheduler P1 regression cases', () => {
   })
 
 
+  it('cancels an in-flight email extraction without creating failure history or starting the next email', async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'fetch_emails') {
+        return [
+          { uid: 910_014, uid_validity: 503, sender: 'one@example.test', subject: 'Current mail', date: '2026-08-01T00:00:00Z', body_text: 'Current' },
+          { uid: 910_015, uid_validity: 503, sender: 'two@example.test', subject: 'Next mail', date: '2026-08-01T00:01:00Z', body_text: 'Next' },
+        ] as never
+      }
+      return undefined as never
+    })
+    schedulerMocks.extractTodosFromContent.mockImplementationOnce((
+      _prompt: string,
+      _images: string[],
+      _source: string,
+      signal?: AbortSignal,
+    ) => new Promise<never>((_resolve, reject) => {
+      const cancel = () => reject(new HttpRequestError('请求已取消', { isCancelled: true }))
+      if (signal?.aborted) cancel()
+      else signal?.addEventListener('abort', cancel, { once: true })
+    })).mockResolvedValue({ summary: 'Should not run', todos: [] })
+
+    const pending = forceRunEmailScanner(true)
+    await vi.waitFor(() => expect(useScannerStore.getState().status).toBe('processing'))
+
+    useScannerStore.getState().requestStop()
+    cancelActiveEmailScan()
+    await pending
+
+    expect(schedulerMocks.extractTodosFromContent).toHaveBeenCalledTimes(1)
+    expect(useScannerStore.getState()).toMatchObject({
+      running: false,
+      paused: false,
+      stopRequested: false,
+      status: 'stopped',
+      progressMsg: '主动停止扫描',
+      historyVersion: 0,
+    })
+  })
+
   it('retries a Tauri request-send error according to retryCount', async () => {
     vi.useFakeTimers()
     const uid = 910_005
@@ -309,6 +348,73 @@ describe('email scheduler P1 regression cases', () => {
     expect(schedulerMocks.extractTodosFromContent).toHaveBeenCalledTimes(1)
     expect(useScannerStore.getState().scanLogs.some((log) => log.includes('跳过已处理'))).toBe(true)
     expect(useScannerStore.getState().scanLogs.some((log) => log.includes(fullSubject))).toBe(true)
+  })
+
+
+  it('passes structured IMAP flags and keyword filters to the scanner backend', async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'fetch_emails') return [] as never
+      return undefined as never
+    })
+    useSettingsStore.setState({
+      emailConfig: {
+        ...baseConfig,
+        autoScanFilter: {
+          readState: 'unread',
+          systemFlags: ['flagged', 'unanswered'],
+          keywords: ['Project-A'],
+          excludeKeywords: ['newsletter'],
+        },
+      },
+    })
+
+    await forceRunEmailScanner(false)
+
+    const request = vi.mocked(invoke).mock.calls
+      .find(([command]) => command === 'fetch_emails')?.[1] as {
+        request: {
+          unreadOnly: boolean
+          readState: string
+          systemFlags: string[]
+          keywords: string[]
+          excludeKeywords: string[]
+          sinceDays: number
+        }
+      }
+    expect(request.request).toMatchObject({
+      unreadOnly: true,
+      readState: 'unread',
+      systemFlags: ['flagged', 'unanswered'],
+      keywords: ['Project-A'],
+      excludeKeywords: ['newsletter'],
+      sinceDays: 2,
+    })
+  })
+
+  it('caps outer email retries with the operation budget instead of multiplying indefinitely', async () => {
+    vi.useFakeTimers()
+    const uid = 910_030
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'fetch_emails') {
+        return [{
+          uid,
+          uid_validity: 701,
+          sender: 'sender@example.test',
+          subject: 'Budgeted retry',
+          date: '2026-08-01T00:00:00Z',
+          body_text: 'Please extract the action items.',
+        }] as never
+      }
+      return undefined as never
+    })
+    schedulerMocks.extractTodosFromContent.mockRejectedValue(new HttpRequestError('request timeout', { isTimeout: true }))
+    useSettingsStore.setState({ emailConfig: { ...baseConfig, retryCount: 5 } })
+
+    const pending = forceRunEmailScanner(true)
+    await vi.runAllTimersAsync()
+    await pending
+
+    expect(schedulerMocks.extractTodosFromContent).toHaveBeenCalledTimes(3)
   })
 
 })

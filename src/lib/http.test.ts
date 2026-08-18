@@ -5,6 +5,7 @@ import {
   LLM_REQUEST_TIMEOUT_MS,
   HttpRequestError,
   fetchWithTimeout,
+  isCancellationError,
   isRetryableHttpStatus,
   isRetryableRequestError,
   isRetryableTransportError,
@@ -23,6 +24,20 @@ describe('HTTP request helpers', () => {
     expect(fetch).toHaveBeenCalledWith('https://example.test', expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(DEFAULT_REQUEST_TIMEOUT_MS).toBe(30_000)
     expect(LLM_REQUEST_TIMEOUT_MS).toBe(180_000)
+  })
+
+  it('preserves native Response metadata while wrapping the body lifecycle', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response('{"ok":true}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+
+    const response = await fetchWithTimeout('https://example.test')
+
+    expect(response.ok).toBe(true)
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toBe('application/json')
+    await expect(response.json()).resolves.toEqual({ ok: true })
   })
 
   it('converts an aborted request into a timeout error', async () => {
@@ -58,4 +73,50 @@ describe('HTTP request helpers', () => {
     expect(isRetryableRequestError(new HttpRequestError('invalid request', { status: 400 }))).toBe(false)
     expect(isRetryableRequestError(new HttpRequestError('authentication failed', { status: 401 }))).toBe(false)
   })
+  it('distinguishes external cancellation from a timeout and does not classify it as retryable', async () => {
+    const controller = new AbortController()
+    vi.mocked(fetch).mockImplementation((_input, init) => new Promise((_resolve, reject) => {
+      const signal = init?.signal as AbortSignal
+      signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    }))
+
+    const pending = fetchWithTimeout('https://example.test', {}, 1_000, { signal: controller.signal })
+    controller.abort()
+
+    await expect(pending).rejects.toMatchObject({ name: 'HttpRequestError', isCancelled: true, isTimeout: false })
+    await expect(pending).rejects.not.toMatchObject({ isRetryable: true })
+    expect(isCancellationError(new HttpRequestError('cancelled', { isCancelled: true }))).toBe(true)
+  })
+
+  it('reports the timeout phase for layered policies and keeps total timeout alive while reading the body', async () => {
+    vi.useFakeTimers()
+    vi.mocked(fetch).mockImplementation((_input, init) => new Promise((_resolve, reject) => {
+      const signal = init?.signal as AbortSignal
+      signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    }))
+
+    const pending = fetchWithTimeout('https://example.test', {}, {
+      connectTimeoutMs: 25,
+      firstByteTimeoutMs: 60,
+      totalTimeoutMs: 100,
+    })
+    const assertion = expect(pending).rejects.toMatchObject({ isTimeout: true, timeoutPhase: 'connect' })
+    await vi.advanceTimersByTimeAsync(25)
+    await assertion
+
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      json: () => new Promise(() => { /* body never completes */ }),
+    } as Response)
+    const response = await fetchWithTimeout('https://example.test', {}, {
+      connectTimeoutMs: 25,
+      firstByteTimeoutMs: 60,
+      totalTimeoutMs: 100,
+    })
+    const bodyPending = response.json()
+    const bodyAssertion = expect(bodyPending).rejects.toMatchObject({ isTimeout: true })
+    await vi.advanceTimersByTimeAsync(100)
+    await bodyAssertion
+  })
+
 })

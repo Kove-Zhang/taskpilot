@@ -483,9 +483,75 @@ pub struct FetchEmailsRequest {
     pass: String,
     ssl: bool,
     folder: String,
-    unread_only: bool,
+    /// Legacy compatibility field. New callers should use read_state.
+    unread_only: Option<bool>,
+    read_state: Option<String>,
+    system_flags: Option<Vec<String>>,
+    keywords: Option<Vec<String>>,
+    exclude_keywords: Option<Vec<String>>,
     since_days: Option<u32>,
     max_emails: Option<usize>,
+}
+
+fn quote_imap_search_value(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("IMAP search keyword cannot be empty".to_string());
+    }
+    if value.chars().any(|character| character == '\r' || character == '\n') {
+        return Err("IMAP search keyword cannot contain line breaks".to_string());
+    }
+    Ok(format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")))
+}
+
+fn build_imap_search_query(
+    read_state: Option<&str>,
+    system_flags: &[String],
+    keywords: &[String],
+    exclude_keywords: &[String],
+    since_date: Option<&str>,
+) -> Result<String, String> {
+    let mut terms = Vec::new();
+    if let Some(read_state) = read_state {
+        terms.push(match read_state {
+            "all" => None,
+            "unread" => Some("UNSEEN"),
+            "read" => Some("SEEN"),
+            other => return Err(format!("Unsupported email read state: {other}")),
+        });
+    }
+
+    for flag in system_flags {
+        let term = match flag.as_str() {
+            "flagged" => "FLAGGED",
+            "unflagged" => "UNFLAGGED",
+            "answered" => "ANSWERED",
+            "unanswered" => "UNANSWERED",
+            "draft" => "DRAFT",
+            "deleted" => "DELETED",
+            "recent" => "RECENT",
+            other => return Err(format!("Unsupported IMAP system flag: {other}")),
+        };
+        terms.push(Some(term));
+    }
+
+    let mut dynamic_terms = Vec::new();
+    for keyword in keywords {
+        dynamic_terms.push(format!("KEYWORD {}", quote_imap_search_value(keyword)?));
+    }
+    for keyword in exclude_keywords {
+        dynamic_terms.push(format!("UNKEYWORD {}", quote_imap_search_value(keyword)?));
+    }
+
+    let mut query_terms = terms.into_iter().flatten().map(str::to_string).collect::<Vec<_>>();
+    query_terms.extend(dynamic_terms);
+    if let Some(since_date) = since_date {
+        query_terms.push(format!("SINCE {since_date}"));
+    }
+    if query_terms.is_empty() {
+        query_terms.push("ALL".to_string());
+    }
+    Ok(query_terms.join(" "))
 }
 
 #[tauri::command]
@@ -498,6 +564,10 @@ pub async fn fetch_emails(request: FetchEmailsRequest) -> Result<Vec<Email>, Str
         ssl,
         folder,
         unread_only,
+        read_state,
+        system_flags,
+        keywords,
+        exclude_keywords,
         since_days,
         max_emails,
     } = request;
@@ -510,23 +580,23 @@ pub async fn fetch_emails(request: FetchEmailsRequest) -> Result<Vec<Email>, Str
             .map_err(|error| format!("Select Error: {error}"))?;
         let uid_validity = mailbox.uid_validity;
 
-        let query = if let Some(days) = since_days {
+        let since_date = since_days.map(|days| {
             // IMAP SINCE is date-granular and server internal dates may differ by timezone.
             // Include one extra day; processed UID fingerprints keep the result idempotent.
-            let since_date = (chrono::Local::now()
+            (chrono::Local::now()
                 - chrono::Duration::days(days.saturating_add(1) as i64))
             .format("%d-%b-%Y")
-            .to_string();
-            if unread_only {
-                format!("UNSEEN SINCE {since_date}")
-            } else {
-                format!("SINCE {since_date}")
-            }
-        } else if unread_only {
-            "UNSEEN".to_string()
-        } else {
-            "ALL".to_string()
-        };
+            .to_string()
+        });
+        let legacy_read_state = unread_only.map(|value| if value { "unread" } else { "all" });
+        let effective_read_state = read_state.as_deref().or(legacy_read_state);
+        let query = build_imap_search_query(
+            effective_read_state,
+            system_flags.as_deref().unwrap_or(&[]),
+            keywords.as_deref().unwrap_or(&[]),
+            exclude_keywords.as_deref().unwrap_or(&[]),
+            since_date.as_deref(),
+        )?;
 
         let mut uids: Vec<u32> = session
             .uid_search(&query)
@@ -711,6 +781,29 @@ mod tests {
             other: single_part(ContentEncoding::Base64, 128),
             extension: None,
         }
+    }
+
+    #[test]
+    fn builds_composed_imap_search_query() {
+        let query = build_imap_search_query(
+            Some("unread"),
+            &["flagged".to_string(), "unanswered".to_string()],
+            &["Project A".to_string()],
+            &["noise\"tag".to_string()],
+            Some("17-Aug-2026"),
+        ).unwrap();
+        assert_eq!(query, r#"UNSEEN FLAGGED UNANSWERED KEYWORD "Project A" UNKEYWORD "noise\"tag" SINCE 17-Aug-2026"#);
+    }
+
+    #[test]
+    fn rejects_unknown_imap_filter_values_and_line_breaks() {
+        assert!(build_imap_search_query(Some("pending"), &[], &[], &[], None).is_err());
+        assert!(build_imap_search_query(None, &[], &["bad\nkeyword".to_string()], &[], None).is_err());
+    }
+
+    #[test]
+    fn uses_all_when_no_filter_is_requested() {
+        assert_eq!(build_imap_search_query(None, &[], &[], &[], None).unwrap(), "ALL");
     }
 
     #[test]

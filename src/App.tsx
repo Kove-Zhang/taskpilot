@@ -13,6 +13,8 @@ import { getCurrentWindow} from '@tauri-apps/api/window'
 import { getCurrentWebview} from '@tauri-apps/api/webview'
 import { assertFileBatchWithinLimits} from './lib/fileLimits'
 import { logger} from './lib/logger'
+import { getUntrustedContentMetadata, UNTRUSTED_CONTENT_LIMITS } from './lib/llm/untrustedContent'
+import { isCancellationError } from './lib/http'
 import { useSettingsStore} from './store'
 import { compressImage} from './lib/imageUtils'
 import { updateHistory} from './lib/history'
@@ -65,6 +67,8 @@ export default function App() {
   const domDragDepthRef = useRef(0)
   const suppressDomDropUntilRef = useRef(0)
   const handleFilesRef = useRef<(files: FileList | File[]) => Promise<void>>(async () => {})
+  const extractionAbortRef = useRef<AbortController | null>(null)
+  const writingAbortRef = useRef<AbortController | null>(null)
 
   const isDraggingRef = useRef(isDragging);
   useEffect(() => { isDraggingRef.current = isDragging;}, [isDragging]);
@@ -107,6 +111,8 @@ export default function App() {
     startEmailScheduler();
 
     return () => {
+      extractionAbortRef.current?.abort();
+      writingAbortRef.current?.abort();
       stopEmailScheduler();
   }
 }, []);
@@ -334,13 +340,16 @@ ${text}
 
   const handleExtract = async () => {
     if (!input && images.length === 0) return;
+    extractionAbortRef.current?.abort();
+    const controller = new AbortController();
+    extractionAbortRef.current = controller;
     setLoading(true);
     setError('');
     setNotionRecovery(null);
 
     logger.info('Starting AI extraction...', { inputLength: input.length, imagesCount: images.length});
     try {
-      const res = await extractTodosFromContent(input, images);
+      const res = await extractTodosFromContent(input, images, 'manual', controller.signal);
       res.id = Math.random().toString(36).substring(2, 11);
       setResult(res);
       logger.info('AI extraction success', { todosCount: res.todos.length});
@@ -355,10 +364,13 @@ ${text}
         logger.warn('Failed to save history', error);
     }
   } catch (err: any) {
-      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
-      setError(msg);
-      logger.error('AI extraction error', msg);
+      if (!isCancellationError(err)) {
+        const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+        setError(msg);
+        logger.error('AI extraction error', msg);
+      }
   } finally {
+      if (extractionAbortRef.current === controller) extractionAbortRef.current = null;
       setLoading(false);
   }
 }
@@ -667,18 +679,24 @@ ${text}
 
   const handleGenerateWriting = async () => {
     if (!result || result.todos.length === 0 || !writeIntent) return;
+    writingAbortRef.current?.abort();
+    const controller = new AbortController();
+    writingAbortRef.current = controller;
     setWriting(true);
     setError('');
-    logger.info('Starting AI writing...', { intent: writeIntent});
+    logger.info('Starting AI writing...', getUntrustedContentMetadata(writeIntent, 'manual', { maxLength: UNTRUSTED_CONTENT_LIMITS.field }));
     try {
-      const generated = await generateWriting(writeIntent, result.todos, input, images);
+      const generated = await generateWriting(writeIntent, result.todos, input, images, controller.signal);
       setWritingResult(generated);
       logger.info('AI writing success');
   } catch (err: any) {
-      const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
-      setError(msg);
-      logger.error('AI writing error', msg);
+      if (!isCancellationError(err)) {
+        const msg = typeof err === 'string' ? err : err.message || JSON.stringify(err);
+        setError(msg);
+        logger.error('AI writing error', msg);
+      }
   } finally {
+      if (writingAbortRef.current === controller) writingAbortRef.current = null;
       setWriting(false);
   }
 }
@@ -1184,6 +1202,3 @@ ${text}
     </div>
   )
 }
-
-
-

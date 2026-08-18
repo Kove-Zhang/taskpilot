@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react'
 import { X, Mail, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, ArrowLeft, Check, Loader2, Trash2, Play, Pause, Square, Rocket, ScrollText, ArrowRight, Clock, UploadCloud, Terminal, AlertTriangle } from 'lucide-react'
 import { LazyStore } from '@tauri-apps/plugin-store'
 import type { EmailHistoryItem } from './lib/emailScheduler'
-import { forceRunEmailScanner } from './lib/emailScheduler'
+import { cancelActiveEmailScan, forceRunEmailScanner } from './lib/emailScheduler'
 import { useSettingsStore, useScannerStore } from './store'
 import { markNotionSyncVerified, syncToNotion } from './lib/notion'
 import { createNotionSyncFailureState, createNotionSyncInProgressState, getNotionSyncButtonLabel, getNotionSyncStatusLabel, resolveNotionSyncTodos, summarizeNotionSyncResults } from './lib/notionSyncState'
@@ -1494,7 +1494,7 @@ export default function EmailTasksPanel({ onClose }: EmailTasksPanelProps) {
                       </button>
 
                       <button
-                        onClick={() => requestStop()}
+                        onClick={() => { requestStop(); cancelActiveEmailScan(); }}
                         className="px-3 py-1.5 rounded-lg bg-red-500/20 text-red-300 border border-red-500/30 hover:bg-red-500/30 text-xs font-medium flex items-center gap-1.5 transition-all shadow-sm"
                       >
                         <Square className="w-3.5 h-3.5 fill-current" /> 停止扫描
