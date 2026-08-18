@@ -105,6 +105,18 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   // UI-only disclosure state: it is deliberately not persisted with provider drafts.
   const [expandedProviderIds, setExpandedProviderIds] = useState<Set<string>>(() => new Set());
   const [, setHealthVersion] = useState(0);
+  const [appVersion, setAppVersion] = useState<string>('0.2.1');
+
+  useEffect(() => {
+    let isMounted = true;
+    import('@tauri-apps/api/app')
+      .then((m) => m.getVersion())
+      .then((v) => {
+        if (isMounted && v) setAppVersion(v);
+      })
+      .catch(() => {});
+    return () => { isMounted = false; };
+  }, []);
 
   useEffect(() => llmEventStore.subscribe(() => {
     setHealthVersion((version) => version + 1);
@@ -1968,6 +1980,29 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
           {/* --- TAB: System --- */}
           <div className={`space-y-6 animate-in fade-in slide-in-from-right-4 duration-300 ${activeTab !== 'system' ? 'hidden' : ''}`}>
+            {/* Version Info Card */}
+            <div className="bg-slate-900/60 border border-teal-500/20 rounded-xl p-4 flex items-center justify-between shadow-lg backdrop-blur-md">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg bg-teal-500/10 border border-teal-500/30 flex items-center justify-center text-teal-400 font-bold text-lg">
+                  TP
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-semibold text-slate-100">Task Pilot 控制台</h4>
+                    <span data-testid="app-version-badge" className="px-2 py-0.5 rounded-full text-xs font-mono font-medium bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                      v{appVersion}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    基于 Tauri + React 的现代化智能效率控制台
+                  </p>
+                </div>
+              </div>
+              <div className="text-right text-xs text-slate-500 font-mono">
+                <span className="px-2 py-1 bg-white/5 rounded border border-white/10">Build: Release</span>
+              </div>
+            </div>
+
             <div className="space-y-3">
               <h3 className="text-sm font-medium text-teal-300 flex items-center gap-2">
                 <Keyboard className="w-4 h-4" /> 系统及快捷键

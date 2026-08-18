@@ -138,8 +138,6 @@ describe('SettingsPanel', () => {
     expect(useSettingsStore.getState().failoverOnAuthError).toBe(true)
   })
 
-})
-
   it('unregisters the persisted global shortcut while recording and restores it after blur', async () => {
     vi.mocked(invoke).mockClear()
     render(<SettingsPanel onClose={() => {}} />)
@@ -161,3 +159,10 @@ describe('SettingsPanel', () => {
       expect(invoke).toHaveBeenCalledWith('update_shortcut', { shortcut: 'Alt+Space' })
     })
   })
+
+  it('renders application version badge in system tab', () => {
+    render(<SettingsPanel onClose={() => {}} />)
+    fireEvent.click(screen.getByText('系统及快捷键'))
+    expect(screen.getByTestId('app-version-badge')).toHaveTextContent('v0.2.1')
+  })
+})
