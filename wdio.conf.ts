@@ -7,10 +7,12 @@ let tauriDriver: ChildProcess | undefined
 export const config: WebdriverIO.Config = {
   specs: ['./test/e2e/**/*.ts'],
   maxInstances: 1,
+  hostname: '127.0.0.1',
+  port: 4444,
   capabilities: [
     {
       'tauri:options': {
-        application: './src-tauri/target/debug/app.exe',
+        application: path.resolve('./src-tauri/target/debug/app.exe'),
       },
     },
   ],
@@ -26,9 +28,10 @@ export const config: WebdriverIO.Config = {
 
   // ensure we are running `tauri-driver` before the session starts so that webdriverio can connect to it
   beforeSession: () => {
+    const nativeDriver = process.env.MSEDGEDRIVER_PATH
     tauriDriver = spawn(
       path.resolve(os.homedir(), '.cargo', 'bin', 'tauri-driver'),
-      [],
+      nativeDriver ? ['--native-driver', nativeDriver] : [],
       { stdio: [null, process.stdout, process.stderr] }
     )
   },

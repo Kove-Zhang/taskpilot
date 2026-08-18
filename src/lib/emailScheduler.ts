@@ -1,4 +1,4 @@
-import { useSettingsStore, useScannerStore } from '../store';
+import { useSettingsStore, useScannerStore, type EmailScanFilter } from '../store';
 import { invoke } from '@tauri-apps/api/core';
 import { decodeIMAPFolder } from './imapFolder';
 import { extractTodosFromContent, type AIResult } from './ai';
@@ -8,9 +8,11 @@ import { logger } from './logger';
 import { LazyStore } from '@tauri-apps/plugin-store';
 import { compressBase64Image } from './imageUtils';
 import { limitEmailHistoryHtml, limitEmailHistoryText } from './emailHistoryContent';
-import { isRetryableRequestError } from './http';
+import { isCancellationError, isRetryableRequestError, raceWithAbort, throwIfAborted } from './http';
+import { sleepForRetry } from './llm/retryPolicy';
 import type { NotionSyncState } from './notionSyncState';
 import { summarizeNotionSyncResults } from './notionSyncState';
+import { createOperationBudget, OperationBudget, OperationBudgetExhaustedError } from './llm/operationBudget';
 
 export interface EmailHistoryItem {
     batchId: string;
@@ -72,6 +74,42 @@ function getEmailHistoryFingerprint(item: Pick<EmailHistoryItem, 'folder' | 'ema
 
 // In-memory flag to prevent overlapping runs
 let lastRunTimestamp = 0;
+let activeScanController: AbortController | null = null;
+
+export function cancelActiveEmailScan(): void {
+    activeScanController?.abort();
+}
+
+function resolveEmailScanFilter(isManual: boolean): EmailScanFilter {
+    const { emailConfig } = useSettingsStore.getState();
+    const legacyReadState = isManual
+        ? (emailConfig.manualUnreadOnly === true ? 'unread' : 'all')
+        : (emailConfig.autoUnreadOnly === false ? 'all' : 'unread');
+    const configured = isManual ? emailConfig.manualScanFilter : emailConfig.autoScanFilter;
+    return {
+        readState: configured?.readState ?? legacyReadState,
+        systemFlags: configured?.systemFlags ?? [],
+        keywords: configured?.keywords ?? [],
+        excludeKeywords: configured?.excludeKeywords ?? [],
+    };
+}
+
+function describeEmailScanFilter(filter: EmailScanFilter): string {
+    const readState = filter.readState === 'unread' ? '仅未读' : filter.readState === 'read' ? '仅已读' : '全部状态';
+    const flagLabels: Record<string, string> = {
+        flagged: '旗标',
+        unflagged: '未旗标',
+        answered: '已回复',
+        unanswered: '未回复',
+        draft: '草稿',
+        deleted: '已删除',
+        recent: '最近邮件',
+    };
+    const flags = filter.systemFlags.map((flag) => flagLabels[flag] ?? flag);
+    const keywords = filter.keywords.length > 0 ? ['标签:' + filter.keywords.join('|')] : [];
+    const excluded = filter.excludeKeywords.length > 0 ? ['排除:' + filter.excludeKeywords.join('|')] : [];
+    return [readState, ...flags, ...keywords, ...excluded].join(' + ');
+}
 
 function shouldRunNow(): boolean {
     const { emailConfig } = useSettingsStore.getState();
@@ -106,7 +144,8 @@ function shouldRunNow(): boolean {
     }
 }
 
-async function processSingleEmail(email: FetchedEmail, batchId: string, folder: string, processedUids: string[]): Promise<EmailHistoryItem> {
+async function processSingleEmail(email: FetchedEmail, batchId: string, folder: string, processedUids: string[], signal?: AbortSignal, operationBudget?: OperationBudget): Promise<EmailHistoryItem> {
+    throwIfAborted(signal);
     const { emailConfig } = useSettingsStore.getState();
     const fingerprint = getEmailFingerprint(folder, email);
     
@@ -152,7 +191,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
     }
 
     let attempt = 0;
-    const maxAttempts = emailConfig.retryCount + 1;
+    const maxAttempts = Math.max(1, emailConfig.retryCount + 1);
     let lastError = '';
     let lastErrorRetryable = false;
 
@@ -161,6 +200,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
     let compressedImages: string[] = [];
     if (email.inline_images && email.inline_images.length > 0) {
         for (const imgStr of email.inline_images) {
+            throwIfAborted(signal);
             try {
                 const compressed = await compressBase64Image(imgStr, 1280, 0.75);
                 compressedImages.push(compressed);
@@ -172,6 +212,16 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
     }
 
     while (attempt < maxAttempts) {
+        throwIfAborted(signal);
+        try {
+            operationBudget?.consumeEmailAttempt();
+        } catch (budgetError) {
+            const reason = budgetError instanceof OperationBudgetExhaustedError ? budgetError.reason : 'email_attempts';
+            lastError = `操作预算已耗尽（${reason}）`;
+            lastErrorRetryable = false;
+            logger.warn(`Email UID ${email.uid} stopped because the operation budget was exhausted`, operationBudget?.getSnapshot());
+            break;
+        }
         attempt++;
         try {
             logger.info(`Processing email UID ${email.uid} (Attempt ${attempt})`);
@@ -200,7 +250,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
                     contentPayload = denoised;
                 }
                 const prompt = `邮件主题: ${email.subject}\n发件人: ${email.sender}\n日期: ${email.date}\n\n内容:\n${contentPayload}`;
-                aiResult = await extractTodosFromContent(prompt, compressedImages);
+                aiResult = await extractTodosFromContent(prompt, compressedImages, 'email', signal, operationBudget);
             }
 
             // 2. Notion Sync (Only if autoSyncToNotion is true)
@@ -228,7 +278,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
 
             // 3. Mark as read if configured
             if (emailConfig.markAsRead) {
-                await invoke('mark_email_read', {
+                await raceWithAbort(invoke('mark_email_read', {
                     host: emailConfig.host,
                     port: emailConfig.port,
                     user: emailConfig.user,
@@ -236,7 +286,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
                     ssl: emailConfig.ssl,
                     folder: folder,
                     uid: email.uid
-                });
+                }), signal);
             }
 
             processedUids.push(fingerprint);
@@ -258,6 +308,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
             };
 
         } catch (e: any) {
+            if (isCancellationError(e)) throw e;
             lastError = typeof e === 'string' ? e : e.message || String(e);
             lastErrorRetryable = isRetryableEmailProcessingError(e);
             logger.error(`Error processing email ${email.uid}`, e);
@@ -269,7 +320,7 @@ async function processSingleEmail(email: FetchedEmail, batchId: string, folder: 
                 break;
             }
             // Add a small delay before retrying a transient failure.
-            await new Promise(r => setTimeout(r, 2000));
+            await sleepForRetry(2_000, signal);
         }
     }
 
@@ -306,6 +357,8 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
     }
 
     scannerStore.resetScanControl();
+    const scanController = new AbortController();
+    activeScanController = scanController;
     scannerStore.setRunning(true);
     scannerStore.setStatus('fetching');
     lastRunTimestamp = Date.now();
@@ -345,12 +398,10 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
             try {
                 scannerStore.setProgressMsg(`拉取目录 ${decodeIMAPFolder(folder)}...`);
                 const sinceDays = isManual ? (emailConfig.manualReadDays || 7) : (emailConfig.autoReadDays || 3);
-                const unreadOnly = isManual
-                    ? (emailConfig.manualUnreadOnly ?? false)
-                    : (emailConfig.autoUnreadOnly ?? true);
+                const scanFilter = resolveEmailScanFilter(isManual);
                 const maxEmailsPerFolder = Math.min(Math.max(emailConfig.maxEmailsPerFolder || 50, 1), 500);
-                const scanScope = unreadOnly ? '仅未读邮件' : '全部邮件';
-                const emails = await invoke('fetch_emails', {
+                const scanScope = describeEmailScanFilter(scanFilter);
+                const emails = await raceWithAbort(invoke('fetch_emails', {
                     request: {
                         host: emailConfig.host,
                         port: emailConfig.port,
@@ -358,11 +409,16 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
                         pass: emailConfig.pass,
                         ssl: emailConfig.ssl,
                         folder,
-                        unreadOnly,
+                        // Keep the legacy field for compatibility with older callers; Rust prefers readState.
+                        unreadOnly: scanFilter.readState === 'unread',
+                        readState: scanFilter.readState,
+                        systemFlags: scanFilter.systemFlags,
+                        keywords: scanFilter.keywords,
+                        excludeKeywords: scanFilter.excludeKeywords,
                         sinceDays,
                         maxEmails: maxEmailsPerFolder
                     }
-                }) as FetchedEmail[];
+                }), scanController.signal) as FetchedEmail[];
 
                 logger.info(`Fetched ${emails.length} recent emails from ${folder}.`);
                 scannerStore.setProgressMsg(`目录 ${decodeIMAPFolder(folder)} | 条件：${scanScope} | 回溯：${sinceDays} 天 | 拉取到 ${emails.length} 封候选邮件`);
@@ -398,7 +454,15 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
 
                     processedCount++;
                     scannerStore.setProgressMsg(`处理中 (${processedCount}/${emails.length}): ${subject}`);
-                    const result = await processSingleEmail(email, batchId, folder, processedUids);
+                    const emailAttempts = Math.max(1, emailConfig.retryCount + 1);
+                    const operationBudget = createOperationBudget({
+                        operationId: `email-${batchId}-${folder}-${email.uid}`,
+                        maxEmailAttempts: Math.min(3, emailAttempts),
+                        // A single email gets a bounded LLM budget instead of multiplying outer retries by inner failover retries.
+                        maxLLMAttempts: Math.max(1, Math.min(6, emailAttempts + 1)),
+                        maxProviderSwitches: Math.max(0, Math.min(2, emailAttempts)),
+                    });
+                    const result = await processSingleEmail(email, batchId, folder, processedUids, scanController.signal, operationBudget);
                     if (result.status === 'failed' && result.retryable === false) {
                         terminalFailureFingerprints.add(fingerprint);
                     }
@@ -432,8 +496,13 @@ export async function forceRunEmailScanner(isManual: boolean = false) {
 
         logger.info("Email scanner batch completed.");
     } catch (e) {
-        logger.error("Failed to run email scanner", e);
+        if (isCancellationError(e)) {
+            logger.info("Email scanner cancellation acknowledged.");
+        } else {
+            logger.error("Failed to run email scanner", e);
+        }
     } finally {
+        if (activeScanController === scanController) activeScanController = null;
         const store = useScannerStore.getState();
         const stopped = store.stopRequested;
         store.setRunning(false);
@@ -460,8 +529,10 @@ export function startEmailScheduler() {
 }
 
 export function stopEmailScheduler() {
+    cancelActiveEmailScan();
     if (timerInterval) {
         clearInterval(timerInterval);
         timerInterval = null;
     }
 }
+

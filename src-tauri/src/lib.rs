@@ -6,14 +6,17 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
 use std::{ptr, slice};
-use tauri::Emitter;
+use tauri::{Emitter, State};
 
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -30,6 +33,75 @@ use imap_cmds::{fetch_emails, get_email_folders, mark_email_read};
 
 struct AppState {
     is_recording: AtomicBool,
+}
+
+#[derive(Default)]
+struct CustomLlmState {
+    cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl CustomLlmState {
+    fn register(&self, request_id: Option<&str>) -> Result<Option<Arc<AtomicBool>>, String> {
+        let Some(request_id) = request_id.filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        validate_custom_correlation_id(request_id, "requestId")?;
+        let mut cancellations = self
+            .cancellations
+            .lock()
+            .map_err(|_| "自定义供应商取消注册表不可用".to_string())?;
+        if cancellations.contains_key(request_id) {
+            return Err("自定义供应商 requestId 已在使用".to_string());
+        }
+        if cancellations.len() >= MAX_ACTIVE_CUSTOM_LLM_REQUESTS {
+            return Err("自定义供应商并发请求过多，请稍后重试".to_string());
+        }
+        let token = Arc::new(AtomicBool::new(false));
+        cancellations.insert(request_id.to_string(), token.clone());
+        Ok(Some(token))
+    }
+
+    fn cancel(&self, request_id: &str) -> Result<bool, String> {
+        let cancellations = self
+            .cancellations
+            .lock()
+            .map_err(|_| "自定义供应商取消注册表不可用".to_string())?;
+        if let Some(token) = cancellations.get(request_id) {
+            token.store(true, Ordering::SeqCst);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn remove(&self, request_id: Option<&str>) {
+        if let Some(request_id) = request_id.filter(|value| !value.is_empty()) {
+            if let Ok(mut cancellations) = self.cancellations.lock() {
+                cancellations.remove(request_id);
+            }
+        }
+    }
+}
+
+async fn await_with_custom_cancellation<F, T>(
+    future: F,
+    cancellation: Option<&Arc<AtomicBool>>,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    let Some(cancellation) = cancellation else {
+        return future.await;
+    };
+    tokio::pin!(future);
+    loop {
+        if cancellation.load(Ordering::SeqCst) {
+            return Err("自定义供应商请求已取消".to_string());
+        }
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+    }
 }
 
 fn app_data_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -311,11 +383,203 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Invalid data format");
     }
+
+    #[test]
+    fn custom_llm_transport_limits_and_timeout_validation_are_enforced() {
+        assert!(validate_custom_llm_request_size(MAX_CUSTOM_LLM_REQUEST_BYTES).is_ok());
+        assert!(validate_custom_llm_request_size(MAX_CUSTOM_LLM_REQUEST_BYTES + 1).is_err());
+        assert!(validate_custom_llm_response_size(MAX_CUSTOM_LLM_RESPONSE_BYTES).is_ok());
+        assert!(validate_custom_llm_response_size(MAX_CUSTOM_LLM_RESPONSE_BYTES + 1).is_err());
+        assert!(resolve_custom_timeout_ms(Some(99), 15_000, "连接超时").is_err());
+        assert!(
+            resolve_custom_timeout_ms(Some(CUSTOM_LLM_MAX_TIMEOUT_MS + 1), 15_000, "总超时")
+                .is_err()
+        );
+        assert_eq!(
+            resolve_custom_timeout_ms(None, 15_000, "连接超时").unwrap(),
+            15_000
+        );
+    }
+
+    #[test]
+    fn custom_llm_cancellation_registry_rejects_duplicates_and_cleans_up() {
+        let state = CustomLlmState::default();
+        let request_id = "request-1";
+        let token = state
+            .register(Some(request_id))
+            .unwrap()
+            .expect("token should be registered");
+        assert!(!token.load(Ordering::SeqCst));
+        assert_eq!(state.cancel(request_id).unwrap(), true);
+        assert!(token.load(Ordering::SeqCst));
+        assert_eq!(
+            state.register(Some(request_id)).unwrap_err(),
+            "自定义供应商 requestId 已在使用"
+        );
+
+        state.remove(Some(request_id));
+        assert_eq!(state.cancel(request_id).unwrap(), false);
+        assert!(state.register(Some(request_id)).is_ok());
+    }
+
+    #[test]
+    fn custom_llm_cancellation_registry_accepts_missing_id_and_rejects_long_id() {
+        let state = CustomLlmState::default();
+        assert!(state.register(None).unwrap().is_none());
+        assert_eq!(state.cancel("unknown-request").unwrap(), false);
+        let too_long = "x".repeat(121);
+        assert_eq!(
+            state.register(Some(&too_long)).unwrap_err(),
+            "自定义供应商 requestId 过长"
+        );
+    }
+    fn spawn_delayed_custom_llm_server(
+        delay: std::time::Duration,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("mock server should accept request");
+            let mut buffer = [0_u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buffer);
+
+            std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n",
+            )
+            .expect("mock server should write headers");
+            std::thread::sleep(delay);
+            let _ = std::io::Write::write_all(&mut stream, b"{}");
+        });
+        (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    fn mock_custom_llm_request(
+        url: String,
+        request_id: &str,
+        first_byte_timeout_ms: u64,
+    ) -> CustomLlmRequest {
+        CustomLlmRequest {
+            url,
+            api_key: "test-key".to_string(),
+            payload: serde_json::json!({"model":"test","messages":[]}),
+            timeout_policy: Some(CustomLlmTimeoutPolicy {
+                connect_timeout_ms: Some(1_000),
+                first_byte_timeout_ms: Some(first_byte_timeout_ms),
+                total_timeout_ms: Some(2_000),
+            }),
+            request_id: Some(request_id.to_string()),
+            trace_id: Some("trace-test".to_string()),
+        }
+    }
+
+    #[test]
+    fn custom_llm_first_byte_timeout_is_enforced_against_mock_server() {
+        tauri::async_runtime::block_on(async {
+            let (url, server) =
+                spawn_delayed_custom_llm_server(std::time::Duration::from_millis(300));
+            let result = request_custom_llm_inner(
+                mock_custom_llm_request(url, "first-byte-test", 100),
+                None,
+            )
+            .await;
+            assert!(result.unwrap_err().contains("阶段：first_byte"));
+            server.join().expect("mock server should finish");
+        });
+    }
+
+    #[test]
+    fn custom_llm_cancellation_stops_waiting_for_a_mock_response_body() {
+        tauri::async_runtime::block_on(async {
+            let (url, server) =
+                spawn_delayed_custom_llm_server(std::time::Duration::from_millis(300));
+            let token = Arc::new(AtomicBool::new(false));
+            let token_for_task = token.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                token_for_task.store(true, Ordering::SeqCst);
+            });
+            let result = request_custom_llm_inner(
+                mock_custom_llm_request(url, "cancel-test", 1_000),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), "自定义供应商请求已取消");
+            server.join().expect("mock server should finish");
+        });
+    }
+
+    #[test]
+    fn custom_llm_total_timeout_is_enforced_after_response_headers() {
+        tauri::async_runtime::block_on(async {
+            let (url, server) =
+                spawn_delayed_custom_llm_server(std::time::Duration::from_millis(300));
+            let mut request = mock_custom_llm_request(url, "total-timeout-test", 1_000);
+            request.timeout_policy.as_mut().unwrap().total_timeout_ms = Some(100);
+            let result = request_custom_llm_inner(request, None).await;
+            assert!(result.unwrap_err().contains("阶段：total"));
+            server.join().expect("mock server should finish");
+        });
+    }
+    #[test]
+    fn custom_llm_response_serializes_non_secret_correlation_ids() {
+        let response = CustomLlmResponse {
+            status: 200,
+            body: "{}".to_string(),
+            headers: HashMap::new(),
+            request_id: Some("request-1".to_string()),
+            trace_id: Some("trace-1".to_string()),
+        };
+        let json = serde_json::to_value(response).expect("response should serialize");
+        assert_eq!(json["requestId"], "request-1");
+        assert_eq!(json["traceId"], "trace-1");
+        assert!(json.get("apiKey").is_none());
+    }
+
+    #[test]
+    fn custom_llm_registry_enforces_capacity_and_safe_request_ids() {
+        let state = CustomLlmState::default();
+        for index in 0..MAX_ACTIVE_CUSTOM_LLM_REQUESTS {
+            state.register(Some(&format!("request-{index}"))).unwrap();
+        }
+        assert_eq!(
+            state.register(Some("request-overflow")).unwrap_err(),
+            "自定义供应商并发请求过多，请稍后重试"
+        );
+        assert_eq!(
+            state.register(Some("bad\nrequest")).unwrap_err(),
+            "自定义供应商 requestId 包含非法字符"
+        );
+        assert_eq!(
+            validate_custom_correlation_id("bad\ntrace", "traceId").unwrap_err(),
+            "自定义供应商 traceId 包含非法字符"
+        );
+        assert_eq!(
+            annotate_custom_llm_error(Some("bad\nrequest"), Some("trace-1"), "boom".to_string()),
+            "boom"
+        );
+        assert_eq!(
+            annotate_custom_llm_error(Some("request-1"), Some("trace-1"), "boom".to_string()),
+            "[custom-llm requestId=request-1 traceId=trace-1] boom"
+        );
+    }
 }
 
+const MAX_ACTIVE_CUSTOM_LLM_REQUESTS: usize = 64;
 const MAX_CUSTOM_LLM_REQUEST_BYTES: usize = 5 * 1024 * 1024;
 const MAX_CUSTOM_LLM_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-const CUSTOM_LLM_REQUEST_TIMEOUT_SECS: u64 = 3 * 60;
+const CUSTOM_LLM_REQUEST_TIMEOUT_SECS: u64 = 180;
+const CUSTOM_LLM_MAX_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomLlmTimeoutPolicy {
+    connect_timeout_ms: Option<u64>,
+    first_byte_timeout_ms: Option<u64>,
+    total_timeout_ms: Option<u64>,
+}
 
 #[derive(Debug, Deserialize)]
 struct CustomLlmRequest {
@@ -323,12 +587,85 @@ struct CustomLlmRequest {
     #[serde(rename = "apiKey")]
     api_key: String,
     payload: serde_json::Value,
+    #[serde(rename = "timeoutPolicy")]
+    timeout_policy: Option<CustomLlmTimeoutPolicy>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
+    #[serde(rename = "traceId")]
+    trace_id: Option<String>,
+}
+
+fn validate_custom_llm_request_size(size: usize) -> Result<(), String> {
+    if size > MAX_CUSTOM_LLM_REQUEST_BYTES {
+        return Err("自定义供应商请求体超过 5 MB 限制".to_string());
+    }
+    Ok(())
+}
+
+fn validate_custom_llm_response_size(size: usize) -> Result<(), String> {
+    if size > MAX_CUSTOM_LLM_RESPONSE_BYTES {
+        return Err("自定义供应商响应超过 10 MB 限制".to_string());
+    }
+    Ok(())
+}
+
+fn is_safe_custom_correlation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 120
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
+}
+
+fn validate_custom_correlation_id(value: &str, field_name: &str) -> Result<(), String> {
+    if value.len() > 120 {
+        return Err(format!("自定义供应商 {field_name} 过长"));
+    }
+    if !is_safe_custom_correlation_id(value) {
+        return Err(format!("自定义供应商 {field_name} 包含非法字符"));
+    }
+    Ok(())
+}
+
+fn annotate_custom_llm_error(
+    request_id: Option<&str>,
+    trace_id: Option<&str>,
+    error: String,
+) -> String {
+    match request_id.filter(|value| is_safe_custom_correlation_id(value)) {
+        Some(request_id) => match trace_id.filter(|value| is_safe_custom_correlation_id(value)) {
+            Some(trace_id) => {
+                format!("[custom-llm requestId={request_id} traceId={trace_id}] {error}")
+            }
+            None => format!("[custom-llm requestId={request_id}] {error}"),
+        },
+        None => error,
+    }
+}
+
+fn resolve_custom_timeout_ms(
+    value: Option<u64>,
+    default_ms: u64,
+    field_name: &str,
+) -> Result<u64, String> {
+    let timeout_ms = value.unwrap_or(default_ms);
+    if !(100..=CUSTOM_LLM_MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(format!(
+            "自定义供应商 {field_name} 必须在 100~{} 毫秒范围内",
+            CUSTOM_LLM_MAX_TIMEOUT_MS
+        ));
+    }
+    Ok(timeout_ms)
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CustomLlmResponse {
     status: u16,
     body: String,
+    headers: HashMap<String, String>,
+    request_id: Option<String>,
+    trace_id: Option<String>,
 }
 
 fn is_non_public_ip(ip: IpAddr) -> bool {
@@ -369,22 +706,29 @@ fn is_non_public_ip(ip: IpAddr) -> bool {
 fn validate_custom_provider_url(raw_url: &str) -> Result<url::Url, String> {
     let url =
         url::Url::parse(raw_url).map_err(|error| format!("自定义供应商 URL 无效: {error}"))?;
-    if url.scheme() != "https" {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "自定义供应商 URL 缺少主机名".to_string())?;
+    let normalized_host = host.to_ascii_lowercase();
+    // Local HTTP is accepted only by code compiled for unit tests so the Rust
+    // transport can exercise actual TTFB/cancellation behavior without
+    // weakening the production HTTPS/SSRF policy.
+    let test_loopback = cfg!(test)
+        && url.scheme() == "http"
+        && matches!(normalized_host.as_str(), "127.0.0.1" | "::1");
+    if url.scheme() != "https" && !test_loopback {
         return Err("自定义供应商只允许使用 HTTPS URL".to_string());
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("自定义供应商 URL 不允许包含用户名或密码".to_string());
     }
 
-    let host = url
-        .host_str()
-        .ok_or_else(|| "自定义供应商 URL 缺少主机名".to_string())?;
-    let normalized_host = host.to_ascii_lowercase();
-    if normalized_host == "localhost" || normalized_host.ends_with(".localhost") {
+    if (normalized_host == "localhost" || normalized_host.ends_with(".localhost")) && !test_loopback
+    {
         return Err("自定义供应商不允许访问 localhost".to_string());
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_non_public_ip(ip) {
+        if is_non_public_ip(ip) && !test_loopback {
             return Err("自定义供应商不允许访问本地或内网 IP 地址".to_string());
         }
     }
@@ -393,17 +737,33 @@ fn validate_custom_provider_url(raw_url: &str) -> Result<url::Url, String> {
 }
 
 fn resolve_public_socket(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let addresses = (host, port)
+    let mut addresses = (host, port)
         .to_socket_addrs()
         .map_err(|error| format!("无法解析自定义供应商域名: {error}"))?;
     addresses
-        .filter(|address| !is_non_public_ip(address.ip()))
-        .find(|address| !is_non_public_ip(address.ip()))
+        .find(|address| cfg!(test) || !is_non_public_ip(address.ip()))
         .ok_or_else(|| "自定义供应商域名解析到了本地或内网地址，已阻止请求".to_string())
 }
 
-#[tauri::command]
-async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmResponse, String> {
+fn allowed_response_headers(response: &reqwest::Response) -> HashMap<String, String> {
+    ["retry-after", "content-type", "x-request-id"]
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+async fn request_custom_llm_inner(
+    request: CustomLlmRequest,
+    cancellation: Option<&Arc<AtomicBool>>,
+) -> Result<CustomLlmResponse, String> {
+    let request_id = request.request_id.clone();
+    let trace_id = request.trace_id.clone();
     let url = validate_custom_provider_url(&request.url)?;
     let host = url
         .host_str()
@@ -414,9 +774,20 @@ async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmRespon
         .ok_or_else(|| "自定义供应商 URL 缺少有效端口".to_string())?;
     let payload_bytes = serde_json::to_vec(&request.payload)
         .map_err(|error| format!("请求数据序列化失败: {error}"))?;
-    if payload_bytes.len() > MAX_CUSTOM_LLM_REQUEST_BYTES {
-        return Err("自定义供应商请求体超过 5 MB 限制".to_string());
-    }
+    validate_custom_llm_request_size(payload_bytes.len())?;
+    let (connect_timeout_ms, first_byte_timeout_ms, total_timeout_ms) =
+        match request.timeout_policy.as_ref() {
+            Some(policy) => (
+                resolve_custom_timeout_ms(policy.connect_timeout_ms, 60_000, "连接超时")?,
+                resolve_custom_timeout_ms(policy.first_byte_timeout_ms, 60_000, "首字节超时")?,
+                resolve_custom_timeout_ms(
+                    policy.total_timeout_ms,
+                    CUSTOM_LLM_REQUEST_TIMEOUT_SECS * 1_000,
+                    "总超时",
+                )?,
+            ),
+            None => (60_000, 60_000, CUSTOM_LLM_REQUEST_TIMEOUT_SECS * 1_000),
+        };
 
     let socket = tauri::async_runtime::spawn_blocking({
         let host = host.clone();
@@ -424,34 +795,40 @@ async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmRespon
     })
     .await
     .map_err(|error| format!("域名解析任务失败: {error}"))??;
+    if cancellation.is_some_and(|token| token.load(Ordering::SeqCst)) {
+        return Err("自定义供应商请求已取消".to_string());
+    }
 
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(
-            CUSTOM_LLM_REQUEST_TIMEOUT_SECS,
-        ))
+        .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms))
+        .timeout(std::time::Duration::from_millis(total_timeout_ms))
         .redirect(reqwest::redirect::Policy::none())
         .resolve(&host, socket)
         .build()
         .map_err(|error| format!("创建自定义供应商 HTTP 客户端失败: {error}"))?;
 
-    let response = client
-        .post(url)
-        .bearer_auth(request.api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(payload_bytes)
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                format!(
-                    "自定义供应商请求超时（{} 秒）",
-                    CUSTOM_LLM_REQUEST_TIMEOUT_SECS
-                )
-            } else {
-                format!("自定义供应商网络请求失败: {error}")
-            }
-        })?;
+    let response = await_with_custom_cancellation(
+        async {
+            client
+                .post(url)
+                .bearer_auth(request.api_key)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(payload_bytes)
+                .send()
+                .await
+                .map_err(|error| {
+                    if error.is_timeout() && error.is_connect() {
+                        "自定义供应商请求超时（阶段：connect）".to_string()
+                    } else if error.is_timeout() {
+                        "自定义供应商请求超时（阶段：total）".to_string()
+                    } else {
+                        format!("自定义供应商网络请求失败: {error}")
+                    }
+                })
+        },
+        cancellation,
+    )
+    .await?;
 
     if response
         .content_length()
@@ -461,17 +838,90 @@ async fn request_custom_llm(request: CustomLlmRequest) -> Result<CustomLlmRespon
     }
 
     let status = response.status().as_u16();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| format!("读取自定义供应商响应失败: {error}"))?;
-    if body.len() > MAX_CUSTOM_LLM_RESPONSE_BYTES {
-        return Err("自定义供应商响应超过 10 MB 限制".to_string());
+    let headers = allowed_response_headers(&response);
+    let mut response_stream = response;
+    let mut body = Vec::new();
+    let first_chunk = tokio::time::timeout(
+        std::time::Duration::from_millis(first_byte_timeout_ms),
+        await_with_custom_cancellation(
+            async {
+                response_stream.chunk().await.map_err(|error| {
+                    if error.is_timeout() {
+                        "自定义供应商请求超时（阶段：total）".to_string()
+                    } else {
+                        format!("读取自定义供应商首字节失败: {error}")
+                    }
+                })
+            },
+            cancellation,
+        ),
+    )
+    .await
+    .map_err(|_| "自定义供应商请求超时（阶段：first_byte）".to_string())??;
+
+    if let Some(chunk) = first_chunk {
+        if body.len().saturating_add(chunk.len()) > MAX_CUSTOM_LLM_RESPONSE_BYTES {
+            return Err("自定义供应商响应超过 10 MB 限制".to_string());
+        }
+        body.extend_from_slice(&chunk);
     }
 
-    let body = String::from_utf8(body.to_vec())
-        .map_err(|_| "自定义供应商响应不是有效 UTF-8 文本".to_string())?;
-    Ok(CustomLlmResponse { status, body })
+    while let Some(chunk) = await_with_custom_cancellation(
+        async {
+            response_stream.chunk().await.map_err(|error| {
+                if error.is_timeout() {
+                    "自定义供应商请求超时（阶段：total）".to_string()
+                } else {
+                    format!("读取自定义供应商响应失败: {error}")
+                }
+            })
+        },
+        cancellation,
+    )
+    .await?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_CUSTOM_LLM_RESPONSE_BYTES {
+            return Err("自定义供应商响应超过 10 MB 限制".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    validate_custom_llm_response_size(body.len())?;
+
+    let body =
+        String::from_utf8(body).map_err(|_| "自定义供应商响应不是有效 UTF-8 文本".to_string())?;
+    Ok(CustomLlmResponse {
+        status,
+        body,
+        headers,
+        request_id,
+        trace_id,
+    })
+}
+
+#[tauri::command]
+async fn request_custom_llm(
+    request: CustomLlmRequest,
+    state: State<'_, CustomLlmState>,
+) -> Result<CustomLlmResponse, String> {
+    let request_id = request.request_id.clone();
+    let trace_id = request.trace_id.clone();
+    if let Some(trace_id) = trace_id.as_deref() {
+        validate_custom_correlation_id(trace_id, "traceId")
+            .map_err(|error| annotate_custom_llm_error(request_id.as_deref(), None, error))?;
+    }
+    let cancellation = state.register(request_id.as_deref()).map_err(|error| {
+        annotate_custom_llm_error(request_id.as_deref(), trace_id.as_deref(), error)
+    })?;
+    let result = request_custom_llm_inner(request, cancellation.as_ref()).await;
+    state.remove(request_id.as_deref());
+    result.map_err(|error| {
+        annotate_custom_llm_error(request_id.as_deref(), trace_id.as_deref(), error)
+    })
+}
+
+#[tauri::command]
+fn cancel_custom_llm(request_id: String, state: State<'_, CustomLlmState>) -> Result<bool, String> {
+    state.cancel(request_id.trim())
 }
 
 #[tauri::command]
@@ -766,7 +1216,11 @@ fn read_dropped_file(path: &std::path::Path) -> Result<NativeDroppedFile, String
     })
 }
 
-fn emit_native_file_drop_event<R: tauri::Runtime>(window: &tauri::Window<R>, event_type: &'static str, paths: &[PathBuf]) {
+fn emit_native_file_drop_event<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    event_type: &'static str,
+    paths: &[PathBuf],
+) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
 
@@ -796,6 +1250,22 @@ fn toggle_main_window(app: &tauri::AppHandle) {
         return;
     };
 
+    // A minimized window can still be visible, so restore it before applying
+    // the normal visible/hidden toggle behavior.
+    match window.is_minimized() {
+        Ok(true) => {
+            for operation in [window.unminimize(), window.show(), window.set_focus()] {
+                if let Err(error) = operation {
+                    eprintln!("无法恢复主窗口: {error}");
+                    break;
+                }
+            }
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => eprintln!("无法读取主窗口最小化状态: {error}"),
+    }
+
     match window.is_visible() {
         Ok(true) => {
             if let Err(error) = window.hide() {
@@ -803,7 +1273,7 @@ fn toggle_main_window(app: &tauri::AppHandle) {
             }
         }
         Ok(false) => {
-            for operation in [window.unminimize(), window.show(), window.set_focus()] {
+            for operation in [window.show(), window.set_focus()] {
                 if let Err(error) = operation {
                     eprintln!("无法显示主窗口: {error}");
                     break;
@@ -860,7 +1330,8 @@ pub fn run() {
             get_email_folders,
             fetch_emails,
             mark_email_read,
-            request_custom_llm
+            request_custom_llm,
+            cancel_custom_llm
         ])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -882,6 +1353,7 @@ pub fn run() {
             app.manage(AppState {
                 is_recording: AtomicBool::new(false),
             });
+            app.manage(CustomLlmState::default());
 
             let alt_space = Shortcut::new(Some(Modifiers::ALT), Code::Space);
             let _ = app.global_shortcut().register(alt_space);
@@ -918,4 +1390,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-

@@ -1,4 +1,3 @@
-import '@wdio/globals/types'
 import { describe, it } from 'mocha'
 import { expect } from '@wdio/globals'
 

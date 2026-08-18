@@ -1,4 +1,5 @@
 import type { AIResult, PositiveFeedbackStatus, TodoItem } from './ai'
+import type { AutoOptimizeOutcome } from './autoOptimize'
 
 export interface PositiveFeedbackSnapshot {
   originalTodos: TodoItem[]
@@ -79,7 +80,7 @@ export function shouldStartPositiveFeedbackLearning(
 }
 
 
-export async function runPositiveFeedbackLearning(snapshot: PositiveFeedbackSnapshot): Promise<'updated' | 'unchanged' | 'skipped'> {
+export async function runPositiveFeedbackLearning(snapshot: PositiveFeedbackSnapshot): Promise<AutoOptimizeOutcome> {
   const { backgroundReviewAndUpdateFocus } = await import('./autoOptimize')
   return backgroundReviewAndUpdateFocus(snapshot.originalTodos, snapshot.acceptedTodos)
 }
