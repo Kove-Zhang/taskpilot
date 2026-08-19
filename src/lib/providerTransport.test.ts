@@ -43,12 +43,15 @@ describe('provider transport', () => {
   })
 
   it('keeps built-in providers on the Tauri HTTP path', async () => {
-    await expect(requestProviderChatCompletion({
+    const response = await requestProviderChatCompletion({
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'test-key',
       payload: { model: 'gpt-4o', messages: [] },
-    })).resolves.toMatchObject({ ok: true })
+    })
 
+    expect(response).toMatchObject({ ok: true })
+    expect(response.transportDiagnostics).toMatchObject({ transport: 'tauri-http' })
+    expect(response.transportDiagnostics?.responseHeadersMs).toEqual(expect.any(Number))
     expect(invoke).not.toHaveBeenCalled()
   })
 
@@ -70,6 +73,7 @@ describe('provider transport', () => {
     expect(response.headers?.get('retry-after')).toBe('7')
     expect(response.headers?.get('content-type')).toBe('application/json')
     expect(response.headers?.get('x-request-id')).toBe('req-123')
+    expect(response.transportDiagnostics).toEqual({ transport: 'custom-rust' })
     expect(invoke).toHaveBeenCalledWith('request_custom_llm', expect.objectContaining({
       request: expect.objectContaining({
         url: 'https://llm-wnbr8ptlsrxha0tp.cn-beijing.maas.aliyuncs.com/cp/chat/completions',

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useRef, useEffect} from 'react'
 import type { ClipboardEvent, ChangeEvent, DragEvent} from 'react'
-import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail, Minus, Maximize2, AlertTriangle} from 'lucide-react'
+import { Sparkles, Image as ImageIcon, FileText, Settings, Send, Loader2, X, Check, Clock, Wand2, PlusSquare, Mail, Minus, Maximize2, AlertTriangle, RefreshCw} from 'lucide-react'
 import { startEmailScheduler, stopEmailScheduler} from './lib/emailScheduler'
 import { extractTodosFromContent, generateWriting} from './lib/ai'
 import type { AIResult} from './lib/ai'
@@ -45,6 +45,7 @@ export default function App() {
   const [showFeedback, setShowFeedback] = useState(false)
   const [feedbackText, setFeedbackText] = useState('')
   const [notionRecovery, setNotionRecovery] = useState<{ todoIds: string[]; message: string; isOpen: boolean} | null>(null)
+  const [notionResyncConfirmation, setNotionResyncConfirmation] = useState<{ todoIds: string[]; isOpen: boolean} | null>(null)
   const { notionProperties, fieldMappings, isWindowMode, globalShortcut} = useSettingsStore()
   const activeFields = notionProperties?.filter(p => fieldMappings[p.id]?.enabled).sort((a, b) => {
     const orderA = fieldMappings[a.id]?.order ?? 999;
@@ -472,11 +473,11 @@ ${text}
     if (shouldLearn) startPositiveFeedbackLearning(result.id || '', learningSnapshot);
 }
 
-  const handleSyncNotion = async (forceTodoIds?: string[]) => {
+  const handleSyncNotion = async (forceTodoIds?: string[], manualResync = false) => {
     if (!result || result.todos.length === 0) return;
 
     const pendingVerificationIds = notionRecovery?.todoIds || result.notionSync?.uncertainTodoIds || [];
-    if (!forceTodoIds && pendingVerificationIds.length > 0) {
+    if (!manualResync && !forceTodoIds && pendingVerificationIds.length > 0) {
       const uncertainTitles = result.todos
         .filter(todo => pendingVerificationIds.includes(todo.id))
         .map(todo => `「${todo.title || todo.id}」`)
@@ -492,8 +493,7 @@ ${text}
     const forceIdSet = forceTodoIds ? new Set(forceTodoIds) : null;
     const selectedTodos = result.todos.filter(todo => (
       todo.selected !== false &&
-      !todo.synced &&
-      (!forceIdSet || forceIdSet.has(todo.id))
+      (manualResync ? (!forceIdSet || forceIdSet.has(todo.id)) : !todo.synced && (!forceIdSet || forceIdSet.has(todo.id)))
     ));
     if (selectedTodos.length === 0) {
       setError("当前没有可同步的待办事项：您选中的条目可能已全部同步至 Notion，或未勾选任何有效事项。");
@@ -517,19 +517,24 @@ ${text}
       ),
   };
     setResult(syncingResult);
-    logger.info('Syncing to Notion...', { count: selectedTodos.length, forced: !!forceTodoIds});
+    logger.info('Syncing to Notion...', { count: selectedTodos.length, forced: !!forceTodoIds, manualResync});
     try {
-      const syncResults = await syncToNotion(
-        selectedTodos,
-        forceTodoIds ? { forceTodoIds} : undefined,
-      );
+      const syncResults = await syncToNotion(selectedTodos, {
+        ...(forceTodoIds ? { forceTodoIds } : {}),
+        ...(manualResync ? { manualResync: true } : {}),
+      });
 
       const failed = syncResults.filter(r => !r.success);
       const succeeded = syncResults.filter(r => r.success);
       const uncertainResults = failed.filter(item => item.needsVerification);
       const succeededIds = new Set(succeeded.map((item) => item.id));
+      const failedIds = new Set(failed.map((item) => item.id));
       const todos = result.todos.map(todo => (
-        succeededIds.has(todo.id) ? { ...todo, synced: true} : todo
+        succeededIds.has(todo.id)
+          ? { ...todo, synced: true }
+          : failedIds.has(todo.id)
+            ? { ...todo, synced: false }
+            : todo
       ));
       const selectedResultTodos = todos.filter(todo => todo.selected !== false);
       const shouldTrackLearning = shouldLearnAfterSync && succeeded.length > 0;
@@ -599,6 +604,24 @@ ${text}
   }
 }
 
+  const openManualNotionResync = () => {
+    if (!result) return;
+    const todoIds = result.todos
+      .filter(todo => todo.selected !== false)
+      .map(todo => todo.id);
+    if (todoIds.length === 0) {
+      setError('当前没有选中的待办事项可再次同步。');
+      return;
+    }
+    setNotionResyncConfirmation({ todoIds, isOpen: true });
+  };
+
+  const confirmManualNotionResync = async () => {
+    if (!notionResyncConfirmation) return;
+    const todoIds = notionResyncConfirmation.todoIds;
+    setNotionResyncConfirmation(null);
+    await handleSyncNotion(todoIds, true);
+  };
   const handleMarkNotionRecovery = async () => {
     if (!notionRecovery) return;
     const todoIds = notionRecovery.todoIds;
@@ -717,6 +740,8 @@ ${text}
   const notionStatusLabel = getNotionSyncStatusLabel(result?.notionSync);
   const notionButtonLabel = getNotionSyncButtonLabel(result?.notionSync, !!notionRecovery, !!result?.syncedToNotion);
   const selectedSyncTodoCount = result?.todos.filter(todo => todo.selected !== false && !todo.synced).length || 0;
+  const selectedNotionTodoCount = result?.todos.filter(todo => todo.selected !== false).length || 0;
+  const canManuallyResyncNotion = notionStatus === 'success' && selectedNotionTodoCount > 0 && !syncing;
   const hasPendingVerification = !!notionRecovery || notionStatus === 'needs_verification';
   const notionStatusClass = notionStatus === 'success'
     ? 'bg-green-500/15 text-green-300 border-green-500/30'
@@ -738,7 +763,6 @@ ${text}
     >
       <div
         className="min-h-[100vh] w-full overflow-y-auto custom-scrollbar flex flex-col items-center justify-center p-4 sm:p-8"
-        onClick={async () => { if (!isWindowMode) await getCurrentWindow().hide()}}
       >
         {isWindowMode && (
           <>
@@ -998,6 +1022,17 @@ ${text}
                       {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : notionStatus === 'success' ? <Check className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
                       <span>{notionButtonLabel}</span>
                     </button>
+                    {notionStatus === 'success' && (
+                      <button
+                        onClick={openManualNotionResync}
+                        disabled={!canManuallyResyncNotion}
+                        title="上次同步已返回成功；如果 Notion 中找不到记录，可确认后再次创建"
+                        className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm font-medium text-amber-200 transition-all hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                        <span>再次同步</span>
+                      </button>
+                    )}
                   </>
                 )}
               </div>
@@ -1132,6 +1167,49 @@ ${text}
       {showHistory && <Suspense fallback={<PanelLoading />}><HistoryPanel onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} /></Suspense>}
       {showEmailHistory && <Suspense fallback={<PanelLoading />}><EmailTasksPanel onClose={() => setShowEmailHistory(false)} /></Suspense>}
 
+      {notionResyncConfirmation?.isOpen && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          onClick={(event) => {
+            event.stopPropagation();
+            setNotionResyncConfirmation(null);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="notion-resync-title"
+            className="w-full max-w-lg rounded-xl border border-amber-500/30 bg-slate-900 p-6 shadow-2xl"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="mb-4 flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+              <div>
+                <h3 id="notion-resync-title" className="text-lg font-semibold text-white">确认再次同步到 Notion</h3>
+                <p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-300">
+                  上次同步已返回成功，但如果您在 Notion 中找不到对应记录，可以再次发送。
+                  {'\n\n'}再次同步可能创建重复页面，请仅在确认原记录确实不存在时继续。
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setNotionResyncConfirmation(null)}
+                className="rounded-md bg-white/5 px-4 py-2 text-sm text-slate-300 transition-colors hover:bg-white/10 hover:text-white"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => void confirmManualNotionResync()}
+                disabled={syncing}
+                className="rounded-md bg-orange-600 px-4 py-2 text-sm text-white shadow-lg shadow-orange-500/20 transition-colors hover:bg-orange-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                确认再次同步
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {notionRecovery?.isOpen && (
         <div
           className="fixed inset-0 z-[110] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"

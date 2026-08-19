@@ -18,8 +18,9 @@ export interface SyncResult {
 export interface SyncOptions {
   /** Todo IDs explicitly confirmed by the user for a force retry. */
   forceTodoIds?: string[]
+  /** Explicit user-confirmed resync after a previous successful sync. */
+  manualResync?: boolean
 }
-
 type NotionPropertyValue = Record<string, unknown>
 type SyncState = 'pending' | 'succeeded' | 'unknown'
 
@@ -182,8 +183,16 @@ async function syncOne(todo: TodoItem, options: SyncOptions = {}): Promise<SyncR
   const existing = records[recordKey]
   const forceRetry = options.forceTodoIds?.includes(todo.id) ?? false
 
-  if (existing?.fingerprint === fingerprint && existing.state === 'succeeded') {
+  if (existing?.fingerprint === fingerprint && existing.state === 'succeeded' && !options.manualResync) {
     return { id: todo.id, success: true, pageId: existing.pageId, skipped: true }
+  }
+
+  // A manual resync is explicitly confirmed by the user after a successful
+  // result was not visible in Notion. Clear the successful idempotency record
+  // so the POST is actually sent again instead of being skipped.
+  if (options.manualResync && existing?.fingerprint === fingerprint && existing.state === 'succeeded') {
+    delete records[recordKey]
+    await writeSyncRecords(records)
   }
   if (existing?.fingerprint === fingerprint && (existing.state === 'pending' || existing.state === 'unknown') && !forceRetry) {
     return {

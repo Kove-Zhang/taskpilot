@@ -4,7 +4,7 @@ import { useSettingsStore, getSortedLLMProviders, type EmailConfig, type EmailSc
 import { assertValidProviderProfile, createProviderProfileFromLegacy } from './lib/llm/providerProfiles'
 import { hasProviderAdapter } from './lib/llm/adapterRegistry'
 import type { ProviderProfile } from './lib/llm/types'
-import { getProviderProbeFingerprint, runProviderProbe } from './lib/llm/providerProbe'
+import { getProviderProbeFingerprint, runProviderProbe, type ProviderProbeDiagnostics } from './lib/llm/providerProbe'
 import { llmEventStore, type ProviderHealthSummary } from './lib/llm/events'
 import { buildReleaseBaselineReport, formatReleaseBaselineReport, type ReleaseBaselineFormat } from './lib/releaseBaseline'
 import { callAIWithFailover } from './lib/ai'
@@ -54,6 +54,19 @@ function safeProviderHost(baseUrl: string): string {
   try { return new URL(baseUrl).host || '[invalid-url]' } catch { return '[invalid-url]' }
 }
 
+function formatProbeDiagnostics(diagnostics: ProviderProbeDiagnostics | undefined): string {
+  if (!diagnostics) return ''
+  const transport = diagnostics.transport === 'tauri-http' ? 'Tauri HTTP' : '原生 Rust'
+  const parts = [transport]
+  if (diagnostics.responseHeadersMs !== undefined) parts.push(`响应头 ${diagnostics.responseHeadersMs}ms`)
+  if (diagnostics.failureStage === 'before_response_headers') parts.push('响应头前失败')
+  if (diagnostics.failureStage === 'response_validation') parts.push('响应校验失败')
+  if (diagnostics.timeoutPhase) parts.push(`超时阶段 ${diagnostics.timeoutPhase}`)
+  if (diagnostics.errorCategory) parts.push(`分类 ${diagnostics.errorCategory}`)
+  parts.push(`总计 ${diagnostics.totalMs}ms`)
+  return parts.join(' · ')
+}
+
 function formatCooldownRemaining(cooldownUntil?: number): string | null {
   if (!cooldownUntil) return null
   const remainingMs = cooldownUntil - Date.now()
@@ -100,8 +113,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   const [showFailoverGuide, setShowFailoverGuide] = useState<boolean>(false);
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [testingStructuredProviderId, setTestingStructuredProviderId] = useState<string | null>(null);
-  const [providerTestResults, setProviderTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string; fingerprint?: string }>>({});
-  const [structuredTestResults, setStructuredTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string; detected?: 'json_object' | 'json_schema'; fingerprint?: string }>>({});
+  const [providerTestResults, setProviderTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string; fingerprint?: string; diagnostics?: ProviderProbeDiagnostics }>>({});
+  const [structuredTestResults, setStructuredTestResults] = useState<Record<string, { status: 'success' | 'error', msg?: string; detected?: 'json_object' | 'json_schema'; fingerprint?: string; diagnostics?: ProviderProbeDiagnostics }>>({});
   // UI-only disclosure state: it is deliberately not persisted with provider drafts.
   const [expandedProviderIds, setExpandedProviderIds] = useState<Set<string>>(() => new Set());
   const [, setHealthVersion] = useState(0);
@@ -424,13 +437,25 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         kind: 'connection',
         request: requestProviderRequest,
       })
-      if (!result.success) throw new Error(result.error || '服务商连接失败')
-      setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'success', fingerprint: result.fingerprint } }))
-      void logger.info('Provider API connection test successful', { host: safeProviderHost(profile.baseUrl), model: profile.model, protocol: profile.apiProtocol, durationMs: result.durationMs })
+      if (!result.success) {
+        const msg = redactProbeError(result.error || '服务商连接失败', provider.apiKey)
+        setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'error', msg, diagnostics: result.diagnostics } }))
+        void logger.error('Provider API connection test failed', {
+          providerId: provider.id,
+          host: safeProviderHost(profile.baseUrl),
+          model: profile.model,
+          protocol: profile.apiProtocol,
+          diagnostics: result.diagnostics,
+          error: msg,
+        })
+        return
+      }
+      setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'success', fingerprint: result.fingerprint, diagnostics: result.diagnostics } }))
+      void logger.info('Provider API connection test successful', { host: safeProviderHost(profile.baseUrl), model: profile.model, protocol: profile.apiProtocol, diagnostics: result.diagnostics })
     } catch (e: unknown) {
       const msg = redactProbeError(e instanceof Error ? e.message : String(e), provider.apiKey)
       setProviderTestResults(prev => ({ ...prev, [provider.id]: { status: 'error', msg } }));
-      void logger.error('Provider API connection test failed', { providerId: provider.id, error: msg })
+      void logger.error('Provider API connection test failed before transport', { providerId: provider.id, host: safeProviderHost(profile.baseUrl), error: msg })
     } finally {
       setTestingProviderId(null);
     }
@@ -446,13 +471,18 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     const profile = getFormProfile(provider)
     try {
       const result = await runProviderProbe({ profile: assertValidProviderProfile(profile), apiKey: provider.apiKey, kind: 'structured-output', request: requestProviderRequest })
-      if (!result.success) throw new Error(result.error || '结构化输出探测失败')
-      setStructuredTestResults(prev => ({ ...prev, [provider.id]: { status: 'success', detected: result.detectedStructuredOutput, fingerprint: result.fingerprint } }))
-      void logger.info('Provider structured output probe succeeded', { providerId: provider.id, model: profile.model, protocol: profile.apiProtocol, durationMs: result.durationMs })
+      if (!result.success) {
+        const msg = redactProbeError(result.error || '结构化输出探测失败', provider.apiKey)
+        setStructuredTestResults(prev => ({ ...prev, [provider.id]: { status: 'error', msg, diagnostics: result.diagnostics } }))
+        void logger.error('Provider structured output probe failed', { providerId: provider.id, host: safeProviderHost(profile.baseUrl), model: profile.model, protocol: profile.apiProtocol, diagnostics: result.diagnostics, error: msg })
+        return
+      }
+      setStructuredTestResults(prev => ({ ...prev, [provider.id]: { status: 'success', detected: result.detectedStructuredOutput, fingerprint: result.fingerprint, diagnostics: result.diagnostics } }))
+      void logger.info('Provider structured output probe succeeded', { providerId: provider.id, model: profile.model, protocol: profile.apiProtocol, diagnostics: result.diagnostics })
     } catch (e: unknown) {
       const msg = redactProbeError(e instanceof Error ? e.message : String(e), provider.apiKey)
       setStructuredTestResults(prev => ({ ...prev, [provider.id]: { status: 'error', msg } }))
-      void logger.error('Provider structured output probe failed', { providerId: provider.id, error: msg })
+      void logger.error('Provider structured output probe failed before transport', { providerId: provider.id, host: safeProviderHost(profile.baseUrl), error: msg })
     } finally {
       setTestingStructuredProviderId(null)
     }
@@ -888,9 +918,10 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                             : 'bg-red-500/10 text-red-300 border border-red-500/20'
                         }`}>
                           {testRes.status === 'success' && connectionProbeIsCurrent ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-400" /> : <XCircle className="w-3.5 h-3.5 shrink-0 text-red-400" />}
-                          <span className="truncate">{testRes.status === 'success'
+                          <span className="min-w-0">{testRes.status === 'success'
                             ? connectionProbeIsCurrent ? '测试成功，API 响应正常！' : '配置已修改，请重新验证。'
                             : `连接失败: ${testRes.msg}`}</span>
+                          {testRes.diagnostics && <span className="ml-auto shrink-0 text-[10px] text-slate-400" title={`目标 ${testRes.diagnostics.host}`}>{formatProbeDiagnostics(testRes.diagnostics)}</span>}
                         </div>
                       )}
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { createProviderProfileFromLegacy } from './providerProfiles'
 import { getProviderProbeFingerprint, runProviderProbe } from './providerProbe'
 import type { ProviderResponse } from './types'
+import { HttpRequestError } from '../http'
 
 const profile = createProviderProfileFromLegacy({
   id: 'probe', name: 'Probe', apiBaseUrl: 'https://api.example.test/v1', modelName: 'probe-model', enabled: true, priority: 1,
@@ -28,6 +29,7 @@ describe('provider probes', () => {
     expect(result).toMatchObject({ success: true, detectedStructuredOutput: 'json_schema' })
     expect(result.probeId).toBeTruthy()
     expect(result.fingerprint).toBe(getProviderProbeFingerprint(profile, 'structured-output'))
+    expect(result.diagnostics).toMatchObject({ transport: 'custom-rust', host: 'api.example.test' })
     expect(captured?.response_format).toMatchObject({ type: 'json_schema' })
     expect(JSON.stringify(captured)).not.toContain('secret-key')
     expect(JSON.stringify(captured)).not.toContain('邮件')
@@ -84,4 +86,26 @@ describe('provider probes', () => {
     })
 
     expect(result.success).toBe(true)
-  })})
+  })
+
+  it('returns a redacted failure stage and timeout category without exposing the request body', async () => {
+    const result = await runProviderProbe({
+      profile,
+      apiKey: 'secret-key',
+      kind: 'connection',
+      request: async () => {
+        throw new HttpRequestError('请求超时（60 秒，阶段：first_byte）', { isTimeout: true, timeoutPhase: 'first_byte' })
+      },
+    })
+
+    expect(result).toMatchObject({ success: false })
+    expect(result.diagnostics).toMatchObject({
+      transport: 'custom-rust',
+      host: 'api.example.test',
+      failureStage: 'before_response_headers',
+      timeoutPhase: 'first_byte',
+      errorCategory: 'timeout',
+    })
+    expect(JSON.stringify(result)).not.toContain('secret-key')
+  })
+})

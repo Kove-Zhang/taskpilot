@@ -1,9 +1,21 @@
 import { invoke } from '@tauri-apps/api/core'
 import { HttpRequestError, fetchWithTimeout, isRetryableTransportError, raceWithAbort, DEFAULT_LLM_TIMEOUT_POLICY, type RequestTimeoutPolicy, type TimeoutPhase } from './http'
-import type { ProviderRequest, ProviderResponse as LLMProviderResponse } from './llm/types'
+import type { ProviderRequest, ProviderResponse as LLMProviderResponse, ProviderTransportDiagnostics, ProviderTransportKind } from './llm/types'
 import { logger } from './logger'
 
 export type ProviderResponse = LLMProviderResponse
+
+const transportDiagnosticsByError = new WeakMap<object, ProviderTransportDiagnostics>()
+
+/** Returns only safe timing and transport metadata attached to a failed request. */
+export function getProviderTransportDiagnostics(error: unknown): ProviderTransportDiagnostics | undefined {
+  return error && typeof error === 'object' ? transportDiagnosticsByError.get(error) : undefined
+}
+
+function attachProviderTransportDiagnostics<T>(error: T, diagnostics: ProviderTransportDiagnostics): T {
+  if (error && typeof error === 'object') transportDiagnosticsByError.set(error, diagnostics)
+  return error
+}
 
 interface CustomProviderResponse {
   status: number
@@ -68,6 +80,10 @@ export function usesCustomProvider(baseUrl: string): boolean {
   } catch {
     return true
   }
+}
+
+export function getProviderTransportKind(baseUrl: string): ProviderTransportKind {
+  return usesCustomProvider(baseUrl) ? 'custom-rust' : 'tauri-http'
 }
 
 function createResponse(
@@ -154,19 +170,25 @@ export async function requestProviderRequest(options: ProviderTransportRequestOp
   })
 
   if (!usesCustomProvider(options.baseUrl)) {
-    const response = await fetchWithTimeout(options.request.endpoint, {
-      method: 'POST',
-      headers: options.request.headers,
-      body,
-    }, options.timeoutPolicy ?? DEFAULT_LLM_TIMEOUT_POLICY, { signal: options.signal })
-    return {
-      ok: response.ok,
-      status: response.status,
-      ...(options.requestId ? { requestId: options.requestId } : {}),
-      ...(options.traceId ? { traceId: options.traceId } : {}),
-      headers: response.headers,
-      text: () => response.text(),
-      json: () => response.json(),
+    const startedAt = Date.now()
+    try {
+      const response = await fetchWithTimeout(options.request.endpoint, {
+        method: 'POST',
+        headers: options.request.headers,
+        body,
+      }, options.timeoutPolicy ?? DEFAULT_LLM_TIMEOUT_POLICY, { signal: options.signal })
+      return {
+        ok: response.ok,
+        status: response.status,
+        ...(options.requestId ? { requestId: options.requestId } : {}),
+        ...(options.traceId ? { traceId: options.traceId } : {}),
+        headers: response.headers,
+        transportDiagnostics: { transport: 'tauri-http', responseHeadersMs: Date.now() - startedAt },
+        text: () => response.text(),
+        json: () => response.json(),
+      }
+    } catch (error) {
+      throw attachProviderTransportDiagnostics(error, { transport: 'tauri-http' })
     }
   }
 
@@ -195,15 +217,19 @@ export async function requestProviderRequest(options: ProviderTransportRequestOp
     if (!response || typeof response.status !== 'number' || typeof response.body !== 'string') {
       throw new Error('Rust 代理返回数据结构异常')
     }
-    return createResponse(
+    const normalized = createResponse(
       response.status,
       response.body,
       response.headers,
       response.requestId ?? requestId,
       response.traceId ?? options.traceId,
     )
+    return { ...normalized, transportDiagnostics: { transport: 'custom-rust' } }
   } catch (error) {
-    throw wrapCustomTransportError(error, requestId, options.traceId)
+    throw attachProviderTransportDiagnostics(
+      wrapCustomTransportError(error, requestId, options.traceId),
+      { transport: 'custom-rust' },
+    )
   } finally {
     options.signal?.removeEventListener('abort', onAbort)
   }

@@ -51,6 +51,19 @@ describe('Notion sync', () => {
     expect(body.properties).not.toHaveProperty('status')
   })
 
+  it('allows an explicitly confirmed manual resync after a successful result', async () => {
+    const todo = makeTodo()
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 'notion-page-original' }) } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 'notion-page-resynced' }) } as Response)
+
+    const first = await syncToNotion([todo])
+    const manual = await syncToNotion([todo], { manualResync: true })
+
+    expect(first).toEqual([{ id: todo.id, success: true, pageId: 'notion-page-original' }])
+    expect(manual).toEqual([{ id: todo.id, success: true, pageId: 'notion-page-resynced' }])
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
   it('returns a visible error for enabled but unsupported mapped properties', async () => {
     useSettingsStore.setState({
       notionProperties: [{ id: 'formula', name: 'formula', type: 'formula' }],

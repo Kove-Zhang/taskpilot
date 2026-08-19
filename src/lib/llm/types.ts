@@ -120,6 +120,15 @@ export interface ProviderRequest {
   body: Record<string, unknown>
 }
 
+/** Non-secret transport metadata collected for provider diagnostics. */
+export type ProviderTransportKind = 'tauri-http' | 'custom-rust'
+
+export interface ProviderTransportDiagnostics {
+  transport: ProviderTransportKind
+  /** Present when the transport exposes the moment response headers arrive. */
+  responseHeadersMs?: number
+}
+
 export interface ProviderResponse {
   ok: boolean
   status: number
@@ -128,6 +137,7 @@ export interface ProviderResponse {
   /** Non-secret operation correlation ID shared by retry/failover attempts. */
   traceId?: string
   headers?: Headers
+  transportDiagnostics?: ProviderTransportDiagnostics
   text(): Promise<string>
   json(): Promise<unknown>
 }

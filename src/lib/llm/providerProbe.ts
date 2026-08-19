@@ -1,5 +1,7 @@
 import { getProviderAdapter } from './adapterRegistry'
-import type { ProviderProfile, ProviderRequest, ProviderResponse, TaskProfile } from './types'
+import { getProviderTransportDiagnostics, getProviderTransportKind } from '../providerTransport'
+import { HttpRequestError } from '../http'
+import type { ProviderProfile, ProviderRequest, ProviderResponse, ProviderTransportDiagnostics, TaskProfile } from './types'
 
 export type ProviderProbeKind = 'connection' | 'structured-output'
 export type DetectedStructuredOutput = 'json_object' | 'json_schema'
@@ -19,6 +21,21 @@ export interface ProviderProbeResult {
   fingerprint?: string
   durationMs: number
   error?: string
+  diagnostics: ProviderProbeDiagnostics
+}
+
+export type ProviderProbeFailureStage = 'before_response_headers' | 'response_validation'
+export type ProviderProbeErrorCategory = 'timeout' | 'tls' | 'dns' | 'connection' | 'http' | 'response' | 'unknown'
+
+/** A deliberately small, persistence-safe snapshot. It never contains request or response content. */
+export interface ProviderProbeDiagnostics {
+  transport: ProviderTransportDiagnostics['transport']
+  host: string
+  responseHeadersMs?: number
+  totalMs: number
+  failureStage?: ProviderProbeFailureStage
+  timeoutPhase?: 'connect' | 'first_byte' | 'total'
+  errorCategory?: ProviderProbeErrorCategory
 }
 
 export interface ProviderProbeRequestOptions {
@@ -146,11 +163,54 @@ function createTask(kind: ProviderProbeKind): TaskProfile {
   }
 }
 
+function safeProviderHost(baseUrl: string): string {
+  try { return new URL(baseUrl).host.slice(0, 200) || '[invalid-url]' } catch { return '[invalid-url]' }
+}
+
+function classifyProbeError(error: unknown): ProviderProbeErrorCategory {
+  if (error instanceof HttpRequestError && error.status !== undefined) return 'http'
+  if (error instanceof HttpRequestError && error.isTimeout) return 'timeout'
+  const message = error instanceof Error ? error.message : String(error)
+  if (/tls|ssl|certificate|handshake|unexpected eof/i.test(message)) return 'tls'
+  if (/dns|resolve|enotfound|eai_again|无法解析/i.test(message)) return 'dns'
+  if (/network|socket|connection|econn|error\s+sending|发送请求/i.test(message)) return 'connection'
+  if (/json|响应|output|content/i.test(message)) return 'response'
+  return 'unknown'
+}
+
+function buildProbeDiagnostics(
+  profile: ProviderProfile,
+  startedAt: number,
+  response?: ProviderResponse,
+  error?: unknown,
+): ProviderProbeDiagnostics {
+  const transport = response?.transportDiagnostics ?? getProviderTransportDiagnostics(error)
+  const totalMs = Math.max(0, Date.now() - startedAt)
+  if (!error) {
+    return {
+      transport: transport?.transport ?? getProviderTransportKind(profile.baseUrl),
+      host: safeProviderHost(profile.baseUrl),
+      responseHeadersMs: transport?.responseHeadersMs,
+      totalMs,
+    }
+  }
+  return {
+    transport: transport?.transport ?? getProviderTransportKind(profile.baseUrl),
+    host: safeProviderHost(profile.baseUrl),
+    responseHeadersMs: transport?.responseHeadersMs,
+    totalMs,
+    failureStage: transport?.responseHeadersMs === undefined ? 'before_response_headers' : 'response_validation',
+    ...(error instanceof HttpRequestError && error.timeoutPhase ? { timeoutPhase: error.timeoutPhase } : {}),
+    errorCategory: classifyProbeError(error),
+  }
+}
+
 async function runStructuredModeProbe(
   options: ProviderProbeRequestOptions,
   probeId: string,
   mode: DetectedStructuredOutput,
-): Promise<{ status: number; responseId?: string }> {
+  onResponse: (response: ProviderResponse) => void,
+): Promise<{ status: number; responseId?: string; response: ProviderResponse }> {
   const adapter = getProviderAdapter(options.profile.apiProtocol)
   const task = createTask('structured-output')
   const probeProfile: ProviderProfile = {
@@ -177,21 +237,24 @@ async function runStructuredModeProbe(
     timeoutPolicy: options.profile.timeoutPolicy,
     retryPolicy: PROVIDER_PROBE_RETRY_POLICY,
   })
+  onResponse(response)
   const completion = await adapter.parseResponse(response)
   validateProbeObject(completion.text, probeId, mode === 'json_schema')
-  return { status: response.status, responseId: completion.responseId }
+  return { status: response.status, responseId: completion.responseId, response }
 }
 
 /** Runs a short, redacted probe. It never receives email content or images. */
 export async function runProviderProbe(options: ProviderProbeRequestOptions): Promise<ProviderProbeResult> {
   const startedAt = Date.now()
   const fingerprint = getProviderProbeFingerprint(options.profile, options.kind)
+  let latestResponse: ProviderResponse | undefined
   try {
     if (options.kind === 'structured-output') {
       const probeId = createProbeId()
       let schemaFailure = ''
       try {
-        const result = await runStructuredModeProbe(options, probeId, 'json_schema')
+        latestResponse = undefined
+        const result = await runStructuredModeProbe(options, probeId, 'json_schema', (response) => { latestResponse = response })
         return {
           kind: options.kind,
           success: true,
@@ -201,13 +264,15 @@ export async function runProviderProbe(options: ProviderProbeRequestOptions): Pr
           probeId,
           fingerprint,
           durationMs: Date.now() - startedAt,
+          diagnostics: buildProbeDiagnostics(options.profile, startedAt, result.response),
         }
       } catch (error) {
         schemaFailure = error instanceof Error ? error.message : String(error)
       }
 
       try {
-        const result = await runStructuredModeProbe(options, probeId, 'json_object')
+        latestResponse = undefined
+        const result = await runStructuredModeProbe(options, probeId, 'json_object', (response) => { latestResponse = response })
         return {
           kind: options.kind,
           success: true,
@@ -217,6 +282,7 @@ export async function runProviderProbe(options: ProviderProbeRequestOptions): Pr
           probeId,
           fingerprint,
           durationMs: Date.now() - startedAt,
+          diagnostics: buildProbeDiagnostics(options.profile, startedAt, result.response),
         }
       } catch (error) {
         const objectFailure = error instanceof Error ? error.message : String(error)
@@ -234,22 +300,23 @@ export async function runProviderProbe(options: ProviderProbeRequestOptions): Pr
         messages: [{ role: 'user', content: 'Say "OK" if you receive this.' }],
       },
     })
-    const response = await options.request({
+    latestResponse = await options.request({
     baseUrl: options.profile.baseUrl,
     apiKey: options.apiKey,
     request,
     timeoutPolicy: options.profile.timeoutPolicy,
     retryPolicy: PROVIDER_PROBE_RETRY_POLICY,
   })
-    const completion = await adapter.parseResponse(response)
+    const completion = await adapter.parseResponse(latestResponse)
     if (!completion.text.trim()) throw new Error('服务商返回空响应')
     return {
       kind: options.kind,
       success: true,
-      status: response.status,
+      status: latestResponse.status,
       responseId: completion.responseId,
       fingerprint,
       durationMs: Date.now() - startedAt,
+      diagnostics: buildProbeDiagnostics(options.profile, startedAt, latestResponse),
     }
   } catch (error) {
     return {
@@ -258,6 +325,7 @@ export async function runProviderProbe(options: ProviderProbeRequestOptions): Pr
       fingerprint,
       durationMs: Date.now() - startedAt,
       error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+      diagnostics: buildProbeDiagnostics(options.profile, startedAt, latestResponse, error),
     }
   }
 }
